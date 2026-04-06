@@ -1967,6 +1967,217 @@ function registerUsageCommand(program2) {
   });
 }
 
+// src/cli/commands/people.ts
+init_crypto();
+init_constants();
+import crypto4 from "crypto";
+var REGISTRY_BLOB_ID = "__people_registry__";
+async function fetchRegistry(vaultKey) {
+  const convex = await authenticateConvexClient();
+  const config = loadConfig();
+  let blob;
+  try {
+    if (config.vaultId) {
+      blob = await convex.query(api.encryptedSync.getBlobById, { blobId: REGISTRY_BLOB_ID, vaultId: config.vaultId });
+    }
+  } catch {
+  }
+  if (!blob) {
+    try {
+      blob = await convex.query(api.encryptedSync.getBlobById, { blobId: REGISTRY_BLOB_ID });
+    } catch {
+    }
+  }
+  if (!blob) return { people: [] };
+  try {
+    const encDocKey = new Uint8Array(blob.encryptedDocKey);
+    const docKey = unwrapDocumentKey(encDocKey, vaultKey);
+    const decrypted = decryptString(new Uint8Array(blob.encryptedBlob), docKey);
+    docKey.fill(0);
+    return JSON.parse(decrypted);
+  } catch {
+    return { people: [] };
+  }
+}
+async function syncRegistry(registry, vaultKey) {
+  const convex = await authenticateConvexClient();
+  const config = loadConfig();
+  const docKey = new Uint8Array(crypto4.randomBytes(DOCUMENT_KEY_BYTES));
+  const encryptedBlob = encryptString(JSON.stringify(registry), docKey);
+  const encryptedDocKey = encrypt(docKey, vaultKey);
+  docKey.fill(0);
+  const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
+  new Uint8Array(blobBuffer).set(encryptedBlob);
+  const keyBuffer = new ArrayBuffer(encryptedDocKey.byteLength);
+  new Uint8Array(keyBuffer).set(encryptedDocKey);
+  if (config.vaultId) {
+    await convex.mutation(api.encryptedSync.upsertBlobByVault, {
+      vaultId: config.vaultId,
+      blobId: REGISTRY_BLOB_ID,
+      encryptedBlob: blobBuffer,
+      encryptedDocKey: keyBuffer,
+      blobSize: encryptedBlob.length
+    });
+  } else {
+    await convex.mutation(api.encryptedSync.upsertBlob, {
+      blobId: REGISTRY_BLOB_ID,
+      encryptedBlob: blobBuffer,
+      encryptedDocKey: keyBuffer,
+      blobSize: encryptedBlob.length
+    });
+  }
+}
+function registerPeopleCommands(program2) {
+  const people = program2.command("people").description("People management & merge");
+  people.command("list").description("List all people with document counts").action(() => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      if (isJson) {
+        output({ error: "Vault is locked" });
+      } else {
+        console.error("Vault is locked");
+      }
+      process.exit(1);
+    }
+    const db2 = getDatabase();
+    const owners = db2.prepare(`
+        SELECT owner, COUNT(*) as count
+        FROM documents
+        WHERE owner IS NOT NULL AND owner != 'Unknown' AND id != '__people_registry__'
+        GROUP BY owner
+        ORDER BY count DESC
+      `).all();
+    if (isJson) {
+      output(owners);
+    } else {
+      for (const { owner, count } of owners) {
+        console.log(`  ${owner.padEnd(40)} ${count} docs`);
+      }
+      console.log(`
+  ${owners.length} people`);
+    }
+  });
+  people.command("docs").description("List documents for a person").argument("<name>", "Person name (partial match)").action((name) => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      if (isJson) {
+        output({ error: "Vault is locked" });
+      } else {
+        console.error("Vault is locked");
+      }
+      process.exit(1);
+    }
+    const db2 = getDatabase();
+    const docs = db2.prepare(`
+        SELECT id, title, type, owner, dateAdded
+        FROM documents
+        WHERE owner LIKE @pat COLLATE NOCASE AND id != '__people_registry__'
+        ORDER BY updatedAt DESC
+      `).all({ pat: `%${name}%` });
+    if (isJson) {
+      output(docs);
+    } else {
+      if (docs.length === 0) {
+        console.log(`  No documents found for "${name}"`);
+        return;
+      }
+      for (const doc of docs) {
+        console.log(`  ${doc.title}`);
+        console.log(`    Type: ${doc.type}  |  Owner: ${doc.owner}`);
+      }
+      console.log(`
+  ${docs.length} document(s)`);
+    }
+  });
+  people.command("aliases").description("Show the people registry with aliases").action(async () => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      if (isJson) {
+        output({ error: "Vault is locked" });
+      } else {
+        console.error("Vault is locked");
+      }
+      process.exit(1);
+    }
+    const { vaultKey } = getVaultKeys();
+    const registry = await fetchRegistry(vaultKey);
+    if (isJson) {
+      output(registry.people.map((p) => ({
+        id: p.id,
+        name: p.canonicalName,
+        aliases: p.aliases
+      })));
+    } else {
+      if (registry.people.length === 0) {
+        console.log("  No people in registry.");
+        return;
+      }
+      for (const person of registry.people) {
+        console.log(`  ${person.canonicalName}`);
+        if (person.aliases.length > 0) {
+          console.log(`    Aliases: ${person.aliases.join(", ")}`);
+        }
+      }
+    }
+  });
+  people.command("merge").description("Merge a name as an alias of another person").argument("<alias>", "Name to merge (will become an alias)").argument("<canonical>", "Canonical name (the primary name)").action(async (alias, canonical) => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      if (isJson) {
+        output({ error: "Vault is locked" });
+      } else {
+        console.error("Vault is locked");
+      }
+      process.exit(1);
+    }
+    const { vaultKey } = getVaultKeys();
+    const registry = await fetchRegistry(vaultKey);
+    let person = registry.people.find(
+      (p) => p.canonicalName.toUpperCase() === canonical.toUpperCase()
+    );
+    if (!person) {
+      person = {
+        id: `person_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        canonicalName: canonical,
+        aliases: []
+      };
+      registry.people.push(person);
+    }
+    const normalizedAlias = alias.trim();
+    if (!person.aliases.some((a) => a.toUpperCase() === normalizedAlias.toUpperCase()) && person.canonicalName.toUpperCase() !== normalizedAlias.toUpperCase()) {
+      person.aliases.push(normalizedAlias);
+    }
+    await syncRegistry(registry, vaultKey);
+    if (isJson) {
+      output({ status: "merged", canonical: person.canonicalName, alias: normalizedAlias, totalAliases: person.aliases.length });
+    } else {
+      console.log(`  Merged: "${normalizedAlias}" \u2192 "${person.canonicalName}"`);
+      console.log(`  Aliases: ${person.aliases.join(", ")}`);
+    }
+  });
+  people.command("rename").description("Change the owner name on all docs matching a name").argument("<from>", "Current owner name").argument("<to>", "New owner name").action(async (from, to) => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      if (isJson) {
+        output({ error: "Vault is locked" });
+      } else {
+        console.error("Vault is locked");
+      }
+      process.exit(1);
+    }
+    const db2 = getDatabase();
+    const result = db2.prepare("UPDATE documents SET owner = @to, updatedAt = @now WHERE owner = @from COLLATE NOCASE").run({ to, from, now: Date.now() });
+    if (isJson) {
+      output({ status: "renamed", from, to, docsUpdated: result.changes });
+    } else {
+      console.log(`  Renamed "${from}" \u2192 "${to}" on ${result.changes} document(s)`);
+      if (result.changes > 0) {
+        console.log("  Note: Run `moivault sync --full` to see changes on phone after next re-push.");
+      }
+    }
+  });
+}
+
 // src/cli/index.ts
 var program = new Command();
 program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.1.0").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
@@ -2003,6 +2214,7 @@ registerDocCommands(program);
 registerSearchCommands(program);
 registerStatsCommand(program);
 registerUsageCommand(program);
+registerPeopleCommands(program);
 program.parseAsync(process.argv).catch((err) => {
   console.error(err.message);
   process.exit(1);
