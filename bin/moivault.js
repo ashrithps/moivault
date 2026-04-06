@@ -1370,7 +1370,12 @@ function registerDocCommands(program2) {
       updateDocumentField(id, field, field === "tags" ? value.split(",").map((t) => t.trim()) : value);
       const updatedDoc = getDocumentById(id);
       const { vaultKey } = getVaultKeys();
-      const docKey = generateDocumentKey();
+      let docKey;
+      if (updatedDoc.encryptedDocKey) {
+        docKey = unwrapDocumentKey(updatedDoc.encryptedDocKey, vaultKey);
+      } else {
+        docKey = generateDocumentKey();
+      }
       const config = loadConfig();
       const docContent = JSON.stringify({
         title: updatedDoc.title,
