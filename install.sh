@@ -1,10 +1,10 @@
 #!/bin/bash
 # moivault installer — one-line install for macOS
-# Usage: curl -fsSL https://raw.githubusercontent.com/AshGovind/moivault/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash
 
 set -e
 
-REPO="AshGovind/moivault"
+REPO="ashrithps/moivault"
 INSTALL_DIR="$HOME/.moivault"
 BIN_DIR="$HOME/.local/bin"
 

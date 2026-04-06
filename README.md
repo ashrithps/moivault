@@ -7,7 +7,7 @@ Search, retrieve, and correlate documents from your encrypted vault. Designed fo
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AshGovind/moivault/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash
 ```
 
 Requires Node.js 20+. Installs to `~/.moivault/` with a launcher at `~/.local/bin/moivault`.
