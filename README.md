@@ -40,17 +40,32 @@ Also auto-installs the Claude Code skill for agent integration.
 ## Commands
 
 ```
-moivault sync                    # Sync from server
-moivault search <query>          # Hybrid FTS + vector search
-moivault doc list                # List all documents
-moivault doc list --type medical # Filter by type
-moivault doc get <id>            # Full metadata
-moivault doc text <id>           # Raw OCR text
-moivault doc fields <id>         # Structured fields
-moivault doc download <id>       # Download original file
-moivault doc types               # List doc types with counts
-moivault stats                   # Vault statistics
-moivault auth status             # Check auth state
+moivault sync                        # Sync from server (incremental)
+moivault sync --full                 # Re-download everything
+moivault search <query>              # Hybrid FTS + vector search
+moivault search <query> --mode fts   # Keyword search only
+moivault search <query> --mode vector # Semantic search only
+
+moivault doc list                    # List all documents
+moivault doc list --type medical     # Filter by type
+moivault doc get <id>                # Full metadata
+moivault doc text <id>               # Raw OCR text
+moivault doc fields <id>             # Structured fields
+moivault doc upload <file>           # Upload PDF/image to vault
+moivault doc download <id>           # Download original file
+moivault doc edit <id> <field> <val> # Edit title, tags, type, owner, or custom field
+moivault doc delete <id>             # Delete document (local + server)
+moivault doc types                   # List doc types with counts
+
+moivault people list                 # All people with doc counts
+moivault people docs <name>          # Documents for a person
+moivault people aliases              # Show people registry with aliases
+moivault people merge <alias> <name> # Merge a name as alias of another
+moivault people rename <from> <to>   # Bulk rename owner on docs
+
+moivault usage                       # API usage and plan details
+moivault stats                       # Vault statistics
+moivault auth status                 # Check auth state
 ```
 
 ## For AI Agents
