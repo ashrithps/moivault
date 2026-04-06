@@ -1,0 +1,48 @@
+{
+  "name": "moivault",
+  "version": "0.1.0",
+  "description": "CLI for Vault — encrypted document management for agents and humans. Search, retrieve, and correlate documents from your encrypted vault.",
+  "bin": {
+    "moivault": "./bin/moivault.js"
+  },
+  "scripts": {
+    "postinstall": "echo '✓ moivault installed. Run: moivault auth status'"
+  },
+  "files": [
+    "bin/",
+    "skill/",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "commander": "^13.1.0",
+    "convex": "^1.21.0"
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "vault",
+    "cli",
+    "documents",
+    "encrypted",
+    "search",
+    "agent",
+    "mcp",
+    "ai"
+  ],
+  "author": "Ashrith Govind",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ashrithgovind/moivault"
+  }
+}
