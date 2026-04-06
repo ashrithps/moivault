@@ -1,12 +1,30 @@
 #!/bin/bash
 # moivault installer — one-line install for macOS
-# Usage: curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash
+#
+# Basic install:
+#   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash
+#
+# Install + authenticate (one-click setup):
+#   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash -s -- \
+#     --payload '{"sessionCookie":"...","secretKey":"...","salt":"...","wrappedVaultKey":"..."}' \
+#     --password 'your-master-password'
 
 set -e
 
 REPO="ashrithps/moivault"
 INSTALL_DIR="$HOME/.moivault"
 BIN_DIR="$HOME/.local/bin"
+AUTH_PAYLOAD=""
+MASTER_PASSWORD=""
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --payload) AUTH_PAYLOAD="$2"; shift 2 ;;
+    --password) MASTER_PASSWORD="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
 
 echo ""
 echo "  Installing moivault..."
@@ -176,13 +194,42 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
   echo ""
 fi
 
+# ── Auth setup (if flags provided) ──
+if [ -n "$AUTH_PAYLOAD" ]; then
+  echo "  → Authenticating..."
+  "$BIN_DIR/moivault" auth login --payload "$AUTH_PAYLOAD" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo "  ✓ Authenticated"
+  else
+    echo "  ✗ Authentication failed — run manually: moivault auth login --payload '<json>'"
+  fi
+fi
+
+if [ -n "$MASTER_PASSWORD" ]; then
+  "$BIN_DIR/moivault" auth save-password "$MASTER_PASSWORD" 2>/dev/null
+  echo "  ✓ Password saved (auto-unlock enabled)"
+fi
+
+if [ -n "$AUTH_PAYLOAD" ] && [ -n "$MASTER_PASSWORD" ]; then
+  echo "  → Syncing vault..."
+  "$BIN_DIR/moivault" sync 2>/dev/null
+  echo "  ✓ Vault synced"
+fi
+
 echo ""
 echo "  ✓ moivault installed!"
 echo ""
-echo "  Get started:"
-echo "    1. Open Vault app → Settings → Developer → Link CLI"
-echo "    2. Copy the command and run it"
-echo "    3. moivault auth save-password 'your-password'"
-echo "    4. moivault sync"
-echo "    5. moivault search 'passport'"
+if [ -n "$AUTH_PAYLOAD" ]; then
+  echo "  Ready to use:"
+  echo "    moivault search 'passport'"
+  echo "    moivault doc list --type medical"
+  echo "    moivault context 'health risks'"
+else
+  echo "  Get started:"
+  echo "    1. Open Vault app → Settings → Developer → Link CLI"
+  echo "    2. Copy the command and run it"
+  echo "    3. moivault auth save-password 'your-password'"
+  echo "    4. moivault sync"
+  echo "    5. moivault search 'passport'"
+fi
 echo ""

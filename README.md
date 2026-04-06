@@ -10,9 +10,21 @@ Search, retrieve, and correlate documents from your encrypted vault. Designed fo
 curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash
 ```
 
+### One-click install with auth (fully automated)
+
+Get the auth payload from the Vault app (Settings → Developer → Link CLI), then:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash -s -- \
+  --payload '<json from app>' \
+  --password 'your-master-password'
+```
+
+This installs, authenticates, saves password, and syncs — ready to use immediately.
+
 Requires Node.js 20+. Installs to `~/.moivault/` with a launcher at `~/.local/bin/moivault`.
 
-Also auto-installs the Claude Code skill for agent integration.
+Auto-installs agent skills (Claude Code, Codex, Cursor, etc.) and Claude Desktop MCP server.
 
 ## Quick Start
 
