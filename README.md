@@ -71,6 +71,7 @@ moivault chunk status                # Show chunk index status
 moivault usage                       # API usage and plan details
 moivault stats                       # Vault statistics
 moivault auth status                 # Check auth state
+moivault mcp                         # Start MCP server (stdio) for Claude Desktop/Cursor
 ```
 
 ## For AI Agents
@@ -87,8 +88,13 @@ Works with any AI coding agent. The installer auto-detects and installs the skil
 - **GitHub Copilot** — `~/.github-copilot/skills/moivault/`
 - **Goose** — `~/.config/goose/skills/moivault/`
 - **OpenCode** — `~/.config/opencode/skills/moivault/`
+- **Claude Desktop** — auto-configured as MCP server (no manual setup)
 - **Trae / Kilo / Augment / Aider / VSCode** — auto-detected
 - **Any other agent** — `~/.config/moivault/SKILL.md`
+
+### MCP Server (Claude Desktop, Cursor)
+
+The installer auto-configures Claude Desktop with the moivault MCP server. After install, restart Claude Desktop and 11 vault tools are available natively — `vault_search`, `vault_context`, `vault_doc_text`, `vault_doc_edit`, `vault_sync`, and more.
 
 Features:
 - JSON output by default (non-TTY). Pretty output in interactive terminals.
