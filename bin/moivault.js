@@ -2955,6 +2955,46 @@ async function startMcpServer() {
     }
   );
   server.tool(
+    "vault_doc_download",
+    "Download the original document file (PDF, image) to ~/Downloads/ and return the file path",
+    {
+      id: z.string().describe("Document ID"),
+      outputPath: z.string().optional().describe("Custom output path (default: ~/Downloads/<title>.<ext>)")
+    },
+    async ({ id, outputPath }) => {
+      await ensureUnlocked();
+      const doc = getDocumentById(id);
+      if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
+      const storageId = doc.encryptedStorageId || doc.storageId;
+      if (!storageId) return { content: [{ type: "text", text: JSON.stringify({ error: "No file attached to this document" }) }] };
+      const convex = await authenticateConvexClient();
+      const fileUrl = await convex.query(api.storage.getUrl, { storageId });
+      if (!fileUrl) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found on server" }) }] };
+      const response = await fetch(fileUrl);
+      if (!response.ok) return { content: [{ type: "text", text: JSON.stringify({ error: `Download failed: ${response.status}` }) }] };
+      const rawBytes = new Uint8Array(await response.arrayBuffer());
+      let fileBytes;
+      if (doc.encryptedStorageId && doc.encryptedDocKey) {
+        const { vaultKey } = getVaultKeys();
+        const docKey = unwrapDocumentKey(doc.encryptedDocKey, vaultKey);
+        fileBytes = decrypt(rawBytes, docKey);
+        docKey.fill(0);
+      } else {
+        fileBytes = rawBytes;
+      }
+      const { default: fs4 } = await import("fs");
+      const { default: path4 } = await import("path");
+      const { default: os3 } = await import("os");
+      const ext = doc.mimeType ? { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[doc.mimeType] ?? "bin" : "bin";
+      const safeName = (doc.title || "document").replace(/[/\\:*?"<>|]/g, "_");
+      const finalPath = outputPath || path4.join(os3.homedir(), "Downloads", `${safeName}.${ext}`);
+      const dir = path4.dirname(finalPath);
+      if (!fs4.existsSync(dir)) fs4.mkdirSync(dir, { recursive: true });
+      fs4.writeFileSync(finalPath, fileBytes);
+      return { content: [{ type: "text", text: JSON.stringify({ status: "downloaded", path: finalPath, size: fileBytes.length, title: doc.title }) }] };
+    }
+  );
+  server.tool(
     "vault_sync",
     "Sync documents from the server",
     { full: z.boolean().default(false).describe("Force full sync") },
@@ -2982,6 +3022,101 @@ async function startMcpServer() {
         totalDocuments: getDocumentCount(),
         documentTypes: getDocumentTypeCounts(),
         lastSync: config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : null
+      }, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_upload",
+    "Upload a local file (PDF, image) to the vault. Extracts text/fields via Gemini, encrypts, and syncs.",
+    { filePath: z.string().describe("Absolute path to the file") },
+    async ({ filePath }) => {
+      await ensureUnlocked();
+      const { default: fs4 } = await import("fs");
+      const { default: path4 } = await import("path");
+      const crypto5 = await import("crypto");
+      if (!fs4.existsSync(filePath)) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found" }) }] };
+      const fileBuffer = fs4.readFileSync(filePath);
+      const fileBytes = new Uint8Array(fileBuffer);
+      const fileName = path4.basename(filePath);
+      const ext = path4.extname(filePath).toLowerCase().slice(1);
+      const mimeType = { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", heic: "image/heic" }[ext] ?? "application/octet-stream";
+      const hash = crypto5.createHash("sha256").update(fileBytes).digest("hex");
+      const docId = hash;
+      const convex = await authenticateConvexClient();
+      const uploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
+      const uploadResp = await fetch(uploadUrl, { method: "POST", headers: { "Content-Type": mimeType }, body: fileBytes });
+      const { storageId } = await uploadResp.json();
+      const extracted = await convex.action(api.proxy.processFile, { storageId, mimeType, fileName });
+      const persistedStorageId = extracted.storageId || storageId;
+      if (!extracted.embedding || !Array.isArray(extracted.embedding) || extracted.embedding.length === 0) {
+        try {
+          const combinedText = [extracted.title || fileName, extracted.type, ...extracted.tags || [], JSON.stringify(extracted.fields || {})].join(" ");
+          extracted.embedding = await convex.action(api.search.embedQuery, { query: combinedText });
+        } catch {
+        }
+      }
+      const { vaultKey } = getVaultKeys();
+      const docKey = generateDocumentKey();
+      const encFileBytes = encrypt(fileBytes, docKey);
+      const encUploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
+      const encResp = await fetch(encUploadUrl, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: encFileBytes });
+      const { storageId: encSid } = await encResp.json();
+      try {
+        await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
+      } catch {
+      }
+      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const now = Date.now();
+      const localDoc = { id: docId, title: extracted.title || fileName, rawText: extracted.rawText || "", type: extracted.type || "generic", tags: extracted.tags || [], fields: extracted.fields || {}, organizations: extracted.organizations || [], mentions: extracted.mentions || [], embedding: extracted.embedding || void 0, owner: extracted.owner || "Unknown", mimeType, encryptedStorageId: encSid, encryptedDocKey: wrappedDocKey, dateAdded: (/* @__PURE__ */ new Date()).toISOString(), status: "ready", createdAt: now, updatedAt: now, syncStatus: "synced" };
+      upsertDocument(localDoc);
+      const config = loadConfig();
+      const docContent = JSON.stringify({ title: localDoc.title, rawText: localDoc.rawText, type: localDoc.type, tags: localDoc.tags, fields: localDoc.fields, organizations: localDoc.organizations, mentions: localDoc.mentions, owner: localDoc.owner, embedding: extracted.embedding || null, mimeType, fileName, fileHash: hash, encryptedStorageId: encSid, dateAdded: localDoc.dateAdded });
+      const encBlob = encrypt(new TextEncoder().encode(docContent), docKey);
+      const blobBuf = new ArrayBuffer(encBlob.byteLength);
+      new Uint8Array(blobBuf).set(encBlob);
+      const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
+      new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
+      if (config.vaultId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: config.vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+      } else {
+        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+      }
+      docKey.fill(0);
+      return { content: [{ type: "text", text: JSON.stringify({ status: "uploaded", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags }) }] };
+    }
+  );
+  server.tool(
+    "vault_people_list",
+    "List all people in the vault with their document counts",
+    {},
+    async () => {
+      await ensureUnlocked();
+      const db2 = (await Promise.resolve().then(() => (init_database(), database_exports))).getDatabase();
+      const owners = db2.prepare("SELECT owner, COUNT(*) as count FROM documents WHERE owner IS NOT NULL AND owner != 'Unknown' AND id != '__people_registry__' GROUP BY owner ORDER BY count DESC").all();
+      return { content: [{ type: "text", text: JSON.stringify(owners, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_people_docs",
+    "List documents belonging to a specific person",
+    { name: z.string().describe("Person name (partial match)") },
+    async ({ name }) => {
+      await ensureUnlocked();
+      const db2 = (await Promise.resolve().then(() => (init_database(), database_exports))).getDatabase();
+      const docs = db2.prepare("SELECT id, title, type, owner, dateAdded FROM documents WHERE owner LIKE @pat COLLATE NOCASE AND id != '__people_registry__' ORDER BY updatedAt DESC").all({ pat: `%${name}%` });
+      return { content: [{ type: "text", text: JSON.stringify(docs, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_chunk_status",
+    "Show the chunk index status for RAG context retrieval",
+    {},
+    async () => {
+      await ensureUnlocked();
+      return { content: [{ type: "text", text: JSON.stringify({
+        totalDocs: getDocumentCount(),
+        chunkedDocs: (await Promise.resolve().then(() => (init_database(), database_exports))).getChunkedDocCount(),
+        totalChunks: getChunkCount()
       }, null, 2) }] };
     }
   );
