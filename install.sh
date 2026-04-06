@@ -36,7 +36,7 @@ curl -fsSL "https://raw.githubusercontent.com/$REPO/main/package.json" -o "$INST
 mkdir -p "$INSTALL_DIR/skill"
 curl -fsSL "https://raw.githubusercontent.com/$REPO/main/skill/SKILL.md" -o "$INSTALL_DIR/skill/SKILL.md"
 
-# Install dependencies (better-sqlite3, convex, commander)
+# Install dependencies
 echo "  ↓ Installing dependencies..."
 cd "$INSTALL_DIR"
 npm install --production --silent 2>/dev/null
@@ -48,12 +48,55 @@ exec node "$HOME/.moivault/moivault.js" "$@"
 LAUNCHER
 chmod +x "$BIN_DIR/moivault"
 
-# Install skill for Claude Code
-SKILL_DIR="$HOME/.claude/skills/moivault"
+# ── Install skill for AI agent platforms ──
+
+SKILL_INSTALLED=""
+
+# Claude Code / Claude Desktop
 if [ -d "$HOME/.claude" ]; then
-  mkdir -p "$SKILL_DIR"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$SKILL_DIR/SKILL.md"
-  echo "  ✓ Claude Code skill installed"
+  mkdir -p "$HOME/.claude/skills/moivault"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.claude/skills/moivault/SKILL.md"
+  SKILL_INSTALLED="$SKILL_INSTALLED claude-code"
+fi
+
+# Cursor (global rules)
+if [ -d "$HOME/.cursor" ] || [ -d "$HOME/Library/Application Support/Cursor" ]; then
+  mkdir -p "$HOME/.cursor/skills"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.cursor/skills/moivault.md"
+  SKILL_INSTALLED="$SKILL_INSTALLED cursor"
+fi
+
+# Windsurf / Codeium
+if [ -d "$HOME/.codeium" ] || [ -d "$HOME/.windsurf" ]; then
+  WINDSURF_DIR="${HOME}/.windsurf"
+  mkdir -p "$WINDSURF_DIR/skills"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$WINDSURF_DIR/skills/moivault.md"
+  SKILL_INSTALLED="$SKILL_INSTALLED windsurf"
+fi
+
+# Codex (OpenAI)
+if command -v codex &> /dev/null; then
+  CODEX_DIR="${HOME}/.codex"
+  mkdir -p "$CODEX_DIR/skills"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$CODEX_DIR/skills/moivault.md"
+  SKILL_INSTALLED="$SKILL_INSTALLED codex"
+fi
+
+# Aider
+if [ -d "$HOME/.aider" ]; then
+  mkdir -p "$HOME/.aider/skills"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.aider/skills/moivault.md"
+  SKILL_INSTALLED="$SKILL_INSTALLED aider"
+fi
+
+# Generic: copy to .config/moivault for any agent to discover
+mkdir -p "$HOME/.config/moivault"
+cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.config/moivault/SKILL.md"
+
+if [ -n "$SKILL_INSTALLED" ]; then
+  echo "  ✓ Agent skills installed:$SKILL_INSTALLED"
+else
+  echo "  ✓ Skill file at: ~/.config/moivault/SKILL.md"
 fi
 
 # Check PATH

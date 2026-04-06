@@ -55,8 +55,17 @@ moivault auth status             # Check auth state
 
 ## For AI Agents
 
+Works with any AI coding agent. The installer auto-detects and installs the skill file for:
+
+- **Claude Code / Claude Desktop** → `~/.claude/skills/moivault/`
+- **Cursor** → `~/.cursor/skills/`
+- **Windsurf / Codeium** → `~/.windsurf/skills/`
+- **Codex (OpenAI)** → `~/.codex/skills/`
+- **Aider** → `~/.aider/skills/`
+- **Any other agent** → `~/.config/moivault/SKILL.md`
+
+Features:
 - JSON output by default (non-TTY). Pretty output in interactive terminals.
-- Skill file auto-installed to `~/.claude/skills/moivault/` for Claude Code.
 - Auto-unlock with saved password — no interactive prompts needed.
 - Hybrid search combines keyword matching (FTS) with semantic vector search (Gemini embeddings).
 
