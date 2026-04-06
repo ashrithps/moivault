@@ -48,6 +48,10 @@ moivault doc edit <id> <field> <val> # Edit a field (title, tags, type, owner, o
 moivault doc delete <id>             # Delete a document (local + server)
 moivault doc delete <id> --force     # Delete without confirmation
 moivault doc types                   # List all document types with counts
+moivault context "<query>"           # RAG retrieval — returns doc context as JSON for any agent
+moivault context "<query>" --limit 5 --chunks 4 --include-fields
+moivault chunk build                 # Build chunk index (splits docs + embeds via Gemini)
+moivault chunk status                # Show chunk index status
 moivault usage                       # Show API usage and plan details
 moivault stats                       # Vault overview (doc count, types, last sync)
 ```
@@ -197,3 +201,38 @@ moivault sync    # Pull latest from server
 - Search returns 0 results → DON'T say "not found" immediately. Try alternative searches.
   Only report "not in vault" after exhausting search strategies.
 - Vector search fails → falls back gracefully to FTS results. May show a stderr warning.
+
+## RAG Context Retrieval (for agents)
+
+The `context` command is the preferred way for agents to query the vault. Instead of doing
+`search` → `doc text` → manual reasoning, use `context` which does retrieval and returns
+structured JSON that you can reason over directly:
+
+```bash
+moivault context "what are ashrith's health risks"
+```
+
+Returns:
+```json
+{
+  "query": "...",
+  "context": [
+    { "docId": "...", "title": "...", "type": "medical", "chunks": ["...relevant text..."], "score": 0.71 }
+  ],
+  "people": ["Ashrith Govind"],
+  "stats": { "chunksSearched": 381, "retrievalTimeMs": 1925 }
+}
+```
+
+**Setup:** Run `moivault chunk build` once to create the chunk index (splits all docs into
+~2000-char chunks and embeds them via Gemini). After that, `context` uses chunk-level
+vector search for precise retrieval.
+
+**Without chunks:** Falls back to doc-level search + truncated rawText. Still works, just less precise.
+
+**Key flags:**
+- `--limit <n>` — max documents (default 5)
+- `--chunks <n>` — max chunks per doc (default 4)
+- `--include-fields` — include structured fields in output
+- `--type <type>` — filter by document type
+- `--max-tokens <n>` — approximate token budget

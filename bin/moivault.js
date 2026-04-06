@@ -9,6 +9,55 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/core/config.ts
+import fs from "fs";
+import path from "path";
+import os from "os";
+function ensureConfigDir() {
+  if (!fs.existsSync(CONFIG_DIR)) {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 448 });
+  }
+}
+function getConfigDir() {
+  ensureConfigDir();
+  return CONFIG_DIR;
+}
+function getDbPath() {
+  ensureConfigDir();
+  return DEFAULT_DB_PATH;
+}
+function loadConfig() {
+  ensureConfigDir();
+  if (!fs.existsSync(CONFIG_FILE)) {
+    return {};
+  }
+  const raw = fs.readFileSync(CONFIG_FILE, "utf-8");
+  return JSON.parse(raw);
+}
+function saveConfig(config) {
+  ensureConfigDir();
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), {
+    mode: 384
+  });
+}
+function updateConfig(updates) {
+  const config = loadConfig();
+  const updated = { ...config, ...updates };
+  saveConfig(updated);
+  return updated;
+}
+var CONVEX_URL, CONVEX_SITE_URL, CONFIG_DIR, CONFIG_FILE, DEFAULT_DB_PATH;
+var init_config = __esm({
+  "src/core/config.ts"() {
+    "use strict";
+    CONVEX_URL = "https://perfect-mallard-90.convex.cloud";
+    CONVEX_SITE_URL = "https://perfect-mallard-90.convex.site";
+    CONFIG_DIR = path.join(os.homedir(), ".vault-cli");
+    CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+    DEFAULT_DB_PATH = path.join(CONFIG_DIR, "vault.db");
+  }
+});
+
 // src/shared/constants.ts
 var DOCUMENT_KEY_BYTES, MUK_BYTES, IV_BYTES, AUTH_TAG_BYTES, PBKDF2_ITERATIONS, PBKDF2_HASH, BLOB_VERSION;
 var init_constants = __esm({
@@ -118,6 +167,472 @@ var init_crypto = __esm({
   }
 });
 
+// src/core/database.ts
+var database_exports = {};
+__export(database_exports, {
+  closeDatabase: () => closeDatabase,
+  deleteChunksByDocId: () => deleteChunksByDocId,
+  deleteDocument: () => deleteDocument,
+  getAllDocuments: () => getAllDocuments,
+  getChunkCount: () => getChunkCount,
+  getChunkTextsById: () => getChunkTextsById,
+  getChunkedDocCount: () => getChunkedDocCount,
+  getChunksByDocId: () => getChunksByDocId,
+  getChunksWithEmbeddings: () => getChunksWithEmbeddings,
+  getDatabase: () => getDatabase,
+  getDocumentById: () => getDocumentById,
+  getDocumentCount: () => getDocumentCount,
+  getDocumentTypeCounts: () => getDocumentTypeCounts,
+  getDocumentsByTags: () => getDocumentsByTags,
+  getDocumentsByType: () => getDocumentsByType,
+  getDocumentsWithEmbeddings: () => getDocumentsWithEmbeddings,
+  openDatabase: () => openDatabase,
+  searchDocumentsFTS: () => searchDocumentsFTS,
+  updateDocumentField: () => updateDocumentField,
+  upsertChunks: () => upsertChunks,
+  upsertDocument: () => upsertDocument,
+  upsertDocuments: () => upsertDocuments
+});
+import Database from "better-sqlite3";
+function openDatabase(dbPath) {
+  if (db) return db;
+  const resolvedPath = dbPath ?? getDbPath();
+  db = new Database(resolvedPath);
+  db.pragma("journal_mode = WAL");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS documents (
+      id TEXT PRIMARY KEY,
+      title TEXT,
+      rawText TEXT,
+      type TEXT,
+      tags TEXT,
+      fields TEXT,
+      organizations TEXT,
+      mentions TEXT,
+      overview TEXT,
+      embedding BLOB,
+      encryptedDocKey BLOB,
+      mimeType TEXT,
+      storageId TEXT,
+      owner TEXT,
+      originalOwner TEXT,
+      addedBy TEXT,
+      imageUrl TEXT,
+      dateAdded TEXT,
+      status TEXT DEFAULT 'ready',
+      vaultId TEXT,
+      createdAt INTEGER,
+      updatedAt INTEGER,
+      syncStatus TEXT DEFAULT 'pending',
+      encryptedStorageId TEXT,
+      fileEncrypted INTEGER DEFAULT 0
+    );
+  `);
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+      title,
+      rawText,
+      tags,
+      type,
+      owner,
+      originalOwner,
+      mentions,
+      organizations,
+      fieldsText,
+      tokenize='unicode61'
+    );
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS doc_chunks (
+      id TEXT PRIMARY KEY,
+      docId TEXT NOT NULL,
+      chunkText TEXT NOT NULL,
+      embedding BLOB,
+      chunkIndex INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_doc_chunks_docId ON doc_chunks(docId);
+
+    CREATE TABLE IF NOT EXISTS chat_threads (
+      id TEXT PRIMARY KEY,
+      title TEXT,
+      contextDocId TEXT,
+      createdAt INTEGER,
+      updatedAt INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id TEXT PRIMARY KEY,
+      threadId TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      sourceDocIds TEXT,
+      createdAt INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_threadId ON chat_messages(threadId);
+  `);
+  return db;
+}
+function getDatabase() {
+  if (!db) {
+    throw new Error("Database not initialized \u2014 call openDatabase() first");
+  }
+  return db;
+}
+function closeDatabase() {
+  if (db) {
+    db.close();
+    db = null;
+  }
+}
+function flattenFieldsForSearch(fieldsJson, type) {
+  if (!fieldsJson) return "";
+  try {
+    const fields = JSON.parse(fieldsJson);
+    return Object.values(fields).filter(Boolean).join(" ");
+  } catch {
+    return "";
+  }
+}
+function deserializeRow(row) {
+  let embedding;
+  if (row.embedding && row.embedding instanceof Buffer) {
+    const f64 = new Float64Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 8);
+    embedding = Array.from(f64);
+  }
+  let tags = [];
+  if (typeof row.tags === "string") {
+    try {
+      tags = JSON.parse(row.tags);
+    } catch {
+      tags = [];
+    }
+  }
+  let fields = {};
+  if (typeof row.fields === "string") {
+    try {
+      fields = JSON.parse(row.fields);
+    } catch {
+      fields = {};
+    }
+  }
+  let organizations;
+  if (typeof row.organizations === "string") {
+    try {
+      organizations = JSON.parse(row.organizations);
+    } catch {
+    }
+  }
+  let mentions;
+  if (typeof row.mentions === "string") {
+    try {
+      mentions = JSON.parse(row.mentions);
+    } catch {
+    }
+  }
+  return {
+    id: row.id,
+    title: row.title,
+    rawText: row.rawText,
+    type: row.type,
+    tags,
+    fields,
+    organizations,
+    mentions,
+    overview: row.overview,
+    embedding,
+    encryptedDocKey: row.encryptedDocKey,
+    mimeType: row.mimeType,
+    storageId: row.storageId,
+    encryptedStorageId: row.encryptedStorageId,
+    fileEncrypted: row.fileEncrypted,
+    owner: row.owner,
+    originalOwner: row.originalOwner,
+    addedBy: row.addedBy,
+    imageUrl: row.imageUrl,
+    dateAdded: row.dateAdded,
+    status: row.status,
+    vaultId: row.vaultId,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    syncStatus: row.syncStatus ?? "synced"
+  };
+}
+function upsertDocument(doc) {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT OR REPLACE INTO documents
+    (id, title, rawText, type, tags, fields, organizations, mentions, overview, embedding, encryptedDocKey, mimeType, storageId, encryptedStorageId, fileEncrypted, owner, originalOwner, addedBy, imageUrl, dateAdded, status, vaultId, createdAt, updatedAt, syncStatus)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const embeddingBlob = doc.embedding ? Buffer.from(new Float64Array(doc.embedding).buffer) : null;
+  stmt.run(
+    doc.id,
+    doc.title,
+    doc.rawText ?? null,
+    doc.type,
+    JSON.stringify(doc.tags),
+    JSON.stringify(doc.fields),
+    doc.organizations ? JSON.stringify(doc.organizations) : null,
+    doc.mentions ? JSON.stringify(doc.mentions) : null,
+    doc.overview ?? null,
+    embeddingBlob,
+    doc.encryptedDocKey ?? null,
+    doc.mimeType ?? null,
+    doc.storageId ?? null,
+    doc.encryptedStorageId ?? null,
+    doc.fileEncrypted ?? 0,
+    doc.owner ?? null,
+    doc.originalOwner ?? null,
+    doc.addedBy ?? null,
+    doc.imageUrl ?? null,
+    doc.dateAdded ?? null,
+    doc.status ?? "ready",
+    doc.vaultId ?? null,
+    doc.createdAt,
+    doc.updatedAt,
+    doc.syncStatus
+  );
+  try {
+    const rowInfo = database.prepare("SELECT rowid FROM documents WHERE id = ?").get(doc.id);
+    if (rowInfo) {
+      database.prepare("DELETE FROM documents_fts WHERE rowid = ?").run(rowInfo.rowid);
+      database.prepare(`
+        INSERT INTO documents_fts (rowid, title, rawText, tags, type, owner, originalOwner, mentions, organizations, fieldsText)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        rowInfo.rowid,
+        doc.title ?? "",
+        doc.rawText ?? "",
+        JSON.stringify(doc.tags ?? []),
+        doc.type ?? "",
+        doc.owner ?? "",
+        doc.originalOwner ?? "",
+        doc.mentions ? JSON.stringify(doc.mentions) : "",
+        doc.organizations ? JSON.stringify(doc.organizations) : "",
+        flattenFieldsForSearch(JSON.stringify(doc.fields ?? {}), doc.type)
+      );
+    }
+  } catch {
+  }
+}
+function upsertDocuments(docs) {
+  const database = getDatabase();
+  const transaction = database.transaction(() => {
+    for (const doc of docs) {
+      upsertDocument(doc);
+    }
+  });
+  transaction();
+}
+function getDocumentById(id) {
+  const database = getDatabase();
+  const row = database.prepare("SELECT * FROM documents WHERE id = ?").get(id);
+  if (!row) return null;
+  return deserializeRow(row);
+}
+function getAllDocuments() {
+  const database = getDatabase();
+  const rows = database.prepare("SELECT * FROM documents ORDER BY updatedAt DESC").all();
+  return rows.map(deserializeRow);
+}
+function getDocumentsByType(type) {
+  const database = getDatabase();
+  const rows = database.prepare("SELECT * FROM documents WHERE type = ? ORDER BY updatedAt DESC").all(type);
+  return rows.map(deserializeRow);
+}
+function getDocumentsByTags(tags) {
+  const database = getDatabase();
+  const conditions = tags.map(() => "tags LIKE ?").join(" OR ");
+  const params = tags.map((t) => `%"${t}"%`);
+  const rows = database.prepare(`SELECT * FROM documents WHERE ${conditions} ORDER BY updatedAt DESC`).all(...params);
+  return rows.map(deserializeRow);
+}
+function deleteDocument(id) {
+  const database = getDatabase();
+  const rowInfo = database.prepare("SELECT rowid FROM documents WHERE id = ?").get(id);
+  database.prepare("DELETE FROM documents WHERE id = ?").run(id);
+  if (rowInfo) {
+    try {
+      database.prepare("DELETE FROM documents_fts WHERE rowid = ?").run(rowInfo.rowid);
+    } catch {
+    }
+  }
+  try {
+    database.prepare("DELETE FROM doc_chunks WHERE docId = ?").run(id);
+  } catch {
+  }
+}
+function updateDocumentField(id, key, value) {
+  const doc = getDocumentById(id);
+  if (!doc) throw new Error(`Document not found: ${id}`);
+  if (key === "title" || key === "rawText" || key === "type" || key === "owner" || key === "originalOwner" || key === "mimeType" || key === "dateAdded") {
+    const database2 = getDatabase();
+    database2.prepare(`UPDATE documents SET ${key} = ?, updatedAt = ? WHERE id = ?`).run(value, Date.now(), id);
+  } else if (key === "tags") {
+    const database2 = getDatabase();
+    const tags = Array.isArray(value) ? value : value.split(",").map((t) => t.trim());
+    database2.prepare("UPDATE documents SET tags = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(tags), Date.now(), id);
+  } else {
+    const fields = { ...doc.fields, [key]: value };
+    const database2 = getDatabase();
+    database2.prepare("UPDATE documents SET fields = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(fields), Date.now(), id);
+  }
+  const database = getDatabase();
+  const updatedDoc = getDocumentById(id);
+  if (updatedDoc) {
+    const rowInfo = database.prepare("SELECT rowid FROM documents WHERE id = ?").get(id);
+    if (rowInfo) {
+      try {
+        database.prepare("DELETE FROM documents_fts WHERE rowid = ?").run(rowInfo.rowid);
+        database.prepare(`
+          INSERT INTO documents_fts (rowid, title, rawText, tags, type, owner, originalOwner, mentions, organizations, fieldsText)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          rowInfo.rowid,
+          updatedDoc.title ?? "",
+          updatedDoc.rawText ?? "",
+          JSON.stringify(updatedDoc.tags ?? []),
+          updatedDoc.type ?? "",
+          updatedDoc.owner ?? "",
+          updatedDoc.originalOwner ?? "",
+          updatedDoc.mentions ? JSON.stringify(updatedDoc.mentions) : "",
+          updatedDoc.organizations ? JSON.stringify(updatedDoc.organizations) : "",
+          Object.values(updatedDoc.fields).filter(Boolean).join(" ")
+        );
+      } catch {
+      }
+    }
+  }
+}
+function searchDocumentsFTS(query, limit = 50) {
+  const database = getDatabase();
+  const terms = query.split(/\s+/).filter(Boolean);
+  const candidates = /* @__PURE__ */ new Map();
+  try {
+    const ftsQuery = terms.map((t) => `${t}*`).join(" ");
+    const ftsRows = database.prepare(`
+      SELECT d.* FROM documents_fts fts
+      JOIN documents d ON d.rowid = fts.rowid
+      WHERE documents_fts MATCH ?
+      LIMIT ?
+    `).all(ftsQuery, limit);
+    for (const row of ftsRows) {
+      const doc = deserializeRow(row);
+      candidates.set(doc.id, doc);
+    }
+  } catch {
+  }
+  if (candidates.size < limit) {
+    const likePattern = `%${terms.join("%")}%`;
+    const likeRows = database.prepare(`
+      SELECT * FROM documents
+      WHERE title LIKE @pat COLLATE NOCASE
+         OR tags LIKE @pat COLLATE NOCASE
+         OR type LIKE @pat COLLATE NOCASE
+         OR owner LIKE @pat COLLATE NOCASE
+         OR rawText LIKE @pat COLLATE NOCASE
+      LIMIT @lim
+    `).all({ pat: likePattern, lim: limit });
+    for (const row of likeRows) {
+      const doc = deserializeRow(row);
+      if (!candidates.has(doc.id)) {
+        candidates.set(doc.id, doc);
+      }
+    }
+  }
+  return Array.from(candidates.values());
+}
+function getDocumentCount() {
+  const database = getDatabase();
+  const result = database.prepare("SELECT COUNT(*) as count FROM documents").get();
+  return result.count;
+}
+function getDocumentTypeCounts() {
+  const database = getDatabase();
+  return database.prepare(
+    "SELECT type, COUNT(*) as count FROM documents GROUP BY type ORDER BY count DESC"
+  ).all();
+}
+function upsertChunks(chunks) {
+  const database = getDatabase();
+  const stmt = database.prepare(`
+    INSERT OR REPLACE INTO doc_chunks (id, docId, chunkText, embedding, chunkIndex)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const transaction = database.transaction(() => {
+    for (const chunk of chunks) {
+      const embBlob = chunk.embedding ? Buffer.from(new Float64Array(chunk.embedding).buffer) : null;
+      stmt.run(chunk.id, chunk.docId, chunk.chunkText, embBlob, chunk.chunkIndex);
+    }
+  });
+  transaction();
+}
+function deleteChunksByDocId(docId) {
+  const database = getDatabase();
+  database.prepare("DELETE FROM doc_chunks WHERE docId = ?").run(docId);
+}
+function getChunksByDocId(docId) {
+  const database = getDatabase();
+  const rows = database.prepare("SELECT * FROM doc_chunks WHERE docId = ? ORDER BY chunkIndex ASC").all(docId);
+  return rows.map(deserializeChunkRow);
+}
+function getChunkTextsById(ids) {
+  const database = getDatabase();
+  const map = /* @__PURE__ */ new Map();
+  if (ids.length === 0) return map;
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = database.prepare(`SELECT id, chunkText FROM doc_chunks WHERE id IN (${placeholders})`).all(...ids);
+  for (const row of rows) map.set(row.id, row.chunkText);
+  return map;
+}
+function getChunkCount() {
+  const database = getDatabase();
+  return database.prepare("SELECT COUNT(*) as c FROM doc_chunks").get().c;
+}
+function getChunkedDocCount() {
+  const database = getDatabase();
+  return database.prepare("SELECT COUNT(DISTINCT docId) as c FROM doc_chunks").get().c;
+}
+function getChunksWithEmbeddings() {
+  const database = getDatabase();
+  const rows = database.prepare("SELECT id, docId, embedding FROM doc_chunks WHERE embedding IS NOT NULL AND length(embedding) > 100").all();
+  return rows.map((row) => {
+    const f64 = new Float64Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 8);
+    return { id: row.id, docId: row.docId, embedding: Array.from(f64) };
+  });
+}
+function deserializeChunkRow(row) {
+  let embedding;
+  if (row.embedding && row.embedding instanceof Buffer && row.embedding.length > 0) {
+    const f64 = new Float64Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 8);
+    embedding = Array.from(f64);
+  }
+  return {
+    id: row.id,
+    docId: row.docId,
+    chunkText: row.chunkText,
+    embedding,
+    chunkIndex: row.chunkIndex
+  };
+}
+function getDocumentsWithEmbeddings() {
+  const database = getDatabase();
+  const rows = database.prepare("SELECT id, embedding FROM documents").all();
+  return rows.map((row) => {
+    if (!row.embedding) return { id: row.id, embedding: null };
+    const f64 = new Float64Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 8);
+    return { id: row.id, embedding: Array.from(f64) };
+  });
+}
+var db;
+var init_database = __esm({
+  "src/core/database.ts"() {
+    "use strict";
+    init_config();
+    db = null;
+  }
+});
+
 // src/cli/index.ts
 import { Command } from "commander";
 
@@ -125,53 +640,9 @@ import { Command } from "commander";
 import http from "http";
 
 // src/core/keychain.ts
+init_config();
 import fs2 from "fs";
 import path2 from "path";
-
-// src/core/config.ts
-import fs from "fs";
-import path from "path";
-import os from "os";
-var CONVEX_URL = "https://perfect-mallard-90.convex.cloud";
-var CONVEX_SITE_URL = "https://perfect-mallard-90.convex.site";
-var CONFIG_DIR = path.join(os.homedir(), ".vault-cli");
-var CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
-var DEFAULT_DB_PATH = path.join(CONFIG_DIR, "vault.db");
-function ensureConfigDir() {
-  if (!fs.existsSync(CONFIG_DIR)) {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 448 });
-  }
-}
-function getConfigDir() {
-  ensureConfigDir();
-  return CONFIG_DIR;
-}
-function getDbPath() {
-  ensureConfigDir();
-  return DEFAULT_DB_PATH;
-}
-function loadConfig() {
-  ensureConfigDir();
-  if (!fs.existsSync(CONFIG_FILE)) {
-    return {};
-  }
-  const raw = fs.readFileSync(CONFIG_FILE, "utf-8");
-  return JSON.parse(raw);
-}
-function saveConfig(config) {
-  ensureConfigDir();
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), {
-    mode: 384
-  });
-}
-function updateConfig(updates) {
-  const config = loadConfig();
-  const updated = { ...config, ...updates };
-  saveConfig(updated);
-  return updated;
-}
-
-// src/core/keychain.ts
 function createFileBackend() {
   const secretsFile = path2.join(getConfigDir(), "secrets.json");
   function readSecrets() {
@@ -205,6 +676,9 @@ function getKeychain() {
   backend = createFileBackend();
   return backend;
 }
+
+// src/cli/commands/auth.ts
+init_config();
 
 // src/core/output.ts
 function shouldOutputJson(opts) {
@@ -514,363 +988,8 @@ function generateDocumentKey() {
 // src/core/sync.ts
 init_crypto();
 import { ConvexHttpClient } from "convex/browser";
-
-// src/core/database.ts
-import Database from "better-sqlite3";
-var db = null;
-function openDatabase(dbPath) {
-  if (db) return db;
-  const resolvedPath = dbPath ?? getDbPath();
-  db = new Database(resolvedPath);
-  db.pragma("journal_mode = WAL");
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS documents (
-      id TEXT PRIMARY KEY,
-      title TEXT,
-      rawText TEXT,
-      type TEXT,
-      tags TEXT,
-      fields TEXT,
-      organizations TEXT,
-      mentions TEXT,
-      overview TEXT,
-      embedding BLOB,
-      encryptedDocKey BLOB,
-      mimeType TEXT,
-      storageId TEXT,
-      owner TEXT,
-      originalOwner TEXT,
-      addedBy TEXT,
-      imageUrl TEXT,
-      dateAdded TEXT,
-      status TEXT DEFAULT 'ready',
-      vaultId TEXT,
-      createdAt INTEGER,
-      updatedAt INTEGER,
-      syncStatus TEXT DEFAULT 'pending',
-      encryptedStorageId TEXT,
-      fileEncrypted INTEGER DEFAULT 0
-    );
-  `);
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-      title,
-      rawText,
-      tags,
-      type,
-      owner,
-      originalOwner,
-      mentions,
-      organizations,
-      fieldsText,
-      tokenize='unicode61'
-    );
-  `);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS doc_chunks (
-      id TEXT PRIMARY KEY,
-      docId TEXT NOT NULL,
-      chunkText TEXT NOT NULL,
-      embedding BLOB,
-      chunkIndex INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_doc_chunks_docId ON doc_chunks(docId);
-
-    CREATE TABLE IF NOT EXISTS chat_threads (
-      id TEXT PRIMARY KEY,
-      title TEXT,
-      contextDocId TEXT,
-      createdAt INTEGER,
-      updatedAt INTEGER
-    );
-
-    CREATE TABLE IF NOT EXISTS chat_messages (
-      id TEXT PRIMARY KEY,
-      threadId TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      sourceDocIds TEXT,
-      createdAt INTEGER
-    );
-    CREATE INDEX IF NOT EXISTS idx_chat_messages_threadId ON chat_messages(threadId);
-  `);
-  return db;
-}
-function getDatabase() {
-  if (!db) {
-    throw new Error("Database not initialized \u2014 call openDatabase() first");
-  }
-  return db;
-}
-function flattenFieldsForSearch(fieldsJson, type) {
-  if (!fieldsJson) return "";
-  try {
-    const fields = JSON.parse(fieldsJson);
-    return Object.values(fields).filter(Boolean).join(" ");
-  } catch {
-    return "";
-  }
-}
-function deserializeRow(row) {
-  let embedding;
-  if (row.embedding && row.embedding instanceof Buffer) {
-    const f64 = new Float64Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 8);
-    embedding = Array.from(f64);
-  }
-  let tags = [];
-  if (typeof row.tags === "string") {
-    try {
-      tags = JSON.parse(row.tags);
-    } catch {
-      tags = [];
-    }
-  }
-  let fields = {};
-  if (typeof row.fields === "string") {
-    try {
-      fields = JSON.parse(row.fields);
-    } catch {
-      fields = {};
-    }
-  }
-  let organizations;
-  if (typeof row.organizations === "string") {
-    try {
-      organizations = JSON.parse(row.organizations);
-    } catch {
-    }
-  }
-  let mentions;
-  if (typeof row.mentions === "string") {
-    try {
-      mentions = JSON.parse(row.mentions);
-    } catch {
-    }
-  }
-  return {
-    id: row.id,
-    title: row.title,
-    rawText: row.rawText,
-    type: row.type,
-    tags,
-    fields,
-    organizations,
-    mentions,
-    overview: row.overview,
-    embedding,
-    encryptedDocKey: row.encryptedDocKey,
-    mimeType: row.mimeType,
-    storageId: row.storageId,
-    encryptedStorageId: row.encryptedStorageId,
-    fileEncrypted: row.fileEncrypted,
-    owner: row.owner,
-    originalOwner: row.originalOwner,
-    addedBy: row.addedBy,
-    imageUrl: row.imageUrl,
-    dateAdded: row.dateAdded,
-    status: row.status,
-    vaultId: row.vaultId,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-    syncStatus: row.syncStatus ?? "synced"
-  };
-}
-function upsertDocument(doc) {
-  const database = getDatabase();
-  const stmt = database.prepare(`
-    INSERT OR REPLACE INTO documents
-    (id, title, rawText, type, tags, fields, organizations, mentions, overview, embedding, encryptedDocKey, mimeType, storageId, encryptedStorageId, fileEncrypted, owner, originalOwner, addedBy, imageUrl, dateAdded, status, vaultId, createdAt, updatedAt, syncStatus)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const embeddingBlob = doc.embedding ? Buffer.from(new Float64Array(doc.embedding).buffer) : null;
-  stmt.run(
-    doc.id,
-    doc.title,
-    doc.rawText ?? null,
-    doc.type,
-    JSON.stringify(doc.tags),
-    JSON.stringify(doc.fields),
-    doc.organizations ? JSON.stringify(doc.organizations) : null,
-    doc.mentions ? JSON.stringify(doc.mentions) : null,
-    doc.overview ?? null,
-    embeddingBlob,
-    doc.encryptedDocKey ?? null,
-    doc.mimeType ?? null,
-    doc.storageId ?? null,
-    doc.encryptedStorageId ?? null,
-    doc.fileEncrypted ?? 0,
-    doc.owner ?? null,
-    doc.originalOwner ?? null,
-    doc.addedBy ?? null,
-    doc.imageUrl ?? null,
-    doc.dateAdded ?? null,
-    doc.status ?? "ready",
-    doc.vaultId ?? null,
-    doc.createdAt,
-    doc.updatedAt,
-    doc.syncStatus
-  );
-  try {
-    const rowInfo = database.prepare("SELECT rowid FROM documents WHERE id = ?").get(doc.id);
-    if (rowInfo) {
-      database.prepare("DELETE FROM documents_fts WHERE rowid = ?").run(rowInfo.rowid);
-      database.prepare(`
-        INSERT INTO documents_fts (rowid, title, rawText, tags, type, owner, originalOwner, mentions, organizations, fieldsText)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        rowInfo.rowid,
-        doc.title ?? "",
-        doc.rawText ?? "",
-        JSON.stringify(doc.tags ?? []),
-        doc.type ?? "",
-        doc.owner ?? "",
-        doc.originalOwner ?? "",
-        doc.mentions ? JSON.stringify(doc.mentions) : "",
-        doc.organizations ? JSON.stringify(doc.organizations) : "",
-        flattenFieldsForSearch(JSON.stringify(doc.fields ?? {}), doc.type)
-      );
-    }
-  } catch {
-  }
-}
-function getDocumentById(id) {
-  const database = getDatabase();
-  const row = database.prepare("SELECT * FROM documents WHERE id = ?").get(id);
-  if (!row) return null;
-  return deserializeRow(row);
-}
-function getAllDocuments() {
-  const database = getDatabase();
-  const rows = database.prepare("SELECT * FROM documents ORDER BY updatedAt DESC").all();
-  return rows.map(deserializeRow);
-}
-function getDocumentsByType(type) {
-  const database = getDatabase();
-  const rows = database.prepare("SELECT * FROM documents WHERE type = ? ORDER BY updatedAt DESC").all(type);
-  return rows.map(deserializeRow);
-}
-function getDocumentsByTags(tags) {
-  const database = getDatabase();
-  const conditions = tags.map(() => "tags LIKE ?").join(" OR ");
-  const params = tags.map((t) => `%"${t}"%`);
-  const rows = database.prepare(`SELECT * FROM documents WHERE ${conditions} ORDER BY updatedAt DESC`).all(...params);
-  return rows.map(deserializeRow);
-}
-function deleteDocument(id) {
-  const database = getDatabase();
-  const rowInfo = database.prepare("SELECT rowid FROM documents WHERE id = ?").get(id);
-  database.prepare("DELETE FROM documents WHERE id = ?").run(id);
-  if (rowInfo) {
-    try {
-      database.prepare("DELETE FROM documents_fts WHERE rowid = ?").run(rowInfo.rowid);
-    } catch {
-    }
-  }
-  try {
-    database.prepare("DELETE FROM doc_chunks WHERE docId = ?").run(id);
-  } catch {
-  }
-}
-function updateDocumentField(id, key, value) {
-  const doc = getDocumentById(id);
-  if (!doc) throw new Error(`Document not found: ${id}`);
-  if (key === "title" || key === "rawText" || key === "type" || key === "owner" || key === "originalOwner" || key === "mimeType" || key === "dateAdded") {
-    const database2 = getDatabase();
-    database2.prepare(`UPDATE documents SET ${key} = ?, updatedAt = ? WHERE id = ?`).run(value, Date.now(), id);
-  } else if (key === "tags") {
-    const database2 = getDatabase();
-    const tags = Array.isArray(value) ? value : value.split(",").map((t) => t.trim());
-    database2.prepare("UPDATE documents SET tags = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(tags), Date.now(), id);
-  } else {
-    const fields = { ...doc.fields, [key]: value };
-    const database2 = getDatabase();
-    database2.prepare("UPDATE documents SET fields = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(fields), Date.now(), id);
-  }
-  const database = getDatabase();
-  const updatedDoc = getDocumentById(id);
-  if (updatedDoc) {
-    const rowInfo = database.prepare("SELECT rowid FROM documents WHERE id = ?").get(id);
-    if (rowInfo) {
-      try {
-        database.prepare("DELETE FROM documents_fts WHERE rowid = ?").run(rowInfo.rowid);
-        database.prepare(`
-          INSERT INTO documents_fts (rowid, title, rawText, tags, type, owner, originalOwner, mentions, organizations, fieldsText)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          rowInfo.rowid,
-          updatedDoc.title ?? "",
-          updatedDoc.rawText ?? "",
-          JSON.stringify(updatedDoc.tags ?? []),
-          updatedDoc.type ?? "",
-          updatedDoc.owner ?? "",
-          updatedDoc.originalOwner ?? "",
-          updatedDoc.mentions ? JSON.stringify(updatedDoc.mentions) : "",
-          updatedDoc.organizations ? JSON.stringify(updatedDoc.organizations) : "",
-          Object.values(updatedDoc.fields).filter(Boolean).join(" ")
-        );
-      } catch {
-      }
-    }
-  }
-}
-function searchDocumentsFTS(query, limit = 50) {
-  const database = getDatabase();
-  const terms = query.split(/\s+/).filter(Boolean);
-  const candidates = /* @__PURE__ */ new Map();
-  try {
-    const ftsQuery = terms.map((t) => `${t}*`).join(" ");
-    const ftsRows = database.prepare(`
-      SELECT d.* FROM documents_fts fts
-      JOIN documents d ON d.rowid = fts.rowid
-      WHERE documents_fts MATCH ?
-      LIMIT ?
-    `).all(ftsQuery, limit);
-    for (const row of ftsRows) {
-      const doc = deserializeRow(row);
-      candidates.set(doc.id, doc);
-    }
-  } catch {
-  }
-  if (candidates.size < limit) {
-    const likePattern = `%${terms.join("%")}%`;
-    const likeRows = database.prepare(`
-      SELECT * FROM documents
-      WHERE title LIKE @pat COLLATE NOCASE
-         OR tags LIKE @pat COLLATE NOCASE
-         OR type LIKE @pat COLLATE NOCASE
-         OR owner LIKE @pat COLLATE NOCASE
-         OR rawText LIKE @pat COLLATE NOCASE
-      LIMIT @lim
-    `).all({ pat: likePattern, lim: limit });
-    for (const row of likeRows) {
-      const doc = deserializeRow(row);
-      if (!candidates.has(doc.id)) {
-        candidates.set(doc.id, doc);
-      }
-    }
-  }
-  return Array.from(candidates.values());
-}
-function getDocumentCount() {
-  const database = getDatabase();
-  const result = database.prepare("SELECT COUNT(*) as count FROM documents").get();
-  return result.count;
-}
-function getDocumentTypeCounts() {
-  const database = getDatabase();
-  return database.prepare(
-    "SELECT type, COUNT(*) as count FROM documents GROUP BY type ORDER BY count DESC"
-  ).all();
-}
-function getDocumentsWithEmbeddings() {
-  const database = getDatabase();
-  const rows = database.prepare("SELECT id, embedding FROM documents").all();
-  return rows.map((row) => {
-    if (!row.embedding) return { id: row.id, embedding: null };
-    const f64 = new Float64Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 8);
-    return { id: row.id, embedding: Array.from(f64) };
-  });
-}
+init_database();
+init_config();
 
 // src/core/convexApi.ts
 import { anyApi } from "convex/server";
@@ -1050,6 +1169,8 @@ async function fetchAndStoreVaultMeta(vaultId) {
 }
 
 // src/cli/commands/unlock.ts
+init_database();
+init_config();
 import { createInterface } from "readline";
 async function promptPassword(message) {
   return new Promise((resolve) => {
@@ -1158,6 +1279,8 @@ function registerUnlockCommands(program2) {
 }
 
 // src/cli/commands/sync.ts
+init_config();
+init_database();
 function registerSyncCommands(program2) {
   program2.command("sync").description("Sync encrypted documents from Convex to local SQLite").option("--full", "Force full sync (re-download all documents)").option("--status", "Show sync status without syncing").action(async (opts) => {
     const isJson = shouldOutputJson(program2.opts());
@@ -1231,11 +1354,14 @@ function registerSyncCommands(program2) {
 }
 
 // src/cli/commands/doc.ts
+init_database();
 import fs3 from "fs";
 import path3 from "path";
 import os2 from "os";
 import crypto3 from "crypto";
 init_crypto();
+init_database();
+init_config();
 function requireUnlocked(isJson) {
   if (!isVaultUnlocked()) {
     const msg = "Vault is locked \u2014 run `vault unlock` first";
@@ -1711,6 +1837,9 @@ function registerDocCommands(program2) {
   });
 }
 
+// src/cli/commands/search.ts
+init_database();
+
 // src/shared/vectorSearch.ts
 var DIMS = 3072;
 var index = null;
@@ -1759,6 +1888,56 @@ function searchVectors(queryEmbedding, topK = 10) {
     }
     const score = dot / (queryNorm * docNorm);
     scores.push({ id: index.ids[i], score });
+  }
+  scores.sort((a, b) => b.score - a.score);
+  return scores.slice(0, topK);
+}
+var chunkIndex = null;
+function buildChunkVectorIndex(chunks) {
+  const valid = chunks.filter((c) => c.embedding && c.embedding.length === DIMS);
+  const count = valid.length;
+  if (count === 0) {
+    chunkIndex = null;
+    return;
+  }
+  const chunkIds = [];
+  const docIds = [];
+  const vectors = new Float32Array(count * DIMS);
+  const norms = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    const chunk = valid[i];
+    chunkIds.push(chunk.id);
+    docIds.push(chunk.docId);
+    const emb = chunk.embedding;
+    let normSq = 0;
+    for (let j = 0; j < DIMS; j++) {
+      const val = emb[j];
+      vectors[i * DIMS + j] = val;
+      normSq += val * val;
+    }
+    norms[i] = Math.sqrt(normSq);
+  }
+  chunkIndex = { chunkIds, docIds, vectors, norms, count };
+}
+function searchChunkVectors(queryEmbedding, topK = 20) {
+  if (!chunkIndex || queryEmbedding.length !== DIMS) return [];
+  let queryNormSq = 0;
+  for (let j = 0; j < DIMS; j++) {
+    queryNormSq += queryEmbedding[j] * queryEmbedding[j];
+  }
+  const queryNorm = Math.sqrt(queryNormSq);
+  if (queryNorm === 0) return [];
+  const scores = [];
+  for (let i = 0; i < chunkIndex.count; i++) {
+    const docNorm = chunkIndex.norms[i];
+    if (docNorm === 0) continue;
+    let dot = 0;
+    const offset = i * DIMS;
+    for (let j = 0; j < DIMS; j++) {
+      dot += queryEmbedding[j] * chunkIndex.vectors[offset + j];
+    }
+    const score = dot / (queryNorm * docNorm);
+    scores.push({ id: chunkIndex.chunkIds[i], docId: chunkIndex.docIds[i], score });
   }
   scores.sort((a, b) => b.score - a.score);
   return scores.slice(0, topK);
@@ -1873,6 +2052,8 @@ function registerSearchCommands(program2) {
 }
 
 // src/cli/commands/stats.ts
+init_database();
+init_config();
 function registerStatsCommand(program2) {
   program2.command("stats").description("Show vault statistics").action(() => {
     const isJson = shouldOutputJson(program2.opts());
@@ -1912,6 +2093,7 @@ function registerStatsCommand(program2) {
 }
 
 // src/cli/commands/usage.ts
+init_database();
 function registerUsageCommand(program2) {
   program2.command("usage").description("Show API usage, plan details, and vault statistics").action(async () => {
     const isJson = shouldOutputJson(program2.opts());
@@ -1968,7 +2150,9 @@ function registerUsageCommand(program2) {
 }
 
 // src/cli/commands/people.ts
+init_database();
 init_crypto();
+init_config();
 init_constants();
 import crypto4 from "crypto";
 var REGISTRY_BLOB_ID = "__people_registry__";
@@ -2178,12 +2362,353 @@ function registerPeopleCommands(program2) {
   });
 }
 
+// src/cli/commands/chunk.ts
+init_database();
+
+// src/shared/chunking.ts
+var CHUNK_SIZE = 2e3;
+var CHUNK_OVERLAP = 400;
+function splitIntoChunks(rawText, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
+  if (!rawText || rawText.trim().length === 0) return [];
+  if (rawText.length <= chunkSize) return [rawText.trim()];
+  const chunks = [];
+  const paragraphs = rawText.split(/\n\n+/);
+  let currentChunk = "";
+  for (const para of paragraphs) {
+    if (currentChunk.length + para.length + 2 <= chunkSize) {
+      currentChunk += (currentChunk ? "\n\n" : "") + para;
+    } else {
+      if (currentChunk) {
+        chunks.push(currentChunk.trim());
+        const overlapText = currentChunk.slice(-overlap);
+        currentChunk = overlapText + "\n\n" + para;
+      } else {
+        const sentences = para.match(/[^.!?]+[.!?]+\s*/g) || [para];
+        for (const sentence of sentences) {
+          if (currentChunk.length + sentence.length <= chunkSize) {
+            currentChunk += sentence;
+          } else {
+            if (currentChunk) {
+              chunks.push(currentChunk.trim());
+              const overlapText = currentChunk.slice(-overlap);
+              currentChunk = overlapText + sentence;
+            } else {
+              chunks.push(sentence.trim().slice(0, chunkSize));
+              currentChunk = "";
+            }
+          }
+        }
+      }
+    }
+  }
+  if (currentChunk.trim()) {
+    chunks.push(currentChunk.trim());
+  }
+  return chunks;
+}
+function buildStructuredChunk(type, fields, title) {
+  const displayName = type.replace(/_/g, " ");
+  const parts = [`This is a ${displayName}: "${title}".`];
+  for (const [key, value] of Object.entries(fields)) {
+    if (value != null && value !== "" && value !== "Unknown" && value !== "N/A") {
+      const label = key.replace(/([A-Z])/g, " $1").replace(/^./, (s) => s.toUpperCase());
+      parts.push(`${label}: ${String(value)}.`);
+    }
+  }
+  return parts.join(" ");
+}
+function chunkDocument(docId, title, type, fields, rawText) {
+  const chunks = [];
+  const structuredText = buildStructuredChunk(type, fields, title);
+  chunks.push({
+    id: `chunk_${docId}_0`,
+    docId,
+    chunkText: structuredText,
+    chunkIndex: 0
+  });
+  if (rawText) {
+    const prefix = `[${title} - ${type.replace(/_/g, " ")}] `;
+    const rawChunks = splitIntoChunks(rawText);
+    for (let i = 0; i < rawChunks.length; i++) {
+      chunks.push({
+        id: `chunk_${docId}_${i + 1}`,
+        docId,
+        chunkText: prefix + rawChunks[i],
+        chunkIndex: i + 1
+      });
+    }
+  }
+  return chunks;
+}
+
+// src/cli/commands/chunk.ts
+function registerChunkCommands(program2) {
+  const chunk = program2.command("chunk").description("Manage chunk index for RAG context retrieval");
+  chunk.command("status").description("Show chunk index status").action(() => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      if (isJson) {
+        output({ error: "Vault is locked" });
+      } else {
+        console.error("Vault is locked");
+      }
+      process.exit(1);
+    }
+    const totalDocs = getDocumentCount();
+    const chunkedDocs = getChunkedDocCount();
+    const totalChunks = getChunkCount();
+    if (isJson) {
+      output({ totalDocs, chunkedDocs, unchunkedDocs: totalDocs - chunkedDocs, totalChunks });
+    } else {
+      console.log(`  Total documents:   ${totalDocs}`);
+      console.log(`  Chunked:           ${chunkedDocs}`);
+      console.log(`  Unchunked:         ${totalDocs - chunkedDocs}`);
+      console.log(`  Total chunks:      ${totalChunks}`);
+    }
+  });
+  chunk.command("build").description("Chunk all documents and generate embeddings").option("--force", "Re-chunk all documents (including already chunked)").option("--doc <id>", "Chunk a single document").option("--batch-size <n>", "Texts per embedding batch", "10").action(async (opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      if (isJson) {
+        output({ error: "Vault is locked" });
+      } else {
+        console.error("Vault is locked");
+      }
+      process.exit(1);
+    }
+    const batchSize = parseInt(opts.batchSize);
+    let docs = getAllDocuments().filter((d) => d.id !== "__people_registry__" && d.rawText);
+    if (opts.doc) {
+      docs = docs.filter((d) => d.id === opts.doc);
+      if (docs.length === 0) {
+        if (isJson) {
+          output({ error: "Document not found or has no text" });
+        } else {
+          console.error("Document not found or has no text.");
+        }
+        process.exit(1);
+      }
+    }
+    if (!opts.force && !opts.doc) {
+      const chunkedDocIds = /* @__PURE__ */ new Set();
+      const allDocs = getAllDocuments();
+      const chunkedCount = getChunkedDocCount();
+      if (chunkedCount > 0) {
+        const db2 = (await Promise.resolve().then(() => (init_database(), database_exports))).getDatabase();
+        const rows = db2.prepare("SELECT DISTINCT docId FROM doc_chunks").all();
+        for (const row of rows) chunkedDocIds.add(row.docId);
+      }
+      docs = docs.filter((d) => !chunkedDocIds.has(d.id));
+    }
+    if (docs.length === 0) {
+      if (isJson) {
+        output({ status: "up_to_date", chunked: 0 });
+      } else {
+        console.log("All documents already chunked.");
+      }
+      return;
+    }
+    if (!isJson) process.stderr.write(`Chunking ${docs.length} documents...
+`);
+    let convex;
+    try {
+      convex = await authenticateConvexClient();
+    } catch (err) {
+      if (!isJson) process.stderr.write(`[warning] No Convex auth \u2014 chunks will be stored without embeddings
+`);
+    }
+    let totalChunks = 0;
+    let docsProcessed = 0;
+    for (const doc of docs) {
+      if (opts.force || opts.doc) {
+        deleteChunksByDocId(doc.id);
+      }
+      const chunks = chunkDocument(doc.id, doc.title, doc.type, doc.fields, doc.rawText);
+      if (convex) {
+        for (let i = 0; i < chunks.length; i += batchSize) {
+          const batch = chunks.slice(i, i + batchSize);
+          try {
+            const embeddings = await convex.action(api.search.embedChunks, {
+              texts: batch.map((c) => c.chunkText)
+            });
+            for (let j = 0; j < batch.length; j++) {
+              if (embeddings[j] && embeddings[j].length > 0) {
+                batch[j].embedding = embeddings[j];
+              }
+            }
+          } catch {
+          }
+        }
+      }
+      upsertChunks(chunks);
+      totalChunks += chunks.length;
+      docsProcessed++;
+      if (!isJson && process.stderr.isTTY) {
+        process.stderr.write(`\r  ${docsProcessed}/${docs.length} docs, ${totalChunks} chunks`);
+      }
+    }
+    if (!isJson && process.stderr.isTTY) process.stderr.write("\n");
+    if (isJson) {
+      output({ status: "built", docsChunked: docsProcessed, totalChunks });
+    } else {
+      console.log(`Chunked ${docsProcessed} docs into ${totalChunks} chunks.`);
+    }
+  });
+}
+
+// src/cli/commands/context.ts
+init_database();
+init_database();
+function registerContextCommand(program2) {
+  program2.command("context").description("Retrieve relevant document context for a query (for agent RAG)").argument("<query>", "Natural language query").option("--limit <n>", "Max documents to return", "5").option("--chunks <n>", "Max chunks per document", "4").option("--include-fields", "Include structured fields in output").option("--type <type>", "Filter by document type").option("--max-tokens <n>", "Approximate token budget (chars/4)").action(async (query, opts) => {
+    if (!isVaultUnlocked()) {
+      console.log(JSON.stringify({ error: "Vault is locked" }));
+      process.exit(1);
+    }
+    const startTime = Date.now();
+    const limit = parseInt(opts.limit);
+    const maxChunksPerDoc = parseInt(opts.chunks);
+    const maxTokens = opts.maxTokens ? parseInt(opts.maxTokens) : void 0;
+    const contextDocs = [];
+    const seenDocIds = /* @__PURE__ */ new Set();
+    const hasChunks = getChunkCount() > 0;
+    let chunksSearched = 0;
+    if (hasChunks) {
+      const chunksWithEmbeddings = getChunksWithEmbeddings();
+      chunksSearched = chunksWithEmbeddings.length;
+      buildChunkVectorIndex(chunksWithEmbeddings);
+      try {
+        const convex = await authenticateConvexClient();
+        const queryEmbedding = await convex.action(api.search.embedQuery, { query });
+        const chunkResults = searchChunkVectors(queryEmbedding, maxChunksPerDoc * limit);
+        const chunksByDoc = /* @__PURE__ */ new Map();
+        for (const cr of chunkResults) {
+          if (!chunksByDoc.has(cr.docId)) chunksByDoc.set(cr.docId, []);
+          chunksByDoc.get(cr.docId).push({ id: cr.id, score: cr.score });
+        }
+        for (const [docId, docChunks] of chunksByDoc) {
+          if (seenDocIds.has(docId)) continue;
+          if (opts.type) {
+            const doc2 = getDocumentById(docId);
+            if (doc2 && doc2.type !== opts.type) continue;
+          }
+          const doc = getDocumentById(docId);
+          if (!doc) continue;
+          const chunkIds = docChunks.slice(0, maxChunksPerDoc).map((c) => c.id);
+          const chunkTexts = getChunkTextsById(chunkIds);
+          const chunks = chunkIds.map((id) => chunkTexts.get(id) || "").filter(Boolean);
+          const maxScore = Math.max(...docChunks.map((c) => c.score));
+          const ctxDoc = {
+            docId,
+            title: doc.title,
+            type: doc.type,
+            owner: doc.owner,
+            score: maxScore,
+            scoreSource: "vector",
+            chunks
+          };
+          if (opts.includeFields) ctxDoc.fields = doc.fields;
+          seenDocIds.add(docId);
+          contextDocs.push(ctxDoc);
+          if (contextDocs.length >= limit) break;
+        }
+      } catch {
+      }
+    }
+    const ftsResults = searchDocumentsFTS(query, limit);
+    for (const doc of ftsResults) {
+      if (seenDocIds.has(doc.id)) {
+        const existing = contextDocs.find((c) => c.docId === doc.id);
+        if (existing) existing.scoreSource = "hybrid";
+        continue;
+      }
+      if (opts.type && doc.type !== opts.type) continue;
+      let chunks;
+      if (hasChunks) {
+        const docChunks = getChunksByDocId(doc.id);
+        chunks = docChunks.slice(0, maxChunksPerDoc).map((c) => c.chunkText);
+      } else {
+        chunks = doc.rawText ? [doc.rawText.slice(0, 4e3)] : [];
+      }
+      const ctxDoc = {
+        docId: doc.id,
+        title: doc.title,
+        type: doc.type,
+        owner: doc.owner,
+        score: 1,
+        scoreSource: "fts",
+        chunks
+      };
+      if (opts.includeFields) ctxDoc.fields = doc.fields;
+      seenDocIds.add(doc.id);
+      contextDocs.push(ctxDoc);
+      if (contextDocs.length >= limit) break;
+    }
+    if (!hasChunks && contextDocs.length < limit) {
+      try {
+        const docsWithEmb = getDocumentsWithEmbeddings();
+        buildVectorIndex(docsWithEmb);
+        const convex = await authenticateConvexClient();
+        const queryEmbedding = await convex.action(api.search.embedQuery, { query });
+        const vectorResults = searchVectors(queryEmbedding, limit);
+        for (const vr of vectorResults) {
+          if (seenDocIds.has(vr.id) || vr.score < 0.3) continue;
+          const doc = getDocumentById(vr.id);
+          if (!doc) continue;
+          if (opts.type && doc.type !== opts.type) continue;
+          const ctxDoc = {
+            docId: doc.id,
+            title: doc.title,
+            type: doc.type,
+            owner: doc.owner,
+            score: vr.score,
+            scoreSource: "vector",
+            chunks: doc.rawText ? [doc.rawText.slice(0, 4e3)] : []
+          };
+          if (opts.includeFields) ctxDoc.fields = doc.fields;
+          seenDocIds.add(doc.id);
+          contextDocs.push(ctxDoc);
+          if (contextDocs.length >= limit) break;
+        }
+      } catch {
+      }
+    }
+    contextDocs.sort((a, b) => b.score - a.score);
+    let finalDocs = contextDocs.slice(0, limit);
+    if (maxTokens) {
+      const charBudget = maxTokens * 4;
+      let totalChars = 0;
+      finalDocs = finalDocs.filter((doc) => {
+        const docChars = doc.chunks.reduce((sum, c) => sum + c.length, 0);
+        if (totalChars + docChars > charBudget) return false;
+        totalChars += docChars;
+        return true;
+      });
+    }
+    const people = [...new Set(finalDocs.map((d) => d.owner).filter(Boolean))];
+    const result = {
+      query,
+      context: finalDocs,
+      people,
+      stats: {
+        docsSearched: getAllDocuments().length,
+        chunksSearched,
+        retrievalTimeMs: Date.now() - startTime,
+        hasChunkIndex: hasChunks
+      }
+    };
+    console.log(JSON.stringify(result, null, 2));
+  });
+}
+
 // src/cli/index.ts
+init_database();
 var program = new Command();
 program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.1.0").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
   const commandName = actionCommand.name();
-  const skipAutoUnlock = ["auth", "login", "logout", "setup-key", "status", "unlock", "lock"];
-  if (skipAutoUnlock.includes(commandName)) return;
+  const parentName = actionCommand.parent?.name();
+  const skipAutoUnlock = parentName === "auth" || commandName === "unlock" || commandName === "lock";
+  if (skipAutoUnlock) return;
   if (!isVaultUnlocked()) {
     let password = process.env.VAULT_MASTER_PASSWORD;
     if (!password) {
@@ -2215,6 +2740,8 @@ registerSearchCommands(program);
 registerStatsCommand(program);
 registerUsageCommand(program);
 registerPeopleCommands(program);
+registerChunkCommands(program);
+registerContextCommand(program);
 program.parseAsync(process.argv).catch((err) => {
   console.error(err.message);
   process.exit(1);

@@ -63,6 +63,11 @@ moivault people aliases              # Show people registry with aliases
 moivault people merge <alias> <name> # Merge a name as alias of another
 moivault people rename <from> <to>   # Bulk rename owner on docs
 
+moivault context <query>             # RAG retrieval — structured context for any agent
+moivault context <query> --limit 5 --include-fields
+moivault chunk build                 # Build chunk index (splits docs + embeds)
+moivault chunk status                # Show chunk index status
+
 moivault usage                       # API usage and plan details
 moivault stats                       # Vault statistics
 moivault auth status                 # Check auth state
