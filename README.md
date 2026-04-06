@@ -94,7 +94,9 @@ Works with any AI coding agent. The installer auto-detects and installs the skil
 
 ### MCP Server (Claude Desktop, Cursor)
 
-The installer auto-configures Claude Desktop with the moivault MCP server. After install, restart Claude Desktop and 11 vault tools are available natively — `vault_search`, `vault_context`, `vault_doc_text`, `vault_doc_edit`, `vault_sync`, and more.
+The installer auto-configures Claude Desktop with the moivault MCP server. After install, restart Claude Desktop and **16 vault tools** are available natively:
+
+`vault_search` · `vault_context` · `vault_doc_get` · `vault_doc_text` · `vault_doc_fields` · `vault_doc_list` · `vault_doc_types` · `vault_doc_edit` · `vault_doc_delete` · `vault_doc_download` · `vault_doc_upload` · `vault_sync` · `vault_stats` · `vault_people_list` · `vault_people_docs` · `vault_chunk_status`
 
 Features:
 - JSON output by default (non-TTY). Pretty output in interactive terminals.
