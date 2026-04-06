@@ -771,6 +771,48 @@ function deleteDocument(id) {
   } catch {
   }
 }
+function updateDocumentField(id, key, value) {
+  const doc = getDocumentById(id);
+  if (!doc) throw new Error(`Document not found: ${id}`);
+  if (key === "title" || key === "rawText" || key === "type" || key === "owner" || key === "originalOwner" || key === "mimeType" || key === "dateAdded") {
+    const database2 = getDatabase();
+    database2.prepare(`UPDATE documents SET ${key} = ?, updatedAt = ? WHERE id = ?`).run(value, Date.now(), id);
+  } else if (key === "tags") {
+    const database2 = getDatabase();
+    const tags = Array.isArray(value) ? value : value.split(",").map((t) => t.trim());
+    database2.prepare("UPDATE documents SET tags = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(tags), Date.now(), id);
+  } else {
+    const fields = { ...doc.fields, [key]: value };
+    const database2 = getDatabase();
+    database2.prepare("UPDATE documents SET fields = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(fields), Date.now(), id);
+  }
+  const database = getDatabase();
+  const updatedDoc = getDocumentById(id);
+  if (updatedDoc) {
+    const rowInfo = database.prepare("SELECT rowid FROM documents WHERE id = ?").get(id);
+    if (rowInfo) {
+      try {
+        database.prepare("DELETE FROM documents_fts WHERE rowid = ?").run(rowInfo.rowid);
+        database.prepare(`
+          INSERT INTO documents_fts (rowid, title, rawText, tags, type, owner, originalOwner, mentions, organizations, fieldsText)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          rowInfo.rowid,
+          updatedDoc.title ?? "",
+          updatedDoc.rawText ?? "",
+          JSON.stringify(updatedDoc.tags ?? []),
+          updatedDoc.type ?? "",
+          updatedDoc.owner ?? "",
+          updatedDoc.originalOwner ?? "",
+          updatedDoc.mentions ? JSON.stringify(updatedDoc.mentions) : "",
+          updatedDoc.organizations ? JSON.stringify(updatedDoc.organizations) : "",
+          Object.values(updatedDoc.fields).filter(Boolean).join(" ")
+        );
+      } catch {
+      }
+    }
+  }
+}
 function searchDocumentsFTS(query, limit = 50) {
   const database = getDatabase();
   const terms = query.split(/\s+/).filter(Boolean);
@@ -1312,6 +1354,123 @@ function registerDocCommands(program2) {
       console.log(`  ${"total".padEnd(25)} ${total}`);
     }
   });
+  doc.command("edit").description("Edit a document field (syncs to server)").argument("<id>", "Document ID").argument("<field>", "Field to edit (title, tags, type, owner, or any custom field)").argument("<value>", "New value (for tags: comma-separated)").action(async (id, field, value) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked(isJson);
+    const document = getDocumentById(id);
+    if (!document) {
+      if (isJson) {
+        output({ error: "Document not found", id });
+      } else {
+        console.error(`Document not found: ${id}`);
+      }
+      process.exit(1);
+    }
+    try {
+      updateDocumentField(id, field, field === "tags" ? value.split(",").map((t) => t.trim()) : value);
+      const updatedDoc = getDocumentById(id);
+      const { vaultKey } = getVaultKeys();
+      const docKey = generateDocumentKey();
+      const config = loadConfig();
+      const docContent = JSON.stringify({
+        title: updatedDoc.title,
+        rawText: updatedDoc.rawText,
+        type: updatedDoc.type,
+        tags: updatedDoc.tags,
+        fields: updatedDoc.fields,
+        organizations: updatedDoc.organizations,
+        mentions: updatedDoc.mentions,
+        owner: updatedDoc.owner,
+        embedding: updatedDoc.embedding ? Array.from(updatedDoc.embedding) : null,
+        mimeType: updatedDoc.mimeType,
+        encryptedStorageId: updatedDoc.encryptedStorageId,
+        storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
+        dateAdded: updatedDoc.dateAdded
+      });
+      const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
+      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
+      new Uint8Array(blobBuffer).set(encryptedBlob);
+      const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
+      new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
+      const convex = await authenticateConvexClient();
+      const vaultId = config.vaultId;
+      if (vaultId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, {
+          vaultId,
+          blobId: id,
+          encryptedBlob: blobBuffer,
+          encryptedDocKey: keyBuffer,
+          blobSize: encryptedBlob.length
+        });
+      } else {
+        await convex.mutation(api.encryptedSync.upsertBlob, {
+          blobId: id,
+          encryptedBlob: blobBuffer,
+          encryptedDocKey: keyBuffer,
+          blobSize: encryptedBlob.length
+        });
+      }
+      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, syncStatus: "synced" });
+      docKey.fill(0);
+      if (isJson) {
+        output({ status: "updated", id, field, value });
+      } else {
+        console.log(`Updated ${field} \u2192 ${value}`);
+      }
+    } catch (err) {
+      const msg = err.message;
+      if (isJson) {
+        output({ error: msg });
+      } else {
+        console.error(`Edit failed: ${msg}`);
+      }
+      process.exit(1);
+    }
+  });
+  doc.command("delete").description("Delete a document from vault (local + server)").argument("<id>", "Document ID").option("--force", "Skip confirmation").action(async (id, opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked(isJson);
+    const document = getDocumentById(id);
+    if (!document) {
+      if (isJson) {
+        output({ error: "Document not found", id });
+      } else {
+        console.error(`Document not found: ${id}`);
+      }
+      process.exit(1);
+    }
+    if (!opts.force && !isJson && process.stdin.isTTY) {
+      const readline = await import("readline");
+      const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+      const answer = await new Promise((resolve) => {
+        rl.question(`  Delete "${document.title}"? (y/N) `, resolve);
+      });
+      rl.close();
+      if (answer.toLowerCase() !== "y") {
+        console.log("  Cancelled.");
+        return;
+      }
+    }
+    try {
+      const convex = await authenticateConvexClient();
+      await convex.mutation(api.encryptedSync.deleteBlob, { blobId: id });
+      deleteDocument(id);
+      if (isJson) {
+        output({ status: "deleted", id, title: document.title });
+      } else {
+        console.log(`Deleted: ${document.title}`);
+      }
+    } catch (err) {
+      const msg = err.message;
+      if (isJson) {
+        output({ error: msg });
+      } else {
+        console.error(`Delete failed: ${msg}`);
+      }
+      process.exit(1);
+    }
+  });
   doc.command("download").description("Download the original document file").argument("<id>", "Document ID").option("--output <path>", "Output file path (default: ~/Downloads/<title>.<ext>)").action(async (id, opts) => {
     const isJson = shouldOutputJson(program2.opts());
     requireUnlocked(isJson);
@@ -1747,6 +1906,62 @@ function registerStatsCommand(program2) {
   });
 }
 
+// src/cli/commands/usage.ts
+function registerUsageCommand(program2) {
+  program2.command("usage").description("Show API usage, plan details, and vault statistics").action(async () => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      const msg = "Vault is locked \u2014 run `vault unlock` first";
+      if (isJson) {
+        output({ error: msg });
+      } else {
+        console.error(msg);
+      }
+      process.exit(1);
+    }
+    try {
+      const convex = await authenticateConvexClient();
+      let subscription = null;
+      try {
+        subscription = await convex.query(api.subscriptions.getMyUsage, {});
+      } catch {
+      }
+      const docCount = getDocumentCount();
+      const typeCounts = getDocumentTypeCounts();
+      const result = {
+        localDocuments: docCount,
+        documentTypes: typeCounts.length
+      };
+      if (subscription) {
+        result.plan = subscription.planLabel ?? subscription.plan ?? "free";
+        result.scansUsed = subscription.scansUsed ?? null;
+        result.scansLimit = subscription.scansLimit ?? null;
+        result.tokensUsed = subscription.tokensUsed ?? null;
+        result.tokensLimit = subscription.tokensLimit ?? null;
+      }
+      if (isJson) {
+        output(result);
+      } else {
+        console.log(`  Documents:   ${docCount}`);
+        console.log(`  Types:       ${typeCounts.length}`);
+        if (subscription) {
+          console.log(`  Plan:        ${result.plan}`);
+          if (result.scansUsed != null) console.log(`  Scans:       ${result.scansUsed}/${result.scansLimit ?? "\u221E"}`);
+          if (result.tokensUsed != null) console.log(`  Tokens:      ${result.tokensUsed}/${result.tokensLimit ?? "\u221E"}`);
+        }
+      }
+    } catch (err) {
+      const msg = err.message;
+      if (isJson) {
+        output({ error: msg });
+      } else {
+        console.error(`Usage check failed: ${msg}`);
+      }
+      process.exit(1);
+    }
+  });
+}
+
 // src/cli/index.ts
 var program = new Command();
 program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.1.0").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
@@ -1782,6 +1997,7 @@ registerSyncCommands(program);
 registerDocCommands(program);
 registerSearchCommands(program);
 registerStatsCommand(program);
+registerUsageCommand(program);
 program.parseAsync(process.argv).catch((err) => {
   console.error(err.message);
   process.exit(1);

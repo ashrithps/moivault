@@ -44,7 +44,11 @@ moivault doc fields <id>             # Structured extracted fields
 moivault doc download <id>           # Download original file to ~/Downloads/
 moivault doc download <id> --output <path>  # Download to specific path
 moivault doc upload <file>           # Upload a document (PDF, image) to the vault
+moivault doc edit <id> <field> <val> # Edit a field (title, tags, type, owner, or custom)
+moivault doc delete <id>             # Delete a document (local + server)
+moivault doc delete <id> --force     # Delete without confirmation
 moivault doc types                   # List all document types with counts
+moivault usage                       # Show API usage and plan details
 moivault stats                       # Vault overview (doc count, types, last sync)
 ```
 
@@ -167,6 +171,8 @@ moivault doc download <id> --output /tmp/doc.pdf # saves to specific path
 - `doc text` returns raw OCR — use this when you need full context or fields don't capture everything
 - `doc download` fetches the original file (PDF/image) — use only when user needs the actual file
 - `doc upload` uploads a local file — Gemini extracts text/fields/tags, encrypts, and syncs to vault + phone
+- `doc edit` updates a field locally, re-encrypts the blob, and pushes to server. Syncs to phone.
+- `doc delete` soft-deletes from server + removes from local DB. Use `--force` for non-interactive.
 - `search` returns snippets — use `doc text` or `doc fields` for details after finding the doc
 - Vector search results include a `score` (0-1) and `scoreSource` ("fts", "vector", or "hybrid")
 
