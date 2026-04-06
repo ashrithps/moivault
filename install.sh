@@ -36,10 +36,14 @@ curl -fsSL "https://raw.githubusercontent.com/$REPO/main/package.json" -o "$INST
 mkdir -p "$INSTALL_DIR/skill"
 curl -fsSL "https://raw.githubusercontent.com/$REPO/main/skill/SKILL.md" -o "$INSTALL_DIR/skill/SKILL.md"
 
-# Install dependencies
+# Install dependencies (better-sqlite3 requires C++ compiler)
 echo "  ↓ Installing dependencies..."
 cd "$INSTALL_DIR"
-npm install --production --silent 2>/dev/null
+if ! npm install --production 2>&1 | tail -1; then
+  echo "  ✗ Dependency install failed. Ensure Xcode CLI tools are installed:"
+  echo "    xcode-select --install"
+  exit 1
+fi
 
 # Create launcher script
 cat > "$BIN_DIR/moivault" << 'LAUNCHER'
