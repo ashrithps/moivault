@@ -45,10 +45,11 @@ if ! npm install --production 2>&1 | tail -1; then
   exit 1
 fi
 
-# Create launcher script
-cat > "$BIN_DIR/moivault" << 'LAUNCHER'
+# Create launcher script with absolute node path (fixes Claude Desktop / MCP PATH issues)
+NODE_PATH=$(which node)
+cat > "$BIN_DIR/moivault" << LAUNCHER
 #!/bin/bash
-exec node "$HOME/.moivault/moivault.js" "$@"
+exec "$NODE_PATH" "\$HOME/.moivault/moivault.js" "\$@"
 LAUNCHER
 chmod +x "$BIN_DIR/moivault"
 
@@ -145,8 +146,8 @@ with open(config_path, 'r') as f:
 if 'mcpServers' not in config:
     config['mcpServers'] = {}
 config['mcpServers']['moivault'] = {
-    'command': '$BIN_DIR/moivault',
-    'args': ['mcp']
+    'command': '$NODE_PATH',
+    'args': ['$INSTALL_DIR/moivault.js', 'mcp']
 }
 with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
