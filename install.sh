@@ -52,33 +52,20 @@ chmod +x "$BIN_DIR/moivault"
 
 SKILL_INSTALLED=""
 
-# Claude Code / Claude Desktop
+# All agents use: <config_dir>/skills/moivault/SKILL.md
+
+# Claude Code / Claude Desktop (~/.claude/skills/moivault/SKILL.md)
 if [ -d "$HOME/.claude" ]; then
   mkdir -p "$HOME/.claude/skills/moivault"
   cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.claude/skills/moivault/SKILL.md"
   SKILL_INSTALLED="$SKILL_INSTALLED claude-code"
 fi
 
-# Cursor (global rules)
-if [ -d "$HOME/.cursor" ] || [ -d "$HOME/Library/Application Support/Cursor" ]; then
-  mkdir -p "$HOME/.cursor/skills"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.cursor/skills/moivault.md"
-  SKILL_INSTALLED="$SKILL_INSTALLED cursor"
-fi
-
-# Windsurf / Codeium
-if [ -d "$HOME/.codeium" ] || [ -d "$HOME/.windsurf" ]; then
-  WINDSURF_DIR="${HOME}/.windsurf"
-  mkdir -p "$WINDSURF_DIR/skills"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$WINDSURF_DIR/skills/moivault.md"
-  SKILL_INSTALLED="$SKILL_INSTALLED windsurf"
-fi
-
-# Codex (OpenAI)
-if command -v codex &> /dev/null; then
+# Codex / OpenAI (~/.codex/skills/moivault/SKILL.md)
+if [ -d "$HOME/.codex" ] || command -v codex &> /dev/null; then
   CODEX_DIR="${HOME}/.codex"
-  mkdir -p "$CODEX_DIR/skills"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$CODEX_DIR/skills/moivault.md"
+  mkdir -p "$CODEX_DIR/skills/moivault"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$CODEX_DIR/skills/moivault/SKILL.md"
   # Add to AGENTS.md if not already present
   if [ -f "$CODEX_DIR/AGENTS.md" ]; then
     if ! grep -q "moivault" "$CODEX_DIR/AGENTS.md" 2>/dev/null; then
@@ -86,23 +73,37 @@ if command -v codex &> /dev/null; then
 
 ## moivault
 
-Encrypted document vault CLI. Use `moivault` to search, retrieve, upload, edit, and delete documents from the vault. See `~/.codex/skills/moivault.md` for full command reference.
+Encrypted document vault CLI. Use `moivault` to search, retrieve, upload, edit, and delete documents from the vault. See `~/.codex/skills/moivault/SKILL.md` for full command reference.
 AGENTBLOCK
     fi
   else
     cat > "$CODEX_DIR/AGENTS.md" << 'AGENTBLOCK'
 ## moivault
 
-Encrypted document vault CLI. Use `moivault` to search, retrieve, upload, edit, and delete documents from the vault. See `~/.codex/skills/moivault.md` for full command reference.
+Encrypted document vault CLI. Use `moivault` to search, retrieve, upload, edit, and delete documents from the vault. See `~/.codex/skills/moivault/SKILL.md` for full command reference.
 AGENTBLOCK
   fi
   SKILL_INSTALLED="$SKILL_INSTALLED codex"
 fi
 
-# Aider
+# Cursor (~/.cursor/skills/moivault/SKILL.md)
+if [ -d "$HOME/.cursor" ] || [ -d "$HOME/Library/Application Support/Cursor" ]; then
+  mkdir -p "$HOME/.cursor/skills/moivault"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.cursor/skills/moivault/SKILL.md"
+  SKILL_INSTALLED="$SKILL_INSTALLED cursor"
+fi
+
+# Windsurf / Codeium (~/.windsurf/skills/moivault/SKILL.md)
+if [ -d "$HOME/.codeium" ] || [ -d "$HOME/.windsurf" ]; then
+  mkdir -p "$HOME/.windsurf/skills/moivault"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.windsurf/skills/moivault/SKILL.md"
+  SKILL_INSTALLED="$SKILL_INSTALLED windsurf"
+fi
+
+# Aider (~/.aider/skills/moivault/SKILL.md)
 if [ -d "$HOME/.aider" ]; then
-  mkdir -p "$HOME/.aider/skills"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.aider/skills/moivault.md"
+  mkdir -p "$HOME/.aider/skills/moivault"
+  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.aider/skills/moivault/SKILL.md"
   SKILL_INSTALLED="$SKILL_INSTALLED aider"
 fi
 
