@@ -79,6 +79,23 @@ if command -v codex &> /dev/null; then
   CODEX_DIR="${HOME}/.codex"
   mkdir -p "$CODEX_DIR/skills"
   cp "$INSTALL_DIR/skill/SKILL.md" "$CODEX_DIR/skills/moivault.md"
+  # Add to AGENTS.md if not already present
+  if [ -f "$CODEX_DIR/AGENTS.md" ]; then
+    if ! grep -q "moivault" "$CODEX_DIR/AGENTS.md" 2>/dev/null; then
+      cat >> "$CODEX_DIR/AGENTS.md" << 'AGENTBLOCK'
+
+## moivault
+
+Encrypted document vault CLI. Use `moivault` to search, retrieve, upload, edit, and delete documents from the vault. See `~/.codex/skills/moivault.md` for full command reference.
+AGENTBLOCK
+    fi
+  else
+    cat > "$CODEX_DIR/AGENTS.md" << 'AGENTBLOCK'
+## moivault
+
+Encrypted document vault CLI. Use `moivault` to search, retrieve, upload, edit, and delete documents from the vault. See `~/.codex/skills/moivault.md` for full command reference.
+AGENTBLOCK
+  fi
   SKILL_INSTALLED="$SKILL_INSTALLED codex"
 fi
 
