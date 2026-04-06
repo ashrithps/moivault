@@ -51,60 +51,77 @@ chmod +x "$BIN_DIR/moivault"
 # ── Install skill for AI agent platforms ──
 
 SKILL_INSTALLED=""
+SKILL_FILE="$INSTALL_DIR/skill/SKILL.md"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 
-# All agents use: <config_dir>/skills/moivault/SKILL.md
+# Helper: install skill to a directory
+install_skill() {
+  local dir="$1" name="$2"
+  mkdir -p "$dir/moivault"
+  cp "$SKILL_FILE" "$dir/moivault/SKILL.md"
+  SKILL_INSTALLED="$SKILL_INSTALLED $name"
+}
 
-# Claude Code / Claude Desktop (~/.claude/skills/moivault/SKILL.md)
-if [ -d "$HOME/.claude" ]; then
-  mkdir -p "$HOME/.claude/skills/moivault"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.claude/skills/moivault/SKILL.md"
-  SKILL_INSTALLED="$SKILL_INSTALLED claude-code"
-fi
+# ── Agent detection & skill install ──
+# Paths sourced from skills.sh (vercel-labs/skills/src/agents.ts)
 
-# Codex / OpenAI (~/.codex/skills/moivault/SKILL.md)
+# Claude Code / Claude Desktop
+[ -d "$HOME/.claude" ] && install_skill "$HOME/.claude/skills" "claude-code"
+
+# Codex (OpenAI)
 if [ -d "$HOME/.codex" ] || command -v codex &> /dev/null; then
-  CODEX_DIR="${HOME}/.codex"
-  mkdir -p "$CODEX_DIR/skills/moivault"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$CODEX_DIR/skills/moivault/SKILL.md"
-  # Add to AGENTS.md if not already present
-  if [ -f "$CODEX_DIR/AGENTS.md" ]; then
-    if ! grep -q "moivault" "$CODEX_DIR/AGENTS.md" 2>/dev/null; then
-      cat >> "$CODEX_DIR/AGENTS.md" << 'AGENTBLOCK'
+  install_skill "$HOME/.codex/skills" "codex"
+  # Also add to AGENTS.md
+  CODEX_AGENTS="$HOME/.codex/AGENTS.md"
+  if ! grep -q "moivault" "$CODEX_AGENTS" 2>/dev/null; then
+    cat >> "$CODEX_AGENTS" << 'EOF'
 
 ## moivault
-
-Encrypted document vault CLI. Use `moivault` to search, retrieve, upload, edit, and delete documents from the vault. See `~/.codex/skills/moivault/SKILL.md` for full command reference.
-AGENTBLOCK
-    fi
-  else
-    cat > "$CODEX_DIR/AGENTS.md" << 'AGENTBLOCK'
-## moivault
-
-Encrypted document vault CLI. Use `moivault` to search, retrieve, upload, edit, and delete documents from the vault. See `~/.codex/skills/moivault/SKILL.md` for full command reference.
-AGENTBLOCK
+Encrypted document vault CLI. See `~/.codex/skills/moivault/SKILL.md` for full reference.
+EOF
   fi
-  SKILL_INSTALLED="$SKILL_INSTALLED codex"
 fi
 
-# Cursor (~/.cursor/skills/moivault/SKILL.md)
-if [ -d "$HOME/.cursor" ] || [ -d "$HOME/Library/Application Support/Cursor" ]; then
-  mkdir -p "$HOME/.cursor/skills/moivault"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.cursor/skills/moivault/SKILL.md"
-  SKILL_INSTALLED="$SKILL_INSTALLED cursor"
-fi
+# Cursor
+[ -d "$HOME/.cursor" ] && install_skill "$HOME/.cursor/skills" "cursor"
 
-# Windsurf / Codeium (~/.windsurf/skills/moivault/SKILL.md)
-if [ -d "$HOME/.codeium" ] || [ -d "$HOME/.windsurf" ]; then
-  mkdir -p "$HOME/.windsurf/skills/moivault"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.windsurf/skills/moivault/SKILL.md"
-  SKILL_INSTALLED="$SKILL_INSTALLED windsurf"
-fi
+# Windsurf / Codeium
+[ -d "$HOME/.windsurf" ] || [ -d "$HOME/.codeium" ] && install_skill "$HOME/.windsurf/skills" "windsurf"
 
-# Aider (~/.aider/skills/moivault/SKILL.md)
-if [ -d "$HOME/.aider" ]; then
-  mkdir -p "$HOME/.aider/skills/moivault"
-  cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.aider/skills/moivault/SKILL.md"
-  SKILL_INSTALLED="$SKILL_INSTALLED aider"
+# Cline / Roo Code (shared .agents/skills)
+[ -d "$HOME/.cline" ] || [ -d "$HOME/.roo" ] && install_skill "$HOME/.agents/skills" "cline"
+
+# Amp
+[ -d "$CONFIG_HOME/amp" ] && install_skill "$CONFIG_HOME/agents/skills" "amp"
+
+# Gemini CLI / Antigravity
+[ -d "$HOME/.gemini" ] && install_skill "$HOME/.gemini/antigravity/skills" "gemini"
+
+# GitHub Copilot
+[ -d "$HOME/.github-copilot" ] && install_skill "$HOME/.github-copilot/skills" "copilot"
+
+# Goose (Block)
+[ -d "$CONFIG_HOME/goose" ] && install_skill "$CONFIG_HOME/goose/skills" "goose"
+
+# OpenCode
+[ -d "$CONFIG_HOME/opencode" ] && install_skill "$CONFIG_HOME/opencode/skills" "opencode"
+
+# Trae
+[ -d "$HOME/.trae" ] && install_skill "$HOME/.trae/skills" "trae"
+
+# Kilo
+[ -d "$HOME/.kilo" ] && install_skill "$HOME/.kilo/skills" "kilo"
+
+# Augment
+[ -d "$HOME/.augment" ] && install_skill "$HOME/.augment/skills" "augment"
+
+# Aider
+[ -d "$HOME/.aider" ] && install_skill "$HOME/.aider/skills" "aider"
+
+# VSCode (GitHub Copilot Chat instructions)
+VSCODE_DIR="$HOME/.vscode"
+[ -d "$HOME/Library/Application Support/Code" ] && VSCODE_DIR="$HOME/Library/Application Support/Code/User"
+[ -d "$VSCODE_DIR" ] && install_skill "$VSCODE_DIR/skills" "vscode"
 fi
 
 # Generic: copy to .config/moivault for any agent to discover

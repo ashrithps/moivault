@@ -77,12 +77,18 @@ moivault auth status                 # Check auth state
 
 Works with any AI coding agent. The installer auto-detects and installs the skill file for:
 
-- **Claude Code / Claude Desktop** → `~/.claude/skills/moivault/`
-- **Cursor** → `~/.cursor/skills/`
-- **Windsurf / Codeium** → `~/.windsurf/skills/`
-- **Codex (OpenAI)** → `~/.codex/skills/`
-- **Aider** → `~/.aider/skills/`
-- **Any other agent** → `~/.config/moivault/SKILL.md`
+- **Claude Code** — `~/.claude/skills/moivault/`
+- **Codex (OpenAI)** — `~/.codex/skills/moivault/` + `AGENTS.md`
+- **Cursor** — `~/.cursor/skills/moivault/`
+- **Windsurf / Codeium** — `~/.windsurf/skills/moivault/`
+- **Cline / Roo Code** — `~/.agents/skills/moivault/`
+- **Amp** — `~/.config/agents/skills/moivault/`
+- **Gemini CLI / Antigravity** — `~/.gemini/antigravity/skills/moivault/`
+- **GitHub Copilot** — `~/.github-copilot/skills/moivault/`
+- **Goose** — `~/.config/goose/skills/moivault/`
+- **OpenCode** — `~/.config/opencode/skills/moivault/`
+- **Trae / Kilo / Augment / Aider / VSCode** — auto-detected
+- **Any other agent** — `~/.config/moivault/SKILL.md`
 
 Features:
 - JSON output by default (non-TTY). Pretty output in interactive terminals.
