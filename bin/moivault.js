@@ -2701,6 +2701,294 @@ function registerContextCommand(program2) {
   });
 }
 
+// src/mcp/server.ts
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+init_database();
+init_config();
+init_database();
+init_crypto();
+async function ensureUnlocked() {
+  if (isVaultUnlocked()) return;
+  let password = process.env.VAULT_MASTER_PASSWORD;
+  if (!password) {
+    const keychain = getKeychain();
+    password = await keychain.get("master_password") ?? void 0;
+  }
+  if (!password) throw new Error("Vault is locked \u2014 set VAULT_MASTER_PASSWORD or run moivault auth save-password");
+  await unlockVault(password);
+  openDatabase();
+}
+async function startMcpServer() {
+  const server = new McpServer({
+    name: "moivault",
+    version: "0.2.0"
+  });
+  server.tool(
+    "vault_search",
+    "Search documents in the vault using full-text and/or semantic vector search",
+    {
+      query: z.string().describe("Search query"),
+      mode: z.enum(["hybrid", "fts", "vector"]).default("hybrid").describe("Search mode"),
+      type: z.string().optional().describe("Filter by document type"),
+      limit: z.number().default(10).describe("Max results")
+    },
+    async ({ query, mode, type, limit }) => {
+      await ensureUnlocked();
+      const results = [];
+      const seenIds = /* @__PURE__ */ new Set();
+      if (mode === "fts" || mode === "hybrid") {
+        for (const doc of searchDocumentsFTS(query, limit)) {
+          if (type && doc.type !== type) continue;
+          seenIds.add(doc.id);
+          results.push({ id: doc.id, title: doc.title, type: doc.type, owner: doc.owner, score: 1, source: "fts", snippet: doc.rawText?.slice(0, 200) });
+        }
+      }
+      if (mode === "vector" || mode === "hybrid") {
+        try {
+          const docsWithEmb = getDocumentsWithEmbeddings();
+          buildVectorIndex(docsWithEmb);
+          const convex = await authenticateConvexClient();
+          const queryEmb = await convex.action(api.search.embedQuery, { query });
+          for (const vr of searchVectors(queryEmb, limit)) {
+            if (vr.score < 0.3) continue;
+            if (seenIds.has(vr.id)) {
+              const e = results.find((r) => r.id === vr.id);
+              if (e) {
+                e.score = vr.score;
+                e.source = "hybrid";
+              }
+              continue;
+            }
+            const doc = getDocumentById(vr.id);
+            if (!doc || type && doc.type !== type) continue;
+            results.push({ id: doc.id, title: doc.title, type: doc.type, owner: doc.owner, score: vr.score, source: "vector", snippet: doc.rawText?.slice(0, 200) });
+          }
+        } catch {
+        }
+      }
+      results.sort((a, b) => b.score - a.score);
+      return { content: [{ type: "text", text: JSON.stringify(results.slice(0, limit), null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_context",
+    "Retrieve relevant document context for RAG. Returns chunks of text from matching documents.",
+    {
+      query: z.string().describe("Natural language query"),
+      limit: z.number().default(5).describe("Max documents"),
+      maxChunksPerDoc: z.number().default(4).describe("Max chunks per document"),
+      includeFields: z.boolean().default(false).describe("Include structured fields")
+    },
+    async ({ query, limit, maxChunksPerDoc, includeFields }) => {
+      await ensureUnlocked();
+      const contextDocs = [];
+      const seenIds = /* @__PURE__ */ new Set();
+      const hasChunks = getChunkCount() > 0;
+      if (hasChunks) {
+        const chunksWithEmb = getChunksWithEmbeddings();
+        buildChunkVectorIndex(chunksWithEmb);
+        try {
+          const convex = await authenticateConvexClient();
+          const queryEmb = await convex.action(api.search.embedQuery, { query });
+          const chunkResults = searchChunkVectors(queryEmb, maxChunksPerDoc * limit);
+          const chunksByDoc = /* @__PURE__ */ new Map();
+          for (const cr of chunkResults) {
+            if (!chunksByDoc.has(cr.docId)) chunksByDoc.set(cr.docId, []);
+            chunksByDoc.get(cr.docId).push({ id: cr.id, score: cr.score });
+          }
+          for (const [docId, docChunks] of chunksByDoc) {
+            if (seenIds.has(docId)) continue;
+            const doc = getDocumentById(docId);
+            if (!doc) continue;
+            const chunkIds = docChunks.slice(0, maxChunksPerDoc).map((c) => c.id);
+            const chunkTexts = getChunkTextsById(chunkIds);
+            const chunks = chunkIds.map((id) => chunkTexts.get(id) || "").filter(Boolean);
+            const ctx = { docId, title: doc.title, type: doc.type, owner: doc.owner, score: Math.max(...docChunks.map((c) => c.score)), chunks };
+            if (includeFields) ctx.fields = doc.fields;
+            seenIds.add(docId);
+            contextDocs.push(ctx);
+            if (contextDocs.length >= limit) break;
+          }
+        } catch {
+        }
+      }
+      for (const doc of searchDocumentsFTS(query, limit)) {
+        if (seenIds.has(doc.id)) continue;
+        const chunks = hasChunks ? getChunksByDocId(doc.id).slice(0, maxChunksPerDoc).map((c) => c.chunkText) : [doc.rawText?.slice(0, 4e3) || ""];
+        const ctx = { docId: doc.id, title: doc.title, type: doc.type, owner: doc.owner, score: 1, chunks };
+        if (includeFields) ctx.fields = doc.fields;
+        seenIds.add(doc.id);
+        contextDocs.push(ctx);
+        if (contextDocs.length >= limit) break;
+      }
+      contextDocs.sort((a, b) => b.score - a.score);
+      const people = [...new Set(contextDocs.map((d) => d.owner).filter(Boolean))];
+      return { content: [{ type: "text", text: JSON.stringify({ query, context: contextDocs.slice(0, limit), people }, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_get",
+    "Get full metadata for a document by ID",
+    { id: z.string().describe("Document ID") },
+    async ({ id }) => {
+      await ensureUnlocked();
+      const doc = getDocumentById(id);
+      if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
+      const result = { id: doc.id, title: doc.title, type: doc.type, tags: doc.tags, owner: doc.owner, dateAdded: doc.dateAdded, fields: doc.fields, mimeType: doc.mimeType, hasFile: !!(doc.storageId || doc.encryptedStorageId) };
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_text",
+    "Get the raw OCR/extracted text of a document",
+    { id: z.string().describe("Document ID") },
+    async ({ id }) => {
+      await ensureUnlocked();
+      const doc = getDocumentById(id);
+      if (!doc) return { content: [{ type: "text", text: "Document not found" }] };
+      return { content: [{ type: "text", text: doc.rawText || "(no text)" }] };
+    }
+  );
+  server.tool(
+    "vault_doc_fields",
+    "Get structured extracted fields for a document",
+    { id: z.string().describe("Document ID") },
+    async ({ id }) => {
+      await ensureUnlocked();
+      const doc = getDocumentById(id);
+      if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ id: doc.id, title: doc.title, type: doc.type, fields: doc.fields }, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_list",
+    "List documents in the vault, optionally filtered by type",
+    {
+      type: z.string().optional().describe("Filter by document type"),
+      limit: z.number().default(50).describe("Max results")
+    },
+    async ({ type, limit }) => {
+      await ensureUnlocked();
+      let docs = type ? getDocumentsByType(type) : getAllDocuments();
+      docs = docs.filter((d) => d.id !== "__people_registry__").slice(0, limit);
+      const result = docs.map((d) => ({ id: d.id, title: d.title, type: d.type, owner: d.owner, dateAdded: d.dateAdded }));
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_types",
+    "List all document types with counts",
+    {},
+    async () => {
+      await ensureUnlocked();
+      const types = getDocumentTypeCounts();
+      return { content: [{ type: "text", text: JSON.stringify(types, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_edit",
+    "Edit a document field (title, tags, type, owner, or custom field). Syncs to server.",
+    {
+      id: z.string().describe("Document ID"),
+      field: z.string().describe("Field to edit"),
+      value: z.string().describe("New value (for tags: comma-separated)")
+    },
+    async ({ id, field, value }) => {
+      await ensureUnlocked();
+      const doc = getDocumentById(id);
+      if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
+      updateDocumentField(id, field, field === "tags" ? value.split(",").map((t) => t.trim()) : value);
+      const updatedDoc = getDocumentById(id);
+      const { vaultKey } = getVaultKeys();
+      let docKey;
+      if (updatedDoc.encryptedDocKey) {
+        docKey = unwrapDocumentKey(updatedDoc.encryptedDocKey, vaultKey);
+      } else {
+        docKey = generateDocumentKey();
+      }
+      const config = loadConfig();
+      const encryptedBlob = encrypt(new TextEncoder().encode(JSON.stringify({
+        title: updatedDoc.title,
+        rawText: updatedDoc.rawText,
+        type: updatedDoc.type,
+        tags: updatedDoc.tags,
+        fields: updatedDoc.fields,
+        organizations: updatedDoc.organizations,
+        mentions: updatedDoc.mentions,
+        owner: updatedDoc.owner,
+        embedding: updatedDoc.embedding ? Array.from(updatedDoc.embedding) : null,
+        mimeType: updatedDoc.mimeType,
+        encryptedStorageId: updatedDoc.encryptedStorageId,
+        storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
+        dateAdded: updatedDoc.dateAdded
+      })), docKey);
+      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const blobBuf = new ArrayBuffer(encryptedBlob.byteLength);
+      new Uint8Array(blobBuf).set(encryptedBlob);
+      const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
+      new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
+      const convex = await authenticateConvexClient();
+      if (config.vaultId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: config.vaultId, blobId: id, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encryptedBlob.length });
+      } else {
+        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: id, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encryptedBlob.length });
+      }
+      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, syncStatus: "synced" });
+      docKey.fill(0);
+      return { content: [{ type: "text", text: JSON.stringify({ status: "updated", id, field, value }) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_delete",
+    "Delete a document from the vault (local + server)",
+    { id: z.string().describe("Document ID") },
+    async ({ id }) => {
+      await ensureUnlocked();
+      const doc = getDocumentById(id);
+      if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
+      const convex = await authenticateConvexClient();
+      await convex.mutation(api.encryptedSync.deleteBlob, { blobId: id });
+      deleteDocument(id);
+      return { content: [{ type: "text", text: JSON.stringify({ status: "deleted", id, title: doc.title }) }] };
+    }
+  );
+  server.tool(
+    "vault_sync",
+    "Sync documents from the server",
+    { full: z.boolean().default(false).describe("Force full sync") },
+    async ({ full }) => {
+      await ensureUnlocked();
+      const { vaultKey } = getVaultKeys();
+      const config = loadConfig();
+      if (full || !config.lastSyncTimestamp) {
+        const count = await syncFull(vaultKey, config.vaultId);
+        return { content: [{ type: "text", text: JSON.stringify({ status: "synced", mode: "full", documents: count }) }] };
+      } else {
+        const { count, deleted } = await syncIncremental(vaultKey, config.vaultId);
+        return { content: [{ type: "text", text: JSON.stringify({ status: "synced", mode: "incremental", updated: count, deleted }) }] };
+      }
+    }
+  );
+  server.tool(
+    "vault_stats",
+    "Get vault statistics",
+    {},
+    async () => {
+      await ensureUnlocked();
+      const config = loadConfig();
+      return { content: [{ type: "text", text: JSON.stringify({
+        totalDocuments: getDocumentCount(),
+        documentTypes: getDocumentTypeCounts(),
+        lastSync: config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : null
+      }, null, 2) }] };
+    }
+  );
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
 // src/cli/index.ts
 init_database();
 var program = new Command();
@@ -2742,6 +3030,9 @@ registerUsageCommand(program);
 registerPeopleCommands(program);
 registerChunkCommands(program);
 registerContextCommand(program);
+program.command("mcp").description("Start MCP server (stdio transport) for Claude Desktop, Cursor, etc.").action(async () => {
+  await startMcpServer();
+});
 program.parseAsync(process.argv).catch((err) => {
   console.error(err.message);
   process.exit(1);

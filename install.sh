@@ -128,6 +128,34 @@ VSCODE_DIR="$HOME/.vscode"
 [ -d "$VSCODE_DIR" ] && install_skill "$VSCODE_DIR/skills" "vscode"
 fi
 
+# ── Claude Desktop (MCP server auto-config) ──
+CLAUDE_DESKTOP_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+if [ -d "$HOME/Library/Application Support/Claude" ]; then
+  # Ensure config file exists
+  if [ ! -f "$CLAUDE_DESKTOP_CONFIG" ]; then
+    echo '{}' > "$CLAUDE_DESKTOP_CONFIG"
+  fi
+  # Add moivault MCP server if not already present
+  if ! grep -q "moivault" "$CLAUDE_DESKTOP_CONFIG" 2>/dev/null; then
+    python3 -c "
+import json, sys
+config_path = sys.argv[1]
+with open(config_path, 'r') as f:
+    config = json.load(f)
+if 'mcpServers' not in config:
+    config['mcpServers'] = {}
+config['mcpServers']['moivault'] = {
+    'command': '$BIN_DIR/moivault',
+    'args': ['mcp']
+}
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=2)
+" "$CLAUDE_DESKTOP_CONFIG" 2>/dev/null && SKILL_INSTALLED="$SKILL_INSTALLED claude-desktop(mcp)"
+  else
+    SKILL_INSTALLED="$SKILL_INSTALLED claude-desktop(mcp)"
+  fi
+fi
+
 # Generic: copy to .config/moivault for any agent to discover
 mkdir -p "$HOME/.config/moivault"
 cp "$INSTALL_DIR/skill/SKILL.md" "$HOME/.config/moivault/SKILL.md"
