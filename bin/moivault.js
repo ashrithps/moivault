@@ -2709,6 +2709,7 @@ init_database();
 init_config();
 init_database();
 init_crypto();
+var hasSyncedThisSession = false;
 async function ensureUnlocked() {
   if (isVaultUnlocked()) return;
   let password = process.env.VAULT_MASTER_PASSWORD;
@@ -2719,6 +2720,18 @@ async function ensureUnlocked() {
   if (!password) throw new Error("Vault is locked \u2014 set VAULT_MASTER_PASSWORD or run moivault auth save-password");
   await unlockVault(password);
   openDatabase();
+}
+async function ensureSynced() {
+  await ensureUnlocked();
+  if (hasSyncedThisSession) return;
+  try {
+    const { vaultKey } = getVaultKeys();
+    const config = loadConfig();
+    await syncIncremental(vaultKey, config.vaultId);
+    hasSyncedThisSession = true;
+  } catch {
+    hasSyncedThisSession = true;
+  }
 }
 async function startMcpServer() {
   const server = new McpServer({
@@ -2735,7 +2748,7 @@ async function startMcpServer() {
       limit: z.number().default(10).describe("Max results")
     },
     async ({ query, mode, type, limit }) => {
-      await ensureUnlocked();
+      await ensureSynced();
       const results = [];
       const seenIds = /* @__PURE__ */ new Set();
       if (mode === "fts" || mode === "hybrid") {
@@ -2782,7 +2795,7 @@ async function startMcpServer() {
       includeFields: z.boolean().default(false).describe("Include structured fields")
     },
     async ({ query, limit, maxChunksPerDoc, includeFields }) => {
-      await ensureUnlocked();
+      await ensureSynced();
       const contextDocs = [];
       const seenIds = /* @__PURE__ */ new Set();
       const hasChunks = getChunkCount() > 0;
@@ -2833,7 +2846,7 @@ async function startMcpServer() {
     "Get full metadata for a document by ID",
     { id: z.string().describe("Document ID") },
     async ({ id }) => {
-      await ensureUnlocked();
+      await ensureSynced();
       const doc = getDocumentById(id);
       if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
       const result = { id: doc.id, title: doc.title, type: doc.type, tags: doc.tags, owner: doc.owner, dateAdded: doc.dateAdded, fields: doc.fields, mimeType: doc.mimeType, hasFile: !!(doc.storageId || doc.encryptedStorageId) };
@@ -2845,7 +2858,7 @@ async function startMcpServer() {
     "Get the raw OCR/extracted text of a document",
     { id: z.string().describe("Document ID") },
     async ({ id }) => {
-      await ensureUnlocked();
+      await ensureSynced();
       const doc = getDocumentById(id);
       if (!doc) return { content: [{ type: "text", text: "Document not found" }] };
       return { content: [{ type: "text", text: doc.rawText || "(no text)" }] };
@@ -2856,7 +2869,7 @@ async function startMcpServer() {
     "Get structured extracted fields for a document",
     { id: z.string().describe("Document ID") },
     async ({ id }) => {
-      await ensureUnlocked();
+      await ensureSynced();
       const doc = getDocumentById(id);
       if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
       return { content: [{ type: "text", text: JSON.stringify({ id: doc.id, title: doc.title, type: doc.type, fields: doc.fields }, null, 2) }] };
@@ -2870,7 +2883,7 @@ async function startMcpServer() {
       limit: z.number().default(50).describe("Max results")
     },
     async ({ type, limit }) => {
-      await ensureUnlocked();
+      await ensureSynced();
       let docs = type ? getDocumentsByType(type) : getAllDocuments();
       docs = docs.filter((d) => d.id !== "__people_registry__").slice(0, limit);
       const result = docs.map((d) => ({ id: d.id, title: d.title, type: d.type, owner: d.owner, dateAdded: d.dateAdded }));
@@ -2882,7 +2895,7 @@ async function startMcpServer() {
     "List all document types with counts",
     {},
     async () => {
-      await ensureUnlocked();
+      await ensureSynced();
       const types = getDocumentTypeCounts();
       return { content: [{ type: "text", text: JSON.stringify(types, null, 2) }] };
     }
@@ -2962,7 +2975,7 @@ async function startMcpServer() {
       outputPath: z.string().optional().describe("Custom output path (default: ~/Downloads/<title>.<ext>)")
     },
     async ({ id, outputPath }) => {
-      await ensureUnlocked();
+      await ensureSynced();
       const doc = getDocumentById(id);
       if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
       const storageId = doc.encryptedStorageId || doc.storageId;
@@ -3016,7 +3029,7 @@ async function startMcpServer() {
     "Get vault statistics",
     {},
     async () => {
-      await ensureUnlocked();
+      await ensureSynced();
       const config = loadConfig();
       return { content: [{ type: "text", text: JSON.stringify({
         totalDocuments: getDocumentCount(),
@@ -3090,7 +3103,7 @@ async function startMcpServer() {
     "List all people in the vault with their document counts",
     {},
     async () => {
-      await ensureUnlocked();
+      await ensureSynced();
       const db2 = (await Promise.resolve().then(() => (init_database(), database_exports))).getDatabase();
       const owners = db2.prepare("SELECT owner, COUNT(*) as count FROM documents WHERE owner IS NOT NULL AND owner != 'Unknown' AND id != '__people_registry__' GROUP BY owner ORDER BY count DESC").all();
       return { content: [{ type: "text", text: JSON.stringify(owners, null, 2) }] };
@@ -3101,7 +3114,7 @@ async function startMcpServer() {
     "List documents belonging to a specific person",
     { name: z.string().describe("Person name (partial match)") },
     async ({ name }) => {
-      await ensureUnlocked();
+      await ensureSynced();
       const db2 = (await Promise.resolve().then(() => (init_database(), database_exports))).getDatabase();
       const docs = db2.prepare("SELECT id, title, type, owner, dateAdded FROM documents WHERE owner LIKE @pat COLLATE NOCASE AND id != '__people_registry__' ORDER BY updatedAt DESC").all({ pat: `%${name}%` });
       return { content: [{ type: "text", text: JSON.stringify(docs, null, 2) }] };
@@ -3112,7 +3125,7 @@ async function startMcpServer() {
     "Show the chunk index status for RAG context retrieval",
     {},
     async () => {
-      await ensureUnlocked();
+      await ensureSynced();
       return { content: [{ type: "text", text: JSON.stringify({
         totalDocs: getDocumentCount(),
         chunkedDocs: (await Promise.resolve().then(() => (init_database(), database_exports))).getChunkedDocCount(),

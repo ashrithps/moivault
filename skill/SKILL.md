@@ -24,6 +24,10 @@ The vault contains personal and business documents: passports, visas, IDs, medic
 - If `readyToUnlock` is false, the user needs to run `moivault auth login` first
 - Auto-unlock is configured — no password needed for commands
 
+## IMPORTANT: Always Sync First
+
+**Before any vault operation, ALWAYS run `moivault sync` first.** This ensures you have the latest documents from the server. Do this at the start of every session or conversation that involves vault data. Do NOT skip this step.
+
 ## Commands
 
 ```bash
