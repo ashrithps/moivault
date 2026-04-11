@@ -1,6 +1,6 @@
 # moivault
 
-CLI for [Vault](https://vault.moi.app) — encrypted document management for agents and humans.
+CLI for [Vault](https://vault.moi) — encrypted document management for agents and humans.
 
 Search, retrieve, and correlate documents from your encrypted vault. Designed for AI agents (Claude Code, Cursor, etc.) with JSON output by default.
 
