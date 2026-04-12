@@ -225,9 +225,43 @@ function openDatabase(dbPath) {
       updatedAt INTEGER,
       syncStatus TEXT DEFAULT 'pending',
       encryptedStorageId TEXT,
-      fileEncrypted INTEGER DEFAULT 0
+      fileEncrypted INTEGER DEFAULT 0,
+      fileAssetProvider TEXT,
+      fileAssetKey TEXT,
+      fileAssetMimeType TEXT,
+      fileAssetSize INTEGER,
+      fileAssetVersion INTEGER,
+      fileAssetStatus TEXT,
+      previewAssetProvider TEXT,
+      previewAssetKey TEXT,
+      previewAssetMimeType TEXT,
+      previewAssetSize INTEGER,
+      previewAssetVersion INTEGER,
+      previewAssetStatus TEXT
     );
   `);
+  const existingCols = db.pragma("table_info(documents)");
+  const colNames = new Set(existingCols.map((c) => c.name));
+  const r2Cols = [
+    "fileAssetProvider TEXT",
+    "fileAssetKey TEXT",
+    "fileAssetMimeType TEXT",
+    "fileAssetSize INTEGER",
+    "fileAssetVersion INTEGER",
+    "fileAssetStatus TEXT",
+    "previewAssetProvider TEXT",
+    "previewAssetKey TEXT",
+    "previewAssetMimeType TEXT",
+    "previewAssetSize INTEGER",
+    "previewAssetVersion INTEGER",
+    "previewAssetStatus TEXT"
+  ];
+  for (const col of r2Cols) {
+    const name = col.split(" ")[0];
+    if (!colNames.has(name)) {
+      db.exec(`ALTER TABLE documents ADD COLUMN ${col}`);
+    }
+  }
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
       title,
@@ -345,6 +379,18 @@ function deserializeRow(row) {
     storageId: row.storageId,
     encryptedStorageId: row.encryptedStorageId,
     fileEncrypted: row.fileEncrypted,
+    fileAssetProvider: row.fileAssetProvider,
+    fileAssetKey: row.fileAssetKey,
+    fileAssetMimeType: row.fileAssetMimeType,
+    fileAssetSize: row.fileAssetSize,
+    fileAssetVersion: row.fileAssetVersion,
+    fileAssetStatus: row.fileAssetStatus,
+    previewAssetProvider: row.previewAssetProvider,
+    previewAssetKey: row.previewAssetKey,
+    previewAssetMimeType: row.previewAssetMimeType,
+    previewAssetSize: row.previewAssetSize,
+    previewAssetVersion: row.previewAssetVersion,
+    previewAssetStatus: row.previewAssetStatus,
     owner: row.owner,
     originalOwner: row.originalOwner,
     addedBy: row.addedBy,
@@ -361,8 +407,8 @@ function upsertDocument(doc) {
   const database = getDatabase();
   const stmt = database.prepare(`
     INSERT OR REPLACE INTO documents
-    (id, title, rawText, type, tags, fields, organizations, mentions, overview, embedding, encryptedDocKey, mimeType, storageId, encryptedStorageId, fileEncrypted, owner, originalOwner, addedBy, imageUrl, dateAdded, status, vaultId, createdAt, updatedAt, syncStatus)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (id, title, rawText, type, tags, fields, organizations, mentions, overview, embedding, encryptedDocKey, mimeType, storageId, encryptedStorageId, fileEncrypted, fileAssetProvider, fileAssetKey, fileAssetMimeType, fileAssetSize, fileAssetVersion, fileAssetStatus, previewAssetProvider, previewAssetKey, previewAssetMimeType, previewAssetSize, previewAssetVersion, previewAssetStatus, owner, originalOwner, addedBy, imageUrl, dateAdded, status, vaultId, createdAt, updatedAt, syncStatus)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const embeddingBlob = doc.embedding ? Buffer.from(new Float64Array(doc.embedding).buffer) : null;
   stmt.run(
@@ -381,6 +427,18 @@ function upsertDocument(doc) {
     doc.storageId ?? null,
     doc.encryptedStorageId ?? null,
     doc.fileEncrypted ?? 0,
+    doc.fileAssetProvider ?? null,
+    doc.fileAssetKey ?? null,
+    doc.fileAssetMimeType ?? null,
+    doc.fileAssetSize ?? null,
+    doc.fileAssetVersion ?? null,
+    doc.fileAssetStatus ?? null,
+    doc.previewAssetProvider ?? null,
+    doc.previewAssetKey ?? null,
+    doc.previewAssetMimeType ?? null,
+    doc.previewAssetSize ?? null,
+    doc.previewAssetVersion ?? null,
+    doc.previewAssetStatus ?? null,
     doc.owner ?? null,
     doc.originalOwner ?? null,
     doc.addedBy ?? null,
@@ -708,7 +766,7 @@ function formatDocument(doc, includeText = false) {
   if (doc.overview) result.overview = doc.overview;
   if (doc.mimeType) result.mimeType = doc.mimeType;
   if (includeText && doc.rawText) result.rawText = doc.rawText;
-  result.hasFile = !!(doc.storageId || doc.encryptedStorageId);
+  result.hasFile = !!(doc.fileAssetKey || doc.storageId || doc.encryptedStorageId);
   result.updatedAt = doc.updatedAt;
   return result;
 }
@@ -1049,6 +1107,19 @@ function decryptBlob(blob, vaultKey) {
     storageId: metadata.storageId,
     encryptedStorageId: metadata.encryptedStorageId,
     fileEncrypted: metadata.encryptedStorageId ? 1 : 0,
+    // R2 asset refs come from top-level blob columns (not encrypted payload)
+    fileAssetProvider: blob.fileAssetProvider,
+    fileAssetKey: blob.fileAssetKey,
+    fileAssetMimeType: blob.fileAssetMimeType,
+    fileAssetSize: blob.fileAssetSize,
+    fileAssetVersion: blob.fileAssetVersion,
+    fileAssetStatus: blob.fileAssetStatus,
+    previewAssetProvider: blob.previewAssetProvider,
+    previewAssetKey: blob.previewAssetKey,
+    previewAssetMimeType: blob.previewAssetMimeType,
+    previewAssetSize: blob.previewAssetSize,
+    previewAssetVersion: blob.previewAssetVersion,
+    previewAssetStatus: blob.previewAssetStatus,
     owner: metadata.owner,
     originalOwner: metadata.originalOwner,
     addedBy: blob.addedBy,
@@ -1614,8 +1685,9 @@ function registerDocCommands(program2) {
       }
       process.exit(1);
     }
+    const hasR2 = !!document.fileAssetKey;
     const storageId = document.encryptedStorageId || document.storageId;
-    if (!storageId) {
+    if (!hasR2 && !storageId) {
       if (isJson) {
         output({ error: "No file attached to this document", id });
       } else {
@@ -1625,23 +1697,34 @@ function registerDocCommands(program2) {
     }
     try {
       const convex = await authenticateConvexClient();
-      const fileUrl = await convex.query(api.storage.getUrl, { storageId });
-      if (!fileUrl) {
-        if (isJson) {
-          output({ error: "File not found on server" });
-        } else {
-          console.error("File not found on server.");
+      const config = loadConfig();
+      let rawBytes;
+      if (hasR2) {
+        if (!isJson) process.stderr.write("Downloading from R2...\n");
+        const downloadInfo = await convex.action(api.r2Assets.requestFileDownloadUrl, {
+          blobId: document.id,
+          vaultId: config.vaultId
+        });
+        const response = await fetch(downloadInfo.url);
+        if (!response.ok) throw new Error(`R2 download failed: ${response.status}`);
+        rawBytes = new Uint8Array(await response.arrayBuffer());
+      } else {
+        if (!isJson) process.stderr.write("Downloading...\n");
+        const fileUrl = await convex.query(api.storage.getUrl, { storageId });
+        if (!fileUrl) {
+          if (isJson) {
+            output({ error: "File not found on server" });
+          } else {
+            console.error("File not found on server.");
+          }
+          process.exit(1);
         }
-        process.exit(1);
+        const response = await fetch(fileUrl);
+        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+        rawBytes = new Uint8Array(await response.arrayBuffer());
       }
-      if (!isJson) process.stderr.write("Downloading...\n");
-      const response = await fetch(fileUrl);
-      if (!response.ok) {
-        throw new Error(`Download failed: ${response.status}`);
-      }
-      const rawBytes = new Uint8Array(await response.arrayBuffer());
       let fileBytes;
-      if (document.encryptedStorageId && document.encryptedDocKey) {
+      if ((hasR2 || document.encryptedStorageId) && document.encryptedDocKey) {
         if (!isJson) process.stderr.write("Decrypting...\n");
         const { vaultKey } = getVaultKeys();
         const docKey = unwrapDocumentKey(document.encryptedDocKey, vaultKey);
@@ -1734,19 +1817,14 @@ function registerDocCommands(program2) {
       const { vaultKey } = getVaultKeys();
       const docKey = generateDocumentKey();
       const encryptedFileBytes = encrypt(fileBytes, docKey);
-      const encUploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
-      const encResp = await fetch(encUploadUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: encryptedFileBytes
-      });
-      const { storageId: encryptedStorageId } = await encResp.json();
       try {
         await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
       } catch {
       }
       const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
       const now = Date.now();
+      const config = loadConfig();
+      const vaultId = config.vaultId;
       const localDoc = {
         id: docId,
         title: extracted.title || fileName,
@@ -1759,7 +1837,6 @@ function registerDocCommands(program2) {
         embedding: extracted.embedding || void 0,
         owner: extracted.owner || "Unknown",
         mimeType,
-        encryptedStorageId,
         encryptedDocKey: wrappedDocKey,
         dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
         status: "ready",
@@ -1767,8 +1844,6 @@ function registerDocCommands(program2) {
         updatedAt: now,
         syncStatus: "synced"
       };
-      upsertDocument(localDoc);
-      const config = loadConfig();
       const docContent = JSON.stringify({
         title: localDoc.title,
         rawText: localDoc.rawText,
@@ -1782,7 +1857,6 @@ function registerDocCommands(program2) {
         mimeType,
         fileName,
         fileHash: hash,
-        encryptedStorageId,
         dateAdded: localDoc.dateAdded
       });
       const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
@@ -1790,7 +1864,6 @@ function registerDocCommands(program2) {
       new Uint8Array(blobBuffer).set(encryptedBlob);
       const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
-      const vaultId = config.vaultId;
       if (vaultId) {
         await convex.mutation(api.encryptedSync.upsertBlobByVault, {
           vaultId,
@@ -1807,6 +1880,36 @@ function registerDocCommands(program2) {
           blobSize: encryptedBlob.length
         });
       }
+      if (!isJson) process.stderr.write("Uploading encrypted file to R2...\n");
+      const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, {
+        blobId: docId,
+        vaultId: vaultId ?? void 0,
+        mimeType: "application/octet-stream",
+        size: encryptedFileBytes.length
+      });
+      const r2Resp = await fetch(fileUploadInfo.url, {
+        method: "PUT",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: encryptedFileBytes
+      });
+      if (!r2Resp.ok) throw new Error(`R2 upload failed: ${r2Resp.status}`);
+      await convex.mutation(api.r2Assets.patchFileAssetRef, {
+        blobId: docId,
+        vaultId: vaultId ?? void 0,
+        provider: "r2",
+        key: fileUploadInfo.key,
+        mimeType,
+        size: encryptedFileBytes.length,
+        version: 1,
+        status: "ready"
+      });
+      localDoc.fileAssetProvider = "r2";
+      localDoc.fileAssetKey = fileUploadInfo.key;
+      localDoc.fileAssetMimeType = mimeType;
+      localDoc.fileAssetSize = encryptedFileBytes.length;
+      localDoc.fileAssetVersion = 1;
+      localDoc.fileAssetStatus = "ready";
+      upsertDocument(localDoc);
       docKey.fill(0);
       if (isJson) {
         output({
@@ -2849,7 +2952,7 @@ async function startMcpServer() {
       await ensureSynced();
       const doc = getDocumentById(id);
       if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
-      const result = { id: doc.id, title: doc.title, type: doc.type, tags: doc.tags, owner: doc.owner, dateAdded: doc.dateAdded, fields: doc.fields, mimeType: doc.mimeType, hasFile: !!(doc.storageId || doc.encryptedStorageId) };
+      const result = { id: doc.id, title: doc.title, type: doc.type, tags: doc.tags, owner: doc.owner, dateAdded: doc.dateAdded, fields: doc.fields, mimeType: doc.mimeType, hasFile: !!(doc.fileAssetKey || doc.storageId || doc.encryptedStorageId) };
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -2978,16 +3081,26 @@ async function startMcpServer() {
       await ensureSynced();
       const doc = getDocumentById(id);
       if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
+      const hasR2 = !!doc.fileAssetKey;
       const storageId = doc.encryptedStorageId || doc.storageId;
-      if (!storageId) return { content: [{ type: "text", text: JSON.stringify({ error: "No file attached to this document" }) }] };
+      if (!hasR2 && !storageId) return { content: [{ type: "text", text: JSON.stringify({ error: "No file attached to this document" }) }] };
       const convex = await authenticateConvexClient();
-      const fileUrl = await convex.query(api.storage.getUrl, { storageId });
-      if (!fileUrl) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found on server" }) }] };
-      const response = await fetch(fileUrl);
-      if (!response.ok) return { content: [{ type: "text", text: JSON.stringify({ error: `Download failed: ${response.status}` }) }] };
-      const rawBytes = new Uint8Array(await response.arrayBuffer());
+      const config = loadConfig();
+      let rawBytes;
+      if (hasR2) {
+        const downloadInfo = await convex.action(api.r2Assets.requestFileDownloadUrl, { blobId: doc.id, vaultId: config.vaultId });
+        const response = await fetch(downloadInfo.url);
+        if (!response.ok) return { content: [{ type: "text", text: JSON.stringify({ error: `R2 download failed: ${response.status}` }) }] };
+        rawBytes = new Uint8Array(await response.arrayBuffer());
+      } else {
+        const fileUrl = await convex.query(api.storage.getUrl, { storageId });
+        if (!fileUrl) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found on server" }) }] };
+        const response = await fetch(fileUrl);
+        if (!response.ok) return { content: [{ type: "text", text: JSON.stringify({ error: `Download failed: ${response.status}` }) }] };
+        rawBytes = new Uint8Array(await response.arrayBuffer());
+      }
       let fileBytes;
-      if (doc.encryptedStorageId && doc.encryptedDocKey) {
+      if ((hasR2 || doc.encryptedStorageId) && doc.encryptedDocKey) {
         const { vaultKey } = getVaultKeys();
         const docKey = unwrapDocumentKey(doc.encryptedDocKey, vaultKey);
         fileBytes = decrypt(rawBytes, docKey);
@@ -3071,29 +3184,37 @@ async function startMcpServer() {
       const { vaultKey } = getVaultKeys();
       const docKey = generateDocumentKey();
       const encFileBytes = encrypt(fileBytes, docKey);
-      const encUploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
-      const encResp = await fetch(encUploadUrl, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: encFileBytes });
-      const { storageId: encSid } = await encResp.json();
       try {
         await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
       } catch {
       }
       const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
       const now = Date.now();
-      const localDoc = { id: docId, title: extracted.title || fileName, rawText: extracted.rawText || "", type: extracted.type || "generic", tags: extracted.tags || [], fields: extracted.fields || {}, organizations: extracted.organizations || [], mentions: extracted.mentions || [], embedding: extracted.embedding || void 0, owner: extracted.owner || "Unknown", mimeType, encryptedStorageId: encSid, encryptedDocKey: wrappedDocKey, dateAdded: (/* @__PURE__ */ new Date()).toISOString(), status: "ready", createdAt: now, updatedAt: now, syncStatus: "synced" };
-      upsertDocument(localDoc);
       const config = loadConfig();
-      const docContent = JSON.stringify({ title: localDoc.title, rawText: localDoc.rawText, type: localDoc.type, tags: localDoc.tags, fields: localDoc.fields, organizations: localDoc.organizations, mentions: localDoc.mentions, owner: localDoc.owner, embedding: extracted.embedding || null, mimeType, fileName, fileHash: hash, encryptedStorageId: encSid, dateAdded: localDoc.dateAdded });
+      const vaultId = config.vaultId;
+      const localDoc = { id: docId, title: extracted.title || fileName, rawText: extracted.rawText || "", type: extracted.type || "generic", tags: extracted.tags || [], fields: extracted.fields || {}, organizations: extracted.organizations || [], mentions: extracted.mentions || [], embedding: extracted.embedding || void 0, owner: extracted.owner || "Unknown", mimeType, encryptedDocKey: wrappedDocKey, dateAdded: (/* @__PURE__ */ new Date()).toISOString(), status: "ready", createdAt: now, updatedAt: now, syncStatus: "synced" };
+      const docContent = JSON.stringify({ title: localDoc.title, rawText: localDoc.rawText, type: localDoc.type, tags: localDoc.tags, fields: localDoc.fields, organizations: localDoc.organizations, mentions: localDoc.mentions, owner: localDoc.owner, embedding: extracted.embedding || null, mimeType, fileName, fileHash: hash, dateAdded: localDoc.dateAdded });
       const encBlob = encrypt(new TextEncoder().encode(docContent), docKey);
       const blobBuf = new ArrayBuffer(encBlob.byteLength);
       new Uint8Array(blobBuf).set(encBlob);
       const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
-      if (config.vaultId) {
-        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: config.vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+      if (vaultId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
       } else {
         await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
       }
+      const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, { blobId: docId, vaultId: vaultId ?? void 0, mimeType: "application/octet-stream", size: encFileBytes.length });
+      const r2Resp = await fetch(fileUploadInfo.url, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: encFileBytes });
+      if (!r2Resp.ok) throw new Error(`R2 upload failed: ${r2Resp.status}`);
+      await convex.mutation(api.r2Assets.patchFileAssetRef, { blobId: docId, vaultId: vaultId ?? void 0, provider: "r2", key: fileUploadInfo.key, mimeType, size: encFileBytes.length, version: 1, status: "ready" });
+      localDoc.fileAssetProvider = "r2";
+      localDoc.fileAssetKey = fileUploadInfo.key;
+      localDoc.fileAssetMimeType = mimeType;
+      localDoc.fileAssetSize = encFileBytes.length;
+      localDoc.fileAssetVersion = 1;
+      localDoc.fileAssetStatus = "ready";
+      upsertDocument(localDoc);
       docKey.fill(0);
       return { content: [{ type: "text", text: JSON.stringify({ status: "uploaded", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags }) }] };
     }
