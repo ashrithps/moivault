@@ -6,6 +6,13 @@ description: >
   tax records, bank statements, contracts, insurance, IDs, receipts, certificates, flights,
   or any stored document. Also use when the user needs to find, compare, or cross-reference
   information across their documents.
+  ALSO use when the user references videos they watched, links they saved, articles they read,
+  or web content they bookmarked — the vault stores YouTube videos (with full transcripts),
+  web links, and bookmarks. Examples: "I watched a video about X", "that article about Y",
+  "the link I saved about Z", "what was that YouTube video", "the video where someone talked
+  about...", "I saw something about...", "remember that thing I saved about...".
+  Trigger on ANY reference to previously consumed content — videos, links, articles, bookmarks,
+  saved pages, YouTube, web links, tweets, posts.
 metadata:
   short-description: Query encrypted document vault
 ---
@@ -161,6 +168,27 @@ Do NOT assume information is missing based on one search result set.
 3. Get full text of medical docs: `moivault doc text <id>`
 4. Cross-reference multiple reports for a complete picture
 
+## YouTube Videos & Web Links
+
+The vault stores saved YouTube videos and web links with full metadata:
+
+**YouTube videos** (`type: youtube`): Include full transcripts, channel name, URL.
+- User might say: "I watched a video about...", "that YouTube video where...", "the video about mac apps"
+- Search by topic, channel, or keywords from the transcript
+- Use `doc text <id>` to read the full transcript
+
+**Web links** (`type: web_link`): Saved articles, tweets, bookmarks with page text.
+- User might say: "that article I saved", "the link about...", "I bookmarked something about..."
+
+**Search strategy for videos/links:**
+```bash
+moivault search "mac apps productivity"          # keyword match on transcript
+moivault search "video about mac apps" --mode vector  # semantic match
+moivault doc list --type youtube                  # list all saved videos
+moivault doc list --type web_link                 # list all saved links
+moivault doc text <id>                            # read full transcript/page text
+```
+
 ## Downloading Files
 
 Use `doc download` when the user needs the actual file (PDF, image, etc.), not just the text:
@@ -168,7 +196,7 @@ Use `doc download` when the user needs the actual file (PDF, image, etc.), not j
 moivault doc download <id>                      # saves to ~/Downloads/<title>.<ext>
 moivault doc download <id> --output /tmp/doc.pdf # saves to specific path
 ```
-- Files are fetched from Convex storage and decrypted automatically
+- Files are fetched from R2 storage (encrypted) and decrypted automatically
 - Only download when explicitly requested — for reading content, use `doc text` instead
 - Returns `{ status, path, size }` in JSON mode
 

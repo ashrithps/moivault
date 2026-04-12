@@ -770,28 +770,43 @@ function formatDocument(doc, includeText = false) {
   result.updatedAt = doc.updatedAt;
   return result;
 }
+function shortId(id) {
+  return id.slice(0, 8);
+}
 function prettyDocument(doc) {
   const lines = [];
-  lines.push(`  ${doc.title}`);
-  lines.push(`  Type: ${doc.type}  |  Owner: ${doc.owner ?? "\u2014"}`);
-  if (doc.tags.length) lines.push(`  Tags: ${doc.tags.join(", ")}`);
-  if (doc.dateAdded) lines.push(`  Added: ${doc.dateAdded}`);
+  lines.push(`  \x1B[1m${doc.title}\x1B[0m`);
+  lines.push(`  \x1B[2mID: ${shortId(doc.id)}\x1B[0m  \x1B[36m${doc.type}\x1B[0m  Owner: ${doc.owner ?? "\u2014"}`);
+  if (doc.tags.length) lines.push(`  Tags: \x1B[33m${doc.tags.join(", ")}\x1B[0m`);
+  if (doc.dateAdded) lines.push(`  Added: ${new Date(doc.dateAdded).toLocaleDateString()}`);
+  const hasFile = !!(doc.fileAssetKey || doc.storageId || doc.encryptedStorageId);
+  lines.push(`  File: ${hasFile ? "\x1B[32m\u2713\x1B[0m" : "\x1B[2m\u2014\x1B[0m"}`);
   if (doc.fields && Object.keys(doc.fields).length > 0) {
     for (const [key, value] of Object.entries(doc.fields)) {
-      if (value) lines.push(`  ${key}: ${value}`);
+      if (value != null && value !== "") lines.push(`  \x1B[2m${key}:\x1B[0m ${value}`);
     }
   }
   return lines.join("\n");
+}
+function prettyDocList(docs) {
+  if (docs.length === 0) return "  No documents found.";
+  return docs.map((doc, i) => {
+    const hasFile = !!(doc.fileAssetKey || doc.storageId || doc.encryptedStorageId);
+    const file = hasFile ? "\x1B[32m\u25CF\x1B[0m" : "\x1B[2m\u25CB\x1B[0m";
+    const date = doc.dateAdded ? new Date(doc.dateAdded).toLocaleDateString() : "";
+    return `  ${file} \x1B[2m${shortId(doc.id)}\x1B[0m  \x1B[1m${doc.title}\x1B[0m
+    \x1B[36m${doc.type}\x1B[0m  ${doc.owner ?? ""}  ${date}  \x1B[33m${doc.tags.slice(0, 3).join(", ")}\x1B[0m`;
+  }).join("\n\n");
 }
 function prettySearchResults(results) {
   if (results.length === 0) return "  No results found.";
   return results.map((r, i) => {
     const lines = [
-      `  ${i + 1}. ${r.title}`,
-      `     Type: ${r.type}  |  Score: ${r.score.toFixed(3)} (${r.scoreSource})`
+      `  ${i + 1}. \x1B[1m${r.title}\x1B[0m  \x1B[2m${shortId(r.id)}\x1B[0m`,
+      `     \x1B[36m${r.type}\x1B[0m  Score: ${r.score.toFixed(3)} (${r.scoreSource})`
     ];
-    if (r.snippet) lines.push(`     ${r.snippet.slice(0, 120)}...`);
-    if (r.tags.length) lines.push(`     Tags: ${r.tags.join(", ")}`);
+    if (r.snippet) lines.push(`     \x1B[2m${r.snippet.slice(0, 120)}...\x1B[0m`);
+    if (r.tags.length) lines.push(`     Tags: \x1B[33m${r.tags.join(", ")}\x1B[0m`);
     return lines.join("\n");
   }).join("\n\n");
 }
@@ -1463,15 +1478,9 @@ function registerDocCommands(program2) {
     if (isJson) {
       output(docs.map((d) => formatDocument(d)));
     } else {
-      if (docs.length === 0) {
-        console.log("  No documents found.");
-        return;
-      }
-      for (const doc2 of docs) {
-        console.log(prettyDocument(doc2));
-        console.log("");
-      }
-      console.log(`  ${docs.length} document(s)`);
+      console.log(prettyDocList(docs));
+      if (docs.length > 0) console.log(`
+  \x1B[2m${docs.length} document(s)\x1B[0m`);
     }
   });
   doc.command("get").description("Get full document metadata by ID").argument("<id>", "Document ID").option("--include-text", "Include raw extracted text").action((id, opts) => {
@@ -1754,165 +1763,167 @@ function registerDocCommands(program2) {
       process.exit(1);
     }
   });
-  doc.command("upload").description("Upload a document to the vault").argument("<file>", "Path to file (PDF, image, etc.)").action(async (filePath, _opts) => {
+  doc.command("upload").description("Upload one or more documents to the vault").argument("<files...>", "Path(s) to file(s) \u2014 PDF, image, etc.").action(async (filePaths, _opts) => {
     const isJson = shouldOutputJson(program2.opts());
     requireUnlocked(isJson);
-    const resolvedPath = path3.resolve(filePath);
-    if (!fs3.existsSync(resolvedPath)) {
-      if (isJson) {
-        output({ error: "File not found", path: resolvedPath });
-      } else {
-        console.error(`File not found: ${resolvedPath}`);
-      }
-      process.exit(1);
-    }
-    const fileName = path3.basename(resolvedPath);
-    const ext = path3.extname(resolvedPath).toLowerCase().slice(1);
-    const mimeType = {
-      pdf: "application/pdf",
-      jpg: "image/jpeg",
-      jpeg: "image/jpeg",
-      png: "image/png",
-      webp: "image/webp",
-      heic: "image/heic"
-    }[ext] ?? "application/octet-stream";
-    try {
-      const fileBuffer = fs3.readFileSync(resolvedPath);
-      const fileBytes = new Uint8Array(fileBuffer);
-      const hash = crypto3.createHash("sha256").update(fileBytes).digest("hex");
-      const docId = hash;
-      if (!isJson) process.stderr.write("Uploading to server...\n");
-      const convex = await authenticateConvexClient();
-      const uploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
-      const uploadResp = await fetch(uploadUrl, {
-        method: "POST",
-        headers: { "Content-Type": mimeType },
-        body: fileBytes
-      });
-      const { storageId } = await uploadResp.json();
-      if (!isJson) process.stderr.write("Analyzing with Gemini...\n");
-      const extracted = await convex.action(api.proxy.processFile, {
-        storageId,
-        mimeType,
-        fileName
-      });
-      const persistedStorageId = extracted.storageId || storageId;
-      if (!extracted.embedding || !Array.isArray(extracted.embedding) || extracted.embedding.length === 0) {
-        try {
-          const combinedText = [
-            extracted.title || fileName,
-            extracted.type,
-            ...extracted.tags || [],
-            ...extracted.mentions || [],
-            JSON.stringify(extracted.fields || {})
-          ].join(" ");
-          const embedding = await convex.action(api.search.embedQuery, { query: combinedText });
-          if (embedding && embedding.length > 0) {
-            extracted.embedding = embedding;
-          }
-        } catch {
+    const results = [];
+    for (const filePath of filePaths) {
+      const resolvedPath = path3.resolve(filePath);
+      if (!fs3.existsSync(resolvedPath)) {
+        if (isJson) {
+          results.push({ error: "File not found", path: resolvedPath });
+          continue;
+        } else {
+          console.error(`File not found: ${resolvedPath}`);
+          continue;
         }
       }
-      if (!isJson) process.stderr.write("Encrypting...\n");
-      const { vaultKey } = getVaultKeys();
-      const docKey = generateDocumentKey();
-      const encryptedFileBytes = encrypt(fileBytes, docKey);
+      const fileName = path3.basename(resolvedPath);
+      const ext = path3.extname(resolvedPath).toLowerCase().slice(1);
+      const mimeType = {
+        pdf: "application/pdf",
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        png: "image/png",
+        webp: "image/webp",
+        heic: "image/heic"
+      }[ext] ?? "application/octet-stream";
       try {
-        await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
-      } catch {
-      }
-      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
-      const now = Date.now();
-      const config = loadConfig();
-      const vaultId = config.vaultId;
-      const localDoc = {
-        id: docId,
-        title: extracted.title || fileName,
-        rawText: extracted.rawText || "",
-        type: extracted.type || "generic",
-        tags: extracted.tags || [],
-        fields: extracted.fields || {},
-        organizations: extracted.organizations || [],
-        mentions: extracted.mentions || [],
-        embedding: extracted.embedding || void 0,
-        owner: extracted.owner || "Unknown",
-        mimeType,
-        encryptedDocKey: wrappedDocKey,
-        dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
-        status: "ready",
-        createdAt: now,
-        updatedAt: now,
-        syncStatus: "synced"
-      };
-      const docContent = JSON.stringify({
-        title: localDoc.title,
-        rawText: localDoc.rawText,
-        type: localDoc.type,
-        tags: localDoc.tags,
-        fields: localDoc.fields,
-        organizations: localDoc.organizations,
-        mentions: localDoc.mentions,
-        owner: localDoc.owner,
-        embedding: extracted.embedding || null,
-        mimeType,
-        fileName,
-        fileHash: hash,
-        dateAdded: localDoc.dateAdded
-      });
-      const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
-      const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
-      new Uint8Array(blobBuffer).set(encryptedBlob);
-      const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
-      new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
-      if (vaultId) {
-        await convex.mutation(api.encryptedSync.upsertBlobByVault, {
-          vaultId,
-          blobId: docId,
-          encryptedBlob: blobBuffer,
-          encryptedDocKey: keyBuffer,
-          blobSize: encryptedBlob.length
+        const fileBuffer = fs3.readFileSync(resolvedPath);
+        const fileBytes = new Uint8Array(fileBuffer);
+        const hash = crypto3.createHash("sha256").update(fileBytes).digest("hex");
+        const docId = hash;
+        if (!isJson) process.stderr.write("Uploading to server...\n");
+        const convex = await authenticateConvexClient();
+        const uploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
+        const uploadResp = await fetch(uploadUrl, {
+          method: "POST",
+          headers: { "Content-Type": mimeType },
+          body: fileBytes
         });
-      } else {
-        await convex.mutation(api.encryptedSync.upsertBlob, {
-          blobId: docId,
-          encryptedBlob: blobBuffer,
-          encryptedDocKey: keyBuffer,
-          blobSize: encryptedBlob.length
+        const { storageId } = await uploadResp.json();
+        if (!isJson) process.stderr.write("Analyzing with Gemini...\n");
+        const extracted = await convex.action(api.proxy.processFile, {
+          storageId,
+          mimeType,
+          fileName
         });
-      }
-      if (!isJson) process.stderr.write("Uploading encrypted file to R2...\n");
-      const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, {
-        blobId: docId,
-        vaultId: vaultId ?? void 0,
-        mimeType: "application/octet-stream",
-        size: encryptedFileBytes.length
-      });
-      const r2Resp = await fetch(fileUploadInfo.url, {
-        method: "PUT",
-        headers: { "Content-Type": "application/octet-stream" },
-        body: encryptedFileBytes
-      });
-      if (!r2Resp.ok) throw new Error(`R2 upload failed: ${r2Resp.status}`);
-      await convex.mutation(api.r2Assets.patchFileAssetRef, {
-        blobId: docId,
-        vaultId: vaultId ?? void 0,
-        provider: "r2",
-        key: fileUploadInfo.key,
-        mimeType,
-        size: encryptedFileBytes.length,
-        version: 1,
-        status: "ready"
-      });
-      localDoc.fileAssetProvider = "r2";
-      localDoc.fileAssetKey = fileUploadInfo.key;
-      localDoc.fileAssetMimeType = mimeType;
-      localDoc.fileAssetSize = encryptedFileBytes.length;
-      localDoc.fileAssetVersion = 1;
-      localDoc.fileAssetStatus = "ready";
-      upsertDocument(localDoc);
-      docKey.fill(0);
-      if (isJson) {
-        output({
+        const persistedStorageId = extracted.storageId || storageId;
+        if (!extracted.embedding || !Array.isArray(extracted.embedding) || extracted.embedding.length === 0) {
+          try {
+            const combinedText = [
+              extracted.title || fileName,
+              extracted.type,
+              ...extracted.tags || [],
+              ...extracted.mentions || [],
+              JSON.stringify(extracted.fields || {})
+            ].join(" ");
+            const embedding = await convex.action(api.search.embedQuery, { query: combinedText });
+            if (embedding && embedding.length > 0) {
+              extracted.embedding = embedding;
+            }
+          } catch {
+          }
+        }
+        if (!isJson) process.stderr.write("Encrypting...\n");
+        const { vaultKey } = getVaultKeys();
+        const docKey = generateDocumentKey();
+        const encryptedFileBytes = encrypt(fileBytes, docKey);
+        try {
+          await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
+        } catch {
+        }
+        const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+        const now = Date.now();
+        const config = loadConfig();
+        const vaultId = config.vaultId;
+        const localDoc = {
+          id: docId,
+          title: extracted.title || fileName,
+          rawText: extracted.rawText || "",
+          type: extracted.type || "generic",
+          tags: extracted.tags || [],
+          fields: extracted.fields || {},
+          organizations: extracted.organizations || [],
+          mentions: extracted.mentions || [],
+          embedding: extracted.embedding || void 0,
+          owner: extracted.owner || "Unknown",
+          mimeType,
+          encryptedDocKey: wrappedDocKey,
+          dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
+          status: "ready",
+          createdAt: now,
+          updatedAt: now,
+          syncStatus: "synced"
+        };
+        const docContent = JSON.stringify({
+          title: localDoc.title,
+          rawText: localDoc.rawText,
+          type: localDoc.type,
+          tags: localDoc.tags,
+          fields: localDoc.fields,
+          organizations: localDoc.organizations,
+          mentions: localDoc.mentions,
+          owner: localDoc.owner,
+          embedding: extracted.embedding || null,
+          mimeType,
+          fileName,
+          fileHash: hash,
+          dateAdded: localDoc.dateAdded
+        });
+        const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
+        const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
+        new Uint8Array(blobBuffer).set(encryptedBlob);
+        const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
+        new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
+        if (vaultId) {
+          await convex.mutation(api.encryptedSync.upsertBlobByVault, {
+            vaultId,
+            blobId: docId,
+            encryptedBlob: blobBuffer,
+            encryptedDocKey: keyBuffer,
+            blobSize: encryptedBlob.length
+          });
+        } else {
+          await convex.mutation(api.encryptedSync.upsertBlob, {
+            blobId: docId,
+            encryptedBlob: blobBuffer,
+            encryptedDocKey: keyBuffer,
+            blobSize: encryptedBlob.length
+          });
+        }
+        if (!isJson) process.stderr.write("Uploading encrypted file to R2...\n");
+        const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, {
+          blobId: docId,
+          vaultId: vaultId ?? void 0,
+          mimeType: "application/octet-stream",
+          size: encryptedFileBytes.length
+        });
+        const r2Resp = await fetch(fileUploadInfo.url, {
+          method: "PUT",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: encryptedFileBytes
+        });
+        if (!r2Resp.ok) throw new Error(`R2 upload failed: ${r2Resp.status}`);
+        await convex.mutation(api.r2Assets.patchFileAssetRef, {
+          blobId: docId,
+          vaultId: vaultId ?? void 0,
+          provider: "r2",
+          key: fileUploadInfo.key,
+          mimeType,
+          size: encryptedFileBytes.length,
+          version: 1,
+          status: "ready"
+        });
+        localDoc.fileAssetProvider = "r2";
+        localDoc.fileAssetKey = fileUploadInfo.key;
+        localDoc.fileAssetMimeType = mimeType;
+        localDoc.fileAssetSize = encryptedFileBytes.length;
+        localDoc.fileAssetVersion = 1;
+        localDoc.fileAssetStatus = "ready";
+        upsertDocument(localDoc);
+        docKey.fill(0);
+        const result = {
           status: "uploaded",
           id: docId,
           title: localDoc.title,
@@ -1920,22 +1931,27 @@ function registerDocCommands(program2) {
           tags: localDoc.tags,
           owner: localDoc.owner,
           hasEmbedding: !!(extracted.embedding && extracted.embedding.length > 0)
-        });
-      } else {
-        console.log(`Uploaded: ${localDoc.title}`);
-        console.log(`  ID:    ${docId}`);
-        console.log(`  Type:  ${localDoc.type}`);
-        console.log(`  Tags:  ${localDoc.tags.join(", ")}`);
-        console.log(`  Owner: ${localDoc.owner}`);
+        };
+        if (isJson) {
+          if (filePaths.length === 1) output(result);
+          else results.push(result);
+        } else {
+          console.log(`\x1B[32m\u2713\x1B[0m \x1B[1m${localDoc.title}\x1B[0m`);
+          console.log(`  ID: ${docId.slice(0, 8)}  Type: ${localDoc.type}  Owner: ${localDoc.owner}`);
+          console.log(`  Tags: ${localDoc.tags.join(", ")}`);
+          if (filePaths.length > 1) console.log("");
+        }
+      } catch (err) {
+        const msg = err.message;
+        if (isJson) {
+          results.push({ error: msg, file: filePath });
+        } else {
+          console.error(`Upload failed (${path3.basename(filePath)}): ${msg}`);
+        }
       }
-    } catch (err) {
-      const msg = err.message;
-      if (isJson) {
-        output({ error: msg });
-      } else {
-        console.error(`Upload failed: ${msg}`);
-      }
-      process.exit(1);
+    }
+    if (isJson && filePaths.length > 1) {
+      output(results);
     }
   });
 }
