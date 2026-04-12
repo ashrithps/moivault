@@ -63,7 +63,7 @@ moivault doc list --type medical     # Filter by type
 moivault doc get <id>                # Full metadata
 moivault doc text <id>               # Raw OCR text
 moivault doc fields <id>             # Structured fields
-moivault doc upload <file>           # Upload PDF/image to vault
+moivault doc upload <file> [file2...] # Upload PDF/image(s) to vault (batch supported)
 moivault doc download <id>           # Download original file
 moivault doc edit <id> <field> <val> # Edit title, tags, type, owner, or custom field
 moivault doc delete <id>             # Delete document (local + server)
@@ -111,7 +111,7 @@ The installer auto-configures Claude Desktop with the moivault MCP server. After
 `vault_search` · `vault_context` · `vault_doc_get` · `vault_doc_text` · `vault_doc_fields` · `vault_doc_list` · `vault_doc_types` · `vault_doc_edit` · `vault_doc_delete` · `vault_doc_download` · `vault_doc_upload` · `vault_sync` · `vault_stats` · `vault_people_list` · `vault_people_docs` · `vault_chunk_status`
 
 Features:
-- JSON output by default (non-TTY). Pretty output in interactive terminals.
+- JSON output by default (non-TTY). Pretty output with colors in interactive terminals.
 - Auto-unlock with saved password — no interactive prompts needed.
 - Hybrid search combines keyword matching (FTS) with semantic vector search (Gemini embeddings).
 
@@ -123,10 +123,21 @@ Features:
 | FTS | `--mode fts` | ~5ms | Exact keywords, names, numbers |
 | Vector | `--mode vector` | ~1.5s | Semantic queries, concepts, synonyms |
 
+## YouTube & Web Links
+
+The vault stores saved YouTube videos and web links from the mobile app:
+
+```bash
+moivault doc list --type youtube       # List saved videos (with full transcripts)
+moivault doc list --type web_link      # List saved articles/bookmarks
+moivault doc text <id>                 # Read full transcript or page text
+moivault search "that video about X"   # Search across video transcripts
+```
+
 ## Security
 
 - Zero-knowledge encryption — documents are decrypted locally, never sent in plaintext
-- AES-256-GCM with per-document keys
+- AES-256-GCM with per-document keys, encrypted files stored in Cloudflare R2
 - Master password derived via PBKDF2 (600K iterations)
 - Credentials stored in `~/.vault-cli/` with 0600 permissions
 
