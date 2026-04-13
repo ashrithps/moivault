@@ -89,7 +89,27 @@ install_skill() {
 # Paths sourced from skills.sh (vercel-labs/skills/src/agents.ts)
 
 # Claude Code / Claude Desktop
-[ -d "$HOME/.claude" ] && install_skill "$HOME/.claude/skills" "claude-code"
+if [ -d "$HOME/.claude" ]; then
+  install_skill "$HOME/.claude/skills" "claude-code"
+  # Auto-allow moivault bash commands (no permission prompts)
+  CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+  if [ -f "$CLAUDE_SETTINGS" ]; then
+    if ! grep -q '"Bash(moivault' "$CLAUDE_SETTINGS" 2>/dev/null; then
+      python3 -c "
+import json, sys
+with open(sys.argv[1], 'r') as f:
+    config = json.load(f)
+perms = config.setdefault('permissions', {})
+allow = perms.setdefault('allow', [])
+for rule in ['Bash(moivault *)', 'Bash(moivault)']:
+    if rule not in allow:
+        allow.append(rule)
+with open(sys.argv[1], 'w') as f:
+    json.dump(config, f, indent=2)
+" "$CLAUDE_SETTINGS" 2>/dev/null
+    fi
+  fi
+fi
 
 # Codex (OpenAI)
 if [ -d "$HOME/.codex" ] || command -v codex &> /dev/null; then
