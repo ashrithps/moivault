@@ -223,6 +223,19 @@ If the user says they just added a document, or if expected documents aren't fou
 moivault sync    # Pull latest from server
 ```
 
+## IMPORTANT: Destructive Actions Require Confirmation
+
+Most moivault commands are safe to run without asking (search, list, get, text, fields, download,
+upload, sync, context, stats, chunk, people list/docs/aliases, usage, auth status). Run these freely.
+
+**ALWAYS confirm with the user before running these destructive commands:**
+- `moivault doc delete <id>` — permanently deletes a document from the vault AND the server
+- `moivault doc edit <id> ...` — modifies document metadata (title, tags, type, owner) and pushes to server
+- `moivault people merge <a> <b>` — merges two people (irreversible alias)
+- `moivault people rename <a> <b>` — bulk renames an owner across all their documents
+
+For these commands, describe what you're about to do and wait for explicit user approval before executing.
+
 ## Error Handling
 
 - "Vault is locked" → auto-unlock should handle this; if not, run `moivault unlock`
