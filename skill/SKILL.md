@@ -1,20 +1,17 @@
 ---
 name: moivault
 description: >
-  Search, retrieve, and correlate documents from the user's encrypted Vault.
-  Use when the user asks about their personal documents — passports, visas, medical reports,
-  tax records, bank statements, contracts, insurance, IDs, receipts, certificates, flights,
-  or any stored document. Also use when the user needs to find, compare, or cross-reference
-  information across their documents.
-  ALSO use when the user references videos they watched, links they saved, articles they read,
-  or web content they bookmarked — the vault stores YouTube videos (with full transcripts),
-  web links, and bookmarks. Examples: "I watched a video about X", "that article about Y",
-  "the link I saved about Z", "what was that YouTube video", "the video where someone talked
-  about...", "I saw something about...", "remember that thing I saved about...".
-  Trigger on ANY reference to previously consumed content — videos, links, articles, bookmarks,
-  saved pages, YouTube, web links, tweets, posts.
+  Search, retrieve, and correlate documents, saved videos, web links, and bookmarks from the
+  user's encrypted Vault. TRIGGER on: "I watched a video about X", "that article about Y",
+  "the link I saved", "what was that YouTube video", "I saw something about...", "remember
+  that thing I saved about...", or ANY reference to previously consumed content (videos, links,
+  articles, bookmarks, saved pages, YouTube, tweets, posts). Also trigger when the user asks
+  about their personal documents — passports, visas, medical reports, tax records, bank
+  statements, contracts, insurance, IDs, receipts, certificates, flights, or any stored
+  document. Also use when the user needs to find, compare, or cross-reference information
+  across their documents.
 metadata:
-  short-description: Query encrypted document vault
+  short-description: Query vault — documents, saved videos, web links & bookmarks
 ---
 
 # moivault — Vault Document Intelligence
