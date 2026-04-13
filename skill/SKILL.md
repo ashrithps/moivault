@@ -56,6 +56,10 @@ moivault doc edit <id> <field> <val> # Edit a field (title, tags, type, owner, o
 moivault doc delete <id>             # Delete a document (local + server)
 moivault doc delete <id> --force     # Delete without confirmation
 moivault doc types                   # List all document types with counts
+moivault doc create --title "<title>" --content "<text>"  # Create a text/markdown document
+moivault doc create --title "<title>" --file <path>       # Create from a file
+moivault doc update-content <id> --content "<text>"       # Update document content
+moivault doc update-content <id> --file <path>            # Update content from file
 moivault context "<query>"           # RAG retrieval — returns doc context as JSON for any agent
 moivault context "<query>" --limit 5 --chunks 4 --include-fields
 moivault chunk build                 # Build chunk index (splits docs + embeds via Gemini)
@@ -63,6 +67,40 @@ moivault chunk status                # Show chunk index status
 moivault usage                       # Show API usage and plan details
 moivault stats                       # Vault overview (doc count, types, last sync)
 ```
+
+### Creating Documents
+
+```bash
+# Create from inline content
+moivault doc create --title "Meeting Notes" --content "# Meeting\n- Action item 1"
+
+# Create from file
+moivault doc create --title "Report" --file ./report.md
+
+# Create from stdin (pipe from another command)
+echo "# Agent Analysis\nFindings..." | moivault doc create --title "Analysis"
+
+# With tags and forced type
+moivault doc create --title "Recipe" --file recipe.md --tags "cooking,dinner" --type note
+```
+
+### Updating Document Content
+
+```bash
+moivault doc update-content <id> --content "# Updated notes"
+moivault doc update-content <id> --file ./updated.md
+echo "new content" | moivault doc update-content <id>
+
+# Quick edit via doc edit
+moivault doc edit <id> content "# Quick update"
+```
+
+### Saving Notes & Reports
+
+To save findings, analysis, or notes to the user's vault:
+- Use `moivault doc create` — content is encrypted, searchable, and syncs to mobile app
+- Text documents support full-text search, vector search, and RAG context retrieval
+- The mobile app renders markdown with full formatting (headings, lists, code blocks, etc.)
 
 ## Search Modes
 
@@ -99,7 +137,7 @@ Common types in the vault: `flight`, `id`, `visa`, `business_card`, `receipt`, `
 `utility_bill`, `prescription`, `drivers_license`, `birth_certificate`, `certificate`,
 `marriage_certificate`, `loan`, `invoice`, `salary_slip`, `investment`, `vaccination`,
 `travel_itinerary`, `boarding_pass`, `train_ticket`, `car_rental`, `hotel_booking`,
-`gift_card`, `rent_agreement`, `membership`, `generic`.
+`gift_card`, `rent_agreement`, `membership`, `note`, `generic`.
 
 ## CRITICAL: Search Strategy
 

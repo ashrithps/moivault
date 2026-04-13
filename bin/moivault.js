@@ -204,6 +204,7 @@ function openDatabase(dbPath) {
       id TEXT PRIMARY KEY,
       title TEXT,
       rawText TEXT,
+      markdownContent TEXT,
       type TEXT,
       tags TEXT,
       fields TEXT,
@@ -243,6 +244,7 @@ function openDatabase(dbPath) {
   const existingCols = db.pragma("table_info(documents)");
   const colNames = new Set(existingCols.map((c) => c.name));
   const r2Cols = [
+    "markdownContent TEXT",
     "fileAssetProvider TEXT",
     "fileAssetKey TEXT",
     "fileAssetMimeType TEXT",
@@ -367,6 +369,7 @@ function deserializeRow(row) {
     id: row.id,
     title: row.title,
     rawText: row.rawText,
+    markdownContent: row.markdownContent,
     type: row.type,
     tags,
     fields,
@@ -407,14 +410,15 @@ function upsertDocument(doc) {
   const database = getDatabase();
   const stmt = database.prepare(`
     INSERT OR REPLACE INTO documents
-    (id, title, rawText, type, tags, fields, organizations, mentions, overview, embedding, encryptedDocKey, mimeType, storageId, encryptedStorageId, fileEncrypted, fileAssetProvider, fileAssetKey, fileAssetMimeType, fileAssetSize, fileAssetVersion, fileAssetStatus, previewAssetProvider, previewAssetKey, previewAssetMimeType, previewAssetSize, previewAssetVersion, previewAssetStatus, owner, originalOwner, addedBy, imageUrl, dateAdded, status, vaultId, createdAt, updatedAt, syncStatus)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (id, title, rawText, markdownContent, type, tags, fields, organizations, mentions, overview, embedding, encryptedDocKey, mimeType, storageId, encryptedStorageId, fileEncrypted, fileAssetProvider, fileAssetKey, fileAssetMimeType, fileAssetSize, fileAssetVersion, fileAssetStatus, previewAssetProvider, previewAssetKey, previewAssetMimeType, previewAssetSize, previewAssetVersion, previewAssetStatus, owner, originalOwner, addedBy, imageUrl, dateAdded, status, vaultId, createdAt, updatedAt, syncStatus)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const embeddingBlob = doc.embedding ? Buffer.from(new Float64Array(doc.embedding).buffer) : null;
   stmt.run(
     doc.id,
     doc.title,
     doc.rawText ?? null,
+    doc.markdownContent || null,
     doc.type,
     JSON.stringify(doc.tags),
     JSON.stringify(doc.fields),
@@ -1110,6 +1114,7 @@ function decryptBlob(blob, vaultKey) {
     id: blob.blobId,
     title: metadata.title ?? "Untitled",
     rawText: metadata.rawText,
+    markdownContent: metadata.markdownContent,
     type: metadata.type ?? "generic",
     tags: metadata.tags ?? [],
     fields: metadata.fields ?? {},
@@ -1573,7 +1578,8 @@ function registerDocCommands(program2) {
       process.exit(1);
     }
     try {
-      updateDocumentField(id, field, field === "tags" ? value.split(",").map((t) => t.trim()) : value);
+      const dbField = field === "content" ? "markdownContent" : field;
+      updateDocumentField(id, dbField, dbField === "tags" ? value.split(",").map((t) => t.trim()) : value);
       const updatedDoc = getDocumentById(id);
       const { vaultKey } = getVaultKeys();
       let docKey;
@@ -1586,6 +1592,7 @@ function registerDocCommands(program2) {
       const docContent = JSON.stringify({
         title: updatedDoc.title,
         rawText: updatedDoc.rawText,
+        markdownContent: updatedDoc.markdownContent,
         type: updatedDoc.type,
         tags: updatedDoc.tags,
         fields: updatedDoc.fields,
@@ -1763,6 +1770,290 @@ function registerDocCommands(program2) {
       process.exit(1);
     }
   });
+  doc.command("create").description("Create a text/markdown document in the vault").requiredOption("--title <title>", "Document title").option("--content <content>", "Inline markdown content").option("--file <path>", "Read content from .txt/.md file").option("--type <type>", "Force document type (default: auto-classify)").option("--tags <tags>", "Comma-separated tags").action(async (opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked(isJson);
+    try {
+      let content;
+      if (opts.content) {
+        content = opts.content;
+      } else if (opts.file) {
+        const filePath = path3.resolve(opts.file);
+        if (!fs3.existsSync(filePath)) {
+          const msg = `File not found: ${filePath}`;
+          if (isJson) {
+            output({ error: msg });
+          } else {
+            console.error(msg);
+          }
+          process.exit(1);
+        }
+        content = fs3.readFileSync(filePath, "utf-8");
+      } else if (!process.stdin.isTTY) {
+        const chunks = [];
+        for await (const chunk of process.stdin) chunks.push(chunk);
+        content = Buffer.concat(chunks).toString("utf-8");
+      } else {
+        const msg = "No content provided \u2014 use --content, --file, or pipe via stdin";
+        if (isJson) {
+          output({ error: msg });
+        } else {
+          console.error(msg);
+        }
+        process.exit(1);
+      }
+      const contentBytes = new TextEncoder().encode(content);
+      if (contentBytes.byteLength > 200 * 1024) {
+        const msg = "Content exceeds 200KB limit";
+        if (isJson) {
+          output({ error: msg });
+        } else {
+          console.error(msg);
+        }
+        process.exit(1);
+      }
+      const hash = crypto3.createHash("sha256").update(contentBytes).digest("hex");
+      const docId = hash;
+      const existingDoc = getDocumentById(docId);
+      if (existingDoc) {
+        if (isJson) {
+          output({ status: "duplicate", id: docId, title: existingDoc.title });
+        } else {
+          console.log(`Document already exists: ${existingDoc.title} (${docId.slice(0, 8)})`);
+        }
+        return;
+      }
+      const convex = await authenticateConvexClient();
+      if (!isJson) process.stderr.write("Analyzing with Gemini...\n");
+      const extracted = await convex.action(api.proxy.processText, {
+        textContent: content,
+        fileName: opts.title
+      });
+      if (opts.type) extracted.type = opts.type;
+      if (opts.tags) {
+        const extraTags = opts.tags.split(",").map((t) => t.trim()).filter(Boolean);
+        extracted.tags = [.../* @__PURE__ */ new Set([...extracted.tags || [], ...extraTags])];
+      }
+      if (!isJson) process.stderr.write("Encrypting...\n");
+      const { vaultKey } = getVaultKeys();
+      const docKey = generateDocumentKey();
+      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const now = Date.now();
+      const config = loadConfig();
+      const vaultId = config.vaultId;
+      const localDoc = {
+        id: docId,
+        title: opts.title,
+        rawText: extracted.rawText || content,
+        markdownContent: content,
+        type: extracted.type || "note",
+        tags: extracted.tags || [],
+        fields: extracted.fields || {},
+        organizations: extracted.organizations || [],
+        mentions: extracted.mentions || [],
+        embedding: extracted.embedding || void 0,
+        owner: extracted.owner || "Unknown",
+        mimeType: "text/markdown",
+        encryptedDocKey: wrappedDocKey,
+        dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
+        status: "ready",
+        createdAt: now,
+        updatedAt: now,
+        syncStatus: "synced"
+      };
+      const docContent = JSON.stringify({
+        title: localDoc.title,
+        rawText: localDoc.rawText,
+        markdownContent: content,
+        type: localDoc.type,
+        tags: localDoc.tags,
+        fields: localDoc.fields,
+        organizations: localDoc.organizations,
+        mentions: localDoc.mentions,
+        owner: localDoc.owner,
+        embedding: extracted.embedding || null,
+        mimeType: "text/markdown",
+        dateAdded: localDoc.dateAdded
+      });
+      const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
+      const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
+      new Uint8Array(blobBuffer).set(encryptedBlob);
+      const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
+      new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
+      if (vaultId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, {
+          vaultId,
+          blobId: docId,
+          encryptedBlob: blobBuffer,
+          encryptedDocKey: keyBuffer,
+          blobSize: encryptedBlob.length
+        });
+      } else {
+        await convex.mutation(api.encryptedSync.upsertBlob, {
+          blobId: docId,
+          encryptedBlob: blobBuffer,
+          encryptedDocKey: keyBuffer,
+          blobSize: encryptedBlob.length
+        });
+      }
+      upsertDocument(localDoc);
+      docKey.fill(0);
+      const result = {
+        status: "created",
+        id: docId,
+        title: localDoc.title,
+        type: localDoc.type,
+        tags: localDoc.tags,
+        owner: localDoc.owner,
+        hasEmbedding: !!(extracted.embedding && extracted.embedding.length > 0)
+      };
+      if (isJson) {
+        output(result);
+      } else {
+        console.log(`\x1B[32m\u2713\x1B[0m \x1B[1m${localDoc.title}\x1B[0m`);
+        console.log(`  ID: ${docId.slice(0, 8)}  Type: ${localDoc.type}  Owner: ${localDoc.owner}`);
+        console.log(`  Tags: ${localDoc.tags.join(", ")}`);
+      }
+    } catch (err) {
+      const msg = err.message;
+      if (isJson) {
+        output({ error: msg });
+      } else {
+        console.error(`Create failed: ${msg}`);
+      }
+      process.exit(1);
+    }
+  });
+  doc.command("update-content").description("Replace markdown content of a document").argument("<id>", "Document ID").option("--content <content>", "New inline markdown content").option("--file <path>", "Read new content from file").action(async (id, opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked(isJson);
+    let content;
+    try {
+      if (opts.content) {
+        content = opts.content;
+      } else if (opts.file) {
+        const filePath = path3.resolve(opts.file);
+        if (!fs3.existsSync(filePath)) {
+          const msg = `File not found: ${filePath}`;
+          if (isJson) {
+            output({ error: msg });
+          } else {
+            console.error(msg);
+          }
+          process.exit(1);
+        }
+        content = fs3.readFileSync(filePath, "utf-8");
+      } else if (!process.stdin.isTTY) {
+        const chunks = [];
+        for await (const chunk of process.stdin) chunks.push(chunk);
+        content = Buffer.concat(chunks).toString("utf-8");
+      } else {
+        const msg = "No content provided \u2014 use --content, --file, or pipe via stdin";
+        if (isJson) {
+          output({ error: msg });
+        } else {
+          console.error(msg);
+        }
+        process.exit(1);
+      }
+      const contentBytes = new TextEncoder().encode(content);
+      if (contentBytes.byteLength > 200 * 1024) {
+        const msg = "Content exceeds 200KB limit";
+        if (isJson) {
+          output({ error: msg });
+        } else {
+          console.error(msg);
+        }
+        process.exit(1);
+      }
+      const localDoc = getDocumentById(id);
+      if (!localDoc) {
+        if (isJson) {
+          output({ error: "Document not found", id });
+        } else {
+          console.error(`Document not found: ${id}`);
+        }
+        process.exit(1);
+      }
+      const convex = await authenticateConvexClient();
+      if (!isJson) process.stderr.write("Analyzing with Gemini...\n");
+      const extracted = await convex.action(api.proxy.processText, {
+        textContent: content,
+        fileName: localDoc.title
+      });
+      const now = Date.now();
+      const updatedDoc = {
+        ...localDoc,
+        markdownContent: content,
+        rawText: extracted.rawText || content,
+        embedding: extracted.embedding || localDoc.embedding,
+        updatedAt: now,
+        syncStatus: "synced"
+      };
+      const { vaultKey } = getVaultKeys();
+      let docKey;
+      if (localDoc.encryptedDocKey) {
+        docKey = unwrapDocumentKey(localDoc.encryptedDocKey, vaultKey);
+      } else {
+        docKey = generateDocumentKey();
+      }
+      const docContent = JSON.stringify({
+        title: updatedDoc.title,
+        rawText: updatedDoc.rawText,
+        markdownContent: content,
+        type: updatedDoc.type,
+        tags: updatedDoc.tags,
+        fields: updatedDoc.fields,
+        organizations: updatedDoc.organizations,
+        mentions: updatedDoc.mentions,
+        owner: updatedDoc.owner,
+        embedding: updatedDoc.embedding ? Array.from(updatedDoc.embedding) : null,
+        mimeType: updatedDoc.mimeType,
+        encryptedStorageId: updatedDoc.encryptedStorageId,
+        storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
+        dateAdded: updatedDoc.dateAdded
+      });
+      const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
+      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
+      new Uint8Array(blobBuffer).set(encryptedBlob);
+      const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
+      new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
+      const config = loadConfig();
+      const vaultId = config.vaultId;
+      if (vaultId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, {
+          vaultId,
+          blobId: id,
+          encryptedBlob: blobBuffer,
+          encryptedDocKey: keyBuffer,
+          blobSize: encryptedBlob.length
+        });
+      } else {
+        await convex.mutation(api.encryptedSync.upsertBlob, {
+          blobId: id,
+          encryptedBlob: blobBuffer,
+          encryptedDocKey: keyBuffer,
+          blobSize: encryptedBlob.length
+        });
+      }
+      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey });
+      docKey.fill(0);
+      if (isJson) {
+        output({ status: "updated", id, title: localDoc.title });
+      } else {
+        console.log(`\x1B[32m\u2713\x1B[0m Content updated: \x1B[1m${localDoc.title}\x1B[0m`);
+      }
+    } catch (err) {
+      const msg = err.message;
+      if (isJson) {
+        output({ error: msg });
+      } else {
+        console.error(`Update failed: ${msg}`);
+      }
+      process.exit(1);
+    }
+  });
   doc.command("upload").description("Upload one or more documents to the vault").argument("<files...>", "Path(s) to file(s) \u2014 PDF, image, etc.").action(async (filePaths, _opts) => {
     const isJson = shouldOutputJson(program2.opts());
     requireUnlocked(isJson);
@@ -1786,11 +2077,106 @@ function registerDocCommands(program2) {
         jpeg: "image/jpeg",
         png: "image/png",
         webp: "image/webp",
-        heic: "image/heic"
+        heic: "image/heic",
+        txt: "text/plain",
+        md: "text/markdown"
       }[ext] ?? "application/octet-stream";
+      const isTextFile = mimeType === "text/plain" || mimeType === "text/markdown" || ext === "md" || ext === "txt";
       try {
         const fileBuffer = fs3.readFileSync(resolvedPath);
         const fileBytes = new Uint8Array(fileBuffer);
+        if (isTextFile) {
+          const content = fileBuffer.toString("utf-8");
+          const contentEncoded = new TextEncoder().encode(content);
+          if (contentEncoded.byteLength > 200 * 1024) throw new Error("Content exceeds 200KB limit");
+          const hash2 = crypto3.createHash("sha256").update(contentEncoded).digest("hex");
+          const docId2 = hash2;
+          const existingDoc = getDocumentById(docId2);
+          if (existingDoc) {
+            const dupResult = { status: "duplicate", id: docId2, title: existingDoc.title };
+            if (isJson) {
+              if (filePaths.length === 1) {
+                output(dupResult);
+              } else {
+                results.push(dupResult);
+              }
+            } else {
+              console.log(`Duplicate: ${existingDoc.title} (${docId2.slice(0, 8)})`);
+            }
+            continue;
+          }
+          if (!isJson) process.stderr.write("Analyzing with Gemini...\n");
+          const convex2 = await authenticateConvexClient();
+          const extracted2 = await convex2.action(api.proxy.processText, { textContent: content, fileName });
+          if (!isJson) process.stderr.write("Encrypting...\n");
+          const { vaultKey: vaultKey2 } = getVaultKeys();
+          const docKey2 = generateDocumentKey();
+          const wrappedDocKey2 = wrapDocumentKey(docKey2, vaultKey2);
+          const now2 = Date.now();
+          const config2 = loadConfig();
+          const vaultId2 = config2.vaultId;
+          const localDoc2 = {
+            id: docId2,
+            title: extracted2.title || path3.basename(fileName, path3.extname(fileName)),
+            rawText: extracted2.rawText || content,
+            markdownContent: content,
+            type: extracted2.type || "note",
+            tags: extracted2.tags || [],
+            fields: extracted2.fields || {},
+            organizations: extracted2.organizations || [],
+            mentions: extracted2.mentions || [],
+            embedding: extracted2.embedding || void 0,
+            owner: extracted2.owner || "Unknown",
+            mimeType,
+            encryptedDocKey: wrappedDocKey2,
+            dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
+            status: "ready",
+            createdAt: now2,
+            updatedAt: now2,
+            syncStatus: "synced"
+          };
+          const docContent2 = JSON.stringify({
+            title: localDoc2.title,
+            rawText: localDoc2.rawText,
+            markdownContent: content,
+            type: localDoc2.type,
+            tags: localDoc2.tags,
+            fields: localDoc2.fields,
+            organizations: localDoc2.organizations,
+            mentions: localDoc2.mentions,
+            owner: localDoc2.owner,
+            embedding: extracted2.embedding || null,
+            mimeType,
+            fileName,
+            fileHash: hash2,
+            dateAdded: localDoc2.dateAdded
+          });
+          const encryptedBlob2 = encrypt(new TextEncoder().encode(docContent2), docKey2);
+          const blobBuffer2 = new ArrayBuffer(encryptedBlob2.byteLength);
+          new Uint8Array(blobBuffer2).set(encryptedBlob2);
+          const keyBuffer2 = new ArrayBuffer(wrappedDocKey2.byteLength);
+          new Uint8Array(keyBuffer2).set(new Uint8Array(wrappedDocKey2));
+          if (vaultId2) {
+            await convex2.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: vaultId2, blobId: docId2, encryptedBlob: blobBuffer2, encryptedDocKey: keyBuffer2, blobSize: encryptedBlob2.length });
+          } else {
+            await convex2.mutation(api.encryptedSync.upsertBlob, { blobId: docId2, encryptedBlob: blobBuffer2, encryptedDocKey: keyBuffer2, blobSize: encryptedBlob2.length });
+          }
+          upsertDocument(localDoc2);
+          docKey2.fill(0);
+          const textResult = { status: "created", id: docId2, title: localDoc2.title, type: localDoc2.type, tags: localDoc2.tags, owner: localDoc2.owner };
+          if (isJson) {
+            if (filePaths.length === 1) {
+              output(textResult);
+            } else {
+              results.push(textResult);
+            }
+          } else {
+            console.log(`\x1B[32m\u2713\x1B[0m \x1B[1m${localDoc2.title}\x1B[0m`);
+            console.log(`  ID: ${docId2.slice(0, 8)}  Type: ${localDoc2.type}  Owner: ${localDoc2.owner}`);
+            if (filePaths.length > 1) console.log("");
+          }
+          continue;
+        }
         const hash = crypto3.createHash("sha256").update(fileBytes).digest("hex");
         const docId = hash;
         if (!isJson) process.stderr.write("Uploading to server...\n");
@@ -1859,6 +2245,7 @@ function registerDocCommands(program2) {
         const docContent = JSON.stringify({
           title: localDoc.title,
           rawText: localDoc.rawText,
+          markdownContent: localDoc.markdownContent,
           type: localDoc.type,
           tags: localDoc.tags,
           fields: localDoc.fields,
@@ -2968,7 +3355,7 @@ async function startMcpServer() {
       await ensureSynced();
       const doc = getDocumentById(id);
       if (!doc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
-      const result = { id: doc.id, title: doc.title, type: doc.type, tags: doc.tags, owner: doc.owner, dateAdded: doc.dateAdded, fields: doc.fields, mimeType: doc.mimeType, hasFile: !!(doc.fileAssetKey || doc.storageId || doc.encryptedStorageId) };
+      const result = { id: doc.id, title: doc.title, type: doc.type, tags: doc.tags, owner: doc.owner, dateAdded: doc.dateAdded, fields: doc.fields, mimeType: doc.mimeType, markdownContent: doc.markdownContent, hasFile: !!(doc.fileAssetKey || doc.storageId || doc.encryptedStorageId) };
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
@@ -3044,6 +3431,7 @@ async function startMcpServer() {
       const encryptedBlob = encrypt(new TextEncoder().encode(JSON.stringify({
         title: updatedDoc.title,
         rawText: updatedDoc.rawText,
+        markdownContent: updatedDoc.markdownContent,
         type: updatedDoc.type,
         tags: updatedDoc.tags,
         fields: updatedDoc.fields,
@@ -3233,6 +3621,156 @@ async function startMcpServer() {
       upsertDocument(localDoc);
       docKey.fill(0);
       return { content: [{ type: "text", text: JSON.stringify({ status: "uploaded", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags }) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_create",
+    "Create a text/markdown document in the vault. Extracts metadata via Gemini, encrypts, and syncs.",
+    {
+      title: z.string().describe("Document title"),
+      content: z.string().describe("Markdown/text content"),
+      type: z.string().optional().describe("Force document type (default: auto-classify)"),
+      tags: z.string().optional().describe("Comma-separated tags to add")
+    },
+    async ({ title, content, type, tags }) => {
+      await ensureUnlocked();
+      const crypto5 = await import("crypto");
+      const contentBytes = new TextEncoder().encode(content);
+      if (contentBytes.byteLength > 200 * 1024) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: "Content exceeds 200KB limit" }) }] };
+      }
+      const hash = crypto5.createHash("sha256").update(contentBytes).digest("hex");
+      const docId = hash;
+      const existingDoc = getDocumentById(docId);
+      if (existingDoc) {
+        return { content: [{ type: "text", text: JSON.stringify({ status: "duplicate", id: docId, title: existingDoc.title }) }] };
+      }
+      const convex = await authenticateConvexClient();
+      const extracted = await convex.action(api.proxy.processText, { textContent: content, fileName: title });
+      if (type) extracted.type = type;
+      if (tags) {
+        const extraTags = tags.split(",").map((t) => t.trim()).filter(Boolean);
+        extracted.tags = [.../* @__PURE__ */ new Set([...extracted.tags || [], ...extraTags])];
+      }
+      const { vaultKey } = getVaultKeys();
+      const docKey = generateDocumentKey();
+      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const now = Date.now();
+      const config = loadConfig();
+      const vaultId = config.vaultId;
+      const localDoc = {
+        id: docId,
+        title,
+        rawText: extracted.rawText || content,
+        markdownContent: content,
+        type: extracted.type || "note",
+        tags: extracted.tags || [],
+        fields: extracted.fields || {},
+        organizations: extracted.organizations || [],
+        mentions: extracted.mentions || [],
+        embedding: extracted.embedding || void 0,
+        owner: extracted.owner || "Unknown",
+        mimeType: "text/markdown",
+        encryptedDocKey: wrappedDocKey,
+        dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
+        status: "ready",
+        createdAt: now,
+        updatedAt: now,
+        syncStatus: "synced"
+      };
+      const docContentStr = JSON.stringify({
+        title: localDoc.title,
+        rawText: localDoc.rawText,
+        markdownContent: content,
+        type: localDoc.type,
+        tags: localDoc.tags,
+        fields: localDoc.fields,
+        organizations: localDoc.organizations,
+        mentions: localDoc.mentions,
+        owner: localDoc.owner,
+        embedding: extracted.embedding || null,
+        mimeType: "text/markdown",
+        dateAdded: localDoc.dateAdded
+      });
+      const encBlob = encrypt(new TextEncoder().encode(docContentStr), docKey);
+      const blobBuf = new ArrayBuffer(encBlob.byteLength);
+      new Uint8Array(blobBuf).set(encBlob);
+      const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
+      new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
+      if (vaultId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+      } else {
+        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+      }
+      upsertDocument(localDoc);
+      docKey.fill(0);
+      return { content: [{ type: "text", text: JSON.stringify({ status: "created", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags, owner: localDoc.owner }) }] };
+    }
+  );
+  server.tool(
+    "vault_doc_update_content",
+    "Replace the markdown content of an existing document. Re-processes rawText and embedding via Gemini.",
+    {
+      docId: z.string().describe("Document ID"),
+      content: z.string().describe("New markdown/text content")
+    },
+    async ({ docId, content }) => {
+      await ensureUnlocked();
+      const contentBytes = new TextEncoder().encode(content);
+      if (contentBytes.byteLength > 200 * 1024) {
+        return { content: [{ type: "text", text: JSON.stringify({ error: "Content exceeds 200KB limit" }) }] };
+      }
+      const localDoc = getDocumentById(docId);
+      if (!localDoc) return { content: [{ type: "text", text: JSON.stringify({ error: "Document not found" }) }] };
+      const convex = await authenticateConvexClient();
+      const extracted = await convex.action(api.proxy.processText, { textContent: content, fileName: localDoc.title });
+      const { vaultKey } = getVaultKeys();
+      let docKey;
+      if (localDoc.encryptedDocKey) {
+        docKey = unwrapDocumentKey(localDoc.encryptedDocKey, vaultKey);
+      } else {
+        docKey = generateDocumentKey();
+      }
+      const now = Date.now();
+      const updatedDoc = {
+        ...localDoc,
+        markdownContent: content,
+        rawText: extracted.rawText || content,
+        embedding: extracted.embedding || localDoc.embedding,
+        updatedAt: now,
+        syncStatus: "synced"
+      };
+      const docContentStr = JSON.stringify({
+        title: updatedDoc.title,
+        rawText: updatedDoc.rawText,
+        markdownContent: content,
+        type: updatedDoc.type,
+        tags: updatedDoc.tags,
+        fields: updatedDoc.fields,
+        organizations: updatedDoc.organizations,
+        mentions: updatedDoc.mentions,
+        owner: updatedDoc.owner,
+        embedding: updatedDoc.embedding ? Array.from(updatedDoc.embedding) : null,
+        mimeType: updatedDoc.mimeType,
+        encryptedStorageId: updatedDoc.encryptedStorageId,
+        storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
+        dateAdded: updatedDoc.dateAdded
+      });
+      const encBlob = encrypt(new TextEncoder().encode(docContentStr), docKey);
+      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const blobBuf = new ArrayBuffer(encBlob.byteLength);
+      new Uint8Array(blobBuf).set(encBlob);
+      const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
+      new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
+      const config = loadConfig();
+      if (config.vaultId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: config.vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+      } else {
+        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+      }
+      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey });
+      docKey.fill(0);
+      return { content: [{ type: "text", text: JSON.stringify({ status: "updated", id: docId, title: localDoc.title }) }] };
     }
   );
   server.tool(
