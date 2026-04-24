@@ -1446,11 +1446,67 @@ function registerSyncCommands(program2) {
 
 // src/cli/commands/doc.ts
 init_database();
+import fs4 from "fs";
+import path4 from "path";
+import os3 from "os";
+import crypto3 from "crypto";
+init_crypto();
+
+// src/core/thumbnail.ts
+import { spawn } from "child_process";
 import fs3 from "fs";
 import path3 from "path";
 import os2 from "os";
-import crypto3 from "crypto";
-init_crypto();
+async function generateThumbnail(filePath, mimeType) {
+  if (mimeType !== "application/pdf" && !mimeType.startsWith("image/")) {
+    return null;
+  }
+  const tmpDir = await fs3.promises.mkdtemp(path3.join(os2.tmpdir(), "vault-thumb-"));
+  const destJpeg = path3.join(tmpDir, "thumb.jpg");
+  try {
+    if (mimeType === "application/pdf") {
+      await runCommand("qlmanage", ["-t", "-s", "720", "-o", tmpDir, filePath]);
+      const files = await fs3.promises.readdir(tmpDir);
+      const png = files.find((f) => f.endsWith(".png"));
+      if (!png) return null;
+      await runCommand("sips", [
+        "-s",
+        "format",
+        "jpeg",
+        path3.join(tmpDir, png),
+        "--out",
+        destJpeg
+      ]);
+    } else {
+      await runCommand("sips", [
+        "-Z",
+        "720",
+        "-s",
+        "format",
+        "jpeg",
+        filePath,
+        "--out",
+        destJpeg
+      ]);
+    }
+    const bytes = new Uint8Array(await fs3.promises.readFile(destJpeg));
+    return { bytes, mimeType: "image/jpeg" };
+  } catch {
+    return null;
+  } finally {
+    await fs3.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {
+    });
+  }
+}
+function runCommand(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { stdio: "ignore" });
+    proc.on("error", reject);
+    proc.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`)));
+  });
+}
+
+// src/cli/commands/doc.ts
 init_database();
 init_config();
 function requireUnlocked(isJson) {
@@ -1751,10 +1807,10 @@ function registerDocCommands(program2) {
       }
       const ext = document.mimeType ? { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[document.mimeType] ?? "bin" : "bin";
       const safeName = (document.title || "document").replace(/[/\\:*?"<>|]/g, "_");
-      const outputPath = opts.output || path3.join(os2.homedir(), "Downloads", `${safeName}.${ext}`);
-      const dir = path3.dirname(outputPath);
-      if (!fs3.existsSync(dir)) fs3.mkdirSync(dir, { recursive: true });
-      fs3.writeFileSync(outputPath, fileBytes);
+      const outputPath = opts.output || path4.join(os3.homedir(), "Downloads", `${safeName}.${ext}`);
+      const dir = path4.dirname(outputPath);
+      if (!fs4.existsSync(dir)) fs4.mkdirSync(dir, { recursive: true });
+      fs4.writeFileSync(outputPath, fileBytes);
       if (isJson) {
         output({ status: "downloaded", path: outputPath, size: fileBytes.length });
       } else {
@@ -1778,8 +1834,8 @@ function registerDocCommands(program2) {
       if (opts.content) {
         content = opts.content;
       } else if (opts.file) {
-        const filePath = path3.resolve(opts.file);
-        if (!fs3.existsSync(filePath)) {
+        const filePath = path4.resolve(opts.file);
+        if (!fs4.existsSync(filePath)) {
           const msg = `File not found: ${filePath}`;
           if (isJson) {
             output({ error: msg });
@@ -1788,7 +1844,7 @@ function registerDocCommands(program2) {
           }
           process.exit(1);
         }
-        content = fs3.readFileSync(filePath, "utf-8");
+        content = fs4.readFileSync(filePath, "utf-8");
       } else if (!process.stdin.isTTY) {
         const chunks = [];
         for await (const chunk of process.stdin) chunks.push(chunk);
@@ -1932,8 +1988,8 @@ function registerDocCommands(program2) {
       if (opts.content) {
         content = opts.content;
       } else if (opts.file) {
-        const filePath = path3.resolve(opts.file);
-        if (!fs3.existsSync(filePath)) {
+        const filePath = path4.resolve(opts.file);
+        if (!fs4.existsSync(filePath)) {
           const msg = `File not found: ${filePath}`;
           if (isJson) {
             output({ error: msg });
@@ -1942,7 +1998,7 @@ function registerDocCommands(program2) {
           }
           process.exit(1);
         }
-        content = fs3.readFileSync(filePath, "utf-8");
+        content = fs4.readFileSync(filePath, "utf-8");
       } else if (!process.stdin.isTTY) {
         const chunks = [];
         for await (const chunk of process.stdin) chunks.push(chunk);
@@ -2059,8 +2115,8 @@ function registerDocCommands(program2) {
     requireUnlocked(isJson);
     const results = [];
     for (const filePath of filePaths) {
-      const resolvedPath = path3.resolve(filePath);
-      if (!fs3.existsSync(resolvedPath)) {
+      const resolvedPath = path4.resolve(filePath);
+      if (!fs4.existsSync(resolvedPath)) {
         if (isJson) {
           results.push({ error: "File not found", path: resolvedPath });
           continue;
@@ -2069,8 +2125,8 @@ function registerDocCommands(program2) {
           continue;
         }
       }
-      const fileName = path3.basename(resolvedPath);
-      const ext = path3.extname(resolvedPath).toLowerCase().slice(1);
+      const fileName = path4.basename(resolvedPath);
+      const ext = path4.extname(resolvedPath).toLowerCase().slice(1);
       const mimeType = {
         pdf: "application/pdf",
         jpg: "image/jpeg",
@@ -2083,7 +2139,7 @@ function registerDocCommands(program2) {
       }[ext] ?? "application/octet-stream";
       const isTextFile = mimeType === "text/plain" || mimeType === "text/markdown" || ext === "md" || ext === "txt";
       try {
-        const fileBuffer = fs3.readFileSync(resolvedPath);
+        const fileBuffer = fs4.readFileSync(resolvedPath);
         const fileBytes = new Uint8Array(fileBuffer);
         if (isTextFile) {
           const content = fileBuffer.toString("utf-8");
@@ -2117,7 +2173,7 @@ function registerDocCommands(program2) {
           const vaultId2 = config2.vaultId;
           const localDoc2 = {
             id: docId2,
-            title: extracted2.title || path3.basename(fileName, path3.extname(fileName)),
+            title: extracted2.title || path4.basename(fileName, path4.extname(fileName)),
             rawText: extracted2.rawText || content,
             markdownContent: content,
             type: extracted2.type || "note",
@@ -2309,6 +2365,49 @@ function registerDocCommands(program2) {
         localDoc.fileAssetVersion = 1;
         localDoc.fileAssetStatus = "ready";
         upsertDocument(localDoc);
+        if (mimeType === "application/pdf" || mimeType.startsWith("image/")) {
+          if (!isJson) process.stderr.write("Generating preview thumbnail...\n");
+          try {
+            const thumb = await generateThumbnail(resolvedPath, mimeType);
+            if (thumb) {
+              const encryptedThumbBytes = encrypt(thumb.bytes, docKey);
+              const previewUploadInfo = await convex.action(api.r2Assets.requestPreviewUploadUrl, {
+                blobId: docId,
+                vaultId: vaultId ?? void 0,
+                mimeType: "application/octet-stream",
+                size: encryptedThumbBytes.length
+              });
+              const previewResp = await fetch(previewUploadInfo.url, {
+                method: "PUT",
+                headers: { "Content-Type": "application/octet-stream" },
+                body: encryptedThumbBytes
+              });
+              if (!previewResp.ok) throw new Error(`R2 preview upload failed: ${previewResp.status}`);
+              await convex.mutation(api.r2Assets.patchPreviewAssetRef, {
+                blobId: docId,
+                vaultId: vaultId ?? void 0,
+                provider: "r2",
+                key: previewUploadInfo.key,
+                mimeType: thumb.mimeType,
+                size: encryptedThumbBytes.length,
+                version: 1,
+                status: "ready"
+              });
+              localDoc.previewAssetProvider = "r2";
+              localDoc.previewAssetKey = previewUploadInfo.key;
+              localDoc.previewAssetMimeType = thumb.mimeType;
+              localDoc.previewAssetSize = encryptedThumbBytes.length;
+              localDoc.previewAssetVersion = 1;
+              localDoc.previewAssetStatus = "ready";
+              upsertDocument(localDoc);
+            }
+          } catch (previewErr) {
+            if (!isJson) {
+              process.stderr.write(`Preview generation skipped: ${previewErr.message}
+`);
+            }
+          }
+        }
         docKey.fill(0);
         const result = {
           status: "uploaded",
@@ -2333,7 +2432,7 @@ function registerDocCommands(program2) {
         if (isJson) {
           results.push({ error: msg, file: filePath });
         } else {
-          console.error(`Upload failed (${path3.basename(filePath)}): ${msg}`);
+          console.error(`Upload failed (${path4.basename(filePath)}): ${msg}`);
         }
       }
     }
@@ -3512,15 +3611,15 @@ async function startMcpServer() {
       } else {
         fileBytes = rawBytes;
       }
-      const { default: fs4 } = await import("fs");
-      const { default: path4 } = await import("path");
-      const { default: os3 } = await import("os");
+      const { default: fs5 } = await import("fs");
+      const { default: path5 } = await import("path");
+      const { default: os4 } = await import("os");
       const ext = doc.mimeType ? { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[doc.mimeType] ?? "bin" : "bin";
       const safeName = (doc.title || "document").replace(/[/\\:*?"<>|]/g, "_");
-      const finalPath = outputPath || path4.join(os3.homedir(), "Downloads", `${safeName}.${ext}`);
-      const dir = path4.dirname(finalPath);
-      if (!fs4.existsSync(dir)) fs4.mkdirSync(dir, { recursive: true });
-      fs4.writeFileSync(finalPath, fileBytes);
+      const finalPath = outputPath || path5.join(os4.homedir(), "Downloads", `${safeName}.${ext}`);
+      const dir = path5.dirname(finalPath);
+      if (!fs5.existsSync(dir)) fs5.mkdirSync(dir, { recursive: true });
+      fs5.writeFileSync(finalPath, fileBytes);
       return { content: [{ type: "text", text: JSON.stringify({ status: "downloaded", path: finalPath, size: fileBytes.length, title: doc.title }) }] };
     }
   );
@@ -3561,14 +3660,14 @@ async function startMcpServer() {
     { filePath: z.string().describe("Absolute path to the file") },
     async ({ filePath }) => {
       await ensureUnlocked();
-      const { default: fs4 } = await import("fs");
-      const { default: path4 } = await import("path");
+      const { default: fs5 } = await import("fs");
+      const { default: path5 } = await import("path");
       const crypto5 = await import("crypto");
-      if (!fs4.existsSync(filePath)) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found" }) }] };
-      const fileBuffer = fs4.readFileSync(filePath);
+      if (!fs5.existsSync(filePath)) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found" }) }] };
+      const fileBuffer = fs5.readFileSync(filePath);
       const fileBytes = new Uint8Array(fileBuffer);
-      const fileName = path4.basename(filePath);
-      const ext = path4.extname(filePath).toLowerCase().slice(1);
+      const fileName = path5.basename(filePath);
+      const ext = path5.extname(filePath).toLowerCase().slice(1);
       const mimeType = { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", heic: "image/heic" }[ext] ?? "application/octet-stream";
       const hash = crypto5.createHash("sha256").update(fileBytes).digest("hex");
       const docId = hash;
