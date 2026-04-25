@@ -75,6 +75,15 @@ moivault people aliases              # Show people registry with aliases
 moivault people merge <alias> <name> # Merge a name as alias of another
 moivault people rename <from> <to>   # Bulk rename owner on docs
 
+moivault places                      # Saved places with Maps links (table view)
+moivault places --filter wishlist    # Just the ones you want to visit
+moivault places --filter visited     # Just the ones you've been to
+moivault places --area HSR --cuisine pizza  # Filter by neighborhood / cuisine
+moivault wishlist                    # Products you want to buy
+moivault wishlist --filter owned     # Already-purchased items
+moivault recipes                     # Saved dishes with prep / cook / serves
+moivault recipes --max-minutes 30 --dietary high-protein
+
 moivault context <query>             # RAG retrieval — structured context for any agent
 moivault context <query> --limit 5 --include-fields
 moivault chunk build                 # Build chunk index (splits docs + embeds)
@@ -106,9 +115,9 @@ Works with any AI coding agent. The installer auto-detects and installs the skil
 
 ### MCP Server (Claude Desktop, Cursor)
 
-The installer auto-configures Claude Desktop with the moivault MCP server. After install, restart Claude Desktop and **16 vault tools** are available natively:
+The installer auto-configures Claude Desktop with the moivault MCP server. After install, restart Claude Desktop and **19 vault tools** are available natively:
 
-`vault_search` · `vault_context` · `vault_doc_get` · `vault_doc_text` · `vault_doc_fields` · `vault_doc_list` · `vault_doc_types` · `vault_doc_edit` · `vault_doc_delete` · `vault_doc_download` · `vault_doc_upload` · `vault_sync` · `vault_stats` · `vault_people_list` · `vault_people_docs` · `vault_chunk_status`
+`vault_search` · `vault_context` · `vault_doc_get` · `vault_doc_text` · `vault_doc_fields` · `vault_doc_list` · `vault_doc_types` · `vault_doc_edit` · `vault_doc_delete` · `vault_doc_download` · `vault_doc_upload` · `vault_sync` · `vault_stats` · `vault_people_list` · `vault_people_docs` · `vault_chunk_status` · `vault_places` · `vault_wishlist` · `vault_recipes`
 
 Features:
 - JSON output by default (non-TTY). Pretty output with colors in interactive terminals.
@@ -123,15 +132,30 @@ Features:
 | FTS | `--mode fts` | ~5ms | Exact keywords, names, numbers |
 | Vector | `--mode vector` | ~1.5s | Semantic queries, concepts, synonyms |
 
-## YouTube & Web Links
+## Document Types
 
-The vault stores saved YouTube videos and web links from the mobile app:
+The vault classifies docs into 40+ types so each one renders with the right card and field set. Notable lifestyle types:
+
+- **`place`** — saved venues (restaurants, cafes, bars, attractions, hotels) from reels/articles. Fields: `placeName`, `placeType`, `cuisineType`, `area`, `city`, `country`, `priceRange`, `signatureItems[]`, `recommendedBy`, `mapsUrl`, `sourceUrl`, `visitStatus` ("visited" | "planned"), `userRating` (0-5), `userVisitDate`. Multi-place reels populate a `places[]` array with one entry per venue.
+- **`recipe`** — saved dishes from cooking reels/shorts/articles. Fields: `dishName`, `cuisine`, `course`, `prepTime`, `cookTime`, `totalTime`, `servings`, `difficulty`, `calories`, `proteinGrams`, `dietaryTags[]`, `ingredients[]`, `keyIngredients[]`, `method[]`, `tips[]`, `recommendedBy`, `sourceUrl`.
+- **`product_research`** — products you've saved (wishlist / owned / researching). Fields: `productName`, `brand`, `model`, `category`, `price`, `currency`, `purchaseStatus` ("wishlist" | "owned" | "researching"), `rating`, `keyPros[]`, `keyCons[]`, `verdict`, `recommendedBy`, `productUrl` (buy link), `sourceUrl`.
+
+Identity & validity types — `id`, `drivers_license`, `visa`, `warranty`, `certification`, `membership`, `insurance`, `contract`, `rent_agreement` — share canonical `issueDate` + `expiryDate` so cards render a live validity timeline + status chip (Active / Expiring / Expired).
+
+Travel types: `flight`, `boarding_pass`, `train_ticket`, `car_rental`, `hotel_booking`, `travel_itinerary`. Health: `medical`, `prescription`, `vaccination`. Finance: `receipt`, `invoice`, `salary_slip`, `bank_statement`, `investment`, `loan`, `subscription`, `utility_bill`, `gift_card`. Tax: `tax_id`, `tax_return`, `tax_notice`. Plus `birth_certificate`, `marriage_certificate`, `certificate`, `education`, `pet_record`, `business_card`, `event_ticket`, `vehicle`, `real_estate`, `coffee_bean`, `note`, `youtube`, `web_link`, `generic`.
+
+## YouTube, Web Links, Reels
+
+The vault stores saved YouTube videos and web links from the mobile app. When the content is about a **specific venue** it auto-classifies as `place`, when it's a **specific product** as `product_research`, and when it's a **recipe** as `recipe`. Otherwise it stays as `youtube` / `web_link`.
 
 ```bash
-moivault doc list --type youtube       # List saved videos (with full transcripts)
-moivault doc list --type web_link      # List saved articles/bookmarks
-moivault doc text <id>                 # Read full transcript or page text
-moivault search "that video about X"   # Search across video transcripts
+moivault doc list --type youtube       # Saved videos with full transcripts
+moivault doc list --type web_link      # Saved articles/bookmarks
+moivault doc list --type place         # Saved venues
+moivault doc list --type recipe        # Saved dishes
+moivault doc list --type product_research  # Saved products
+moivault doc text <id>                 # Full transcript or page text
+moivault search "that video about X"   # Search across transcripts
 ```
 
 ## Security

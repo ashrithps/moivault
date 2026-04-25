@@ -3306,6 +3306,283 @@ function registerContextCommand(program2) {
   });
 }
 
+// src/cli/commands/lifestyle.ts
+init_database();
+function requireUnlocked2(isJson) {
+  if (!isVaultUnlocked()) {
+    const msg = "Vault is locked \u2014 run `moivault unlock` first";
+    if (isJson) {
+      output({ error: msg });
+    } else {
+      console.error(msg);
+    }
+    process.exit(1);
+  }
+}
+function asString(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  return String(v);
+}
+function asArray(v) {
+  if (Array.isArray(v)) return v.map(asString).filter(Boolean);
+  if (typeof v === "string" && v) return [v];
+  return [];
+}
+function buildMapsUrl(p) {
+  const explicit = asString(p?.mapsUrl).trim();
+  if (explicit && /^https?:\/\//i.test(explicit)) return explicit;
+  const name = asString(p?.placeName ?? p?.name).trim();
+  const address = asString(p?.address).trim();
+  const area = asString(p?.area).trim();
+  const city = asString(p?.city).trim();
+  const country = asString(p?.country).trim();
+  const parts = address ? [name, address].filter(Boolean) : [name, area, city, country].filter(Boolean);
+  const query = parts.join(", ");
+  if (!query) return "";
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+}
+function formatLocality(area, city, country) {
+  const norm = (s) => s.toLowerCase().replace(/[,\.]/g, "").trim();
+  if (area && city) {
+    if (norm(area) === norm(city)) return city;
+    if (norm(area).includes(norm(city)) || norm(city).includes(norm(area))) return city;
+    return `${area} \xB7 ${city}`;
+  }
+  return area || city || country;
+}
+function buildPlaceRows(docs) {
+  const rows = [];
+  for (const doc of docs) {
+    const f = doc.fields ?? {};
+    const sourceUrl = asString(f.sourceUrl) || asString(f.url);
+    const recommendedBy = asString(f.recommendedBy);
+    const collect = (p, fallbackTitle) => {
+      const placeName = asString(p.placeName ?? p.name) || fallbackTitle;
+      const area = asString(p.area);
+      const city = asString(p.city) || asString(f.city);
+      const country = asString(p.country) || asString(f.country);
+      const status = asString(p.visitStatus).toLowerCase() || asString(f.visitStatus).toLowerCase();
+      const visited = status === "visited";
+      return {
+        docId: doc.id,
+        docTitle: doc.title,
+        placeName,
+        placeType: asString(p.placeType),
+        cuisineType: asString(p.cuisineType),
+        area,
+        city,
+        country,
+        locality: formatLocality(area, city, country),
+        priceRange: asString(p.priceRange),
+        signatureItems: asArray(p.signatureItems),
+        recommendedBy: asString(p.recommendedBy) || recommendedBy,
+        visitStatus: visited ? "visited" : "planned",
+        visited,
+        userRating: Number(p.userRating || f.userRating || 0),
+        userVisitDate: asString(p.userVisitDate || f.userVisitDate),
+        sourceUrl,
+        mapsUrl: buildMapsUrl(p) || buildMapsUrl(f)
+      };
+    };
+    const placesArr = Array.isArray(f.places) ? f.places : [];
+    if (placesArr.length > 0) {
+      for (const p of placesArr) {
+        rows.push(collect(p, doc.title));
+      }
+    } else {
+      rows.push(collect(f, doc.title));
+    }
+  }
+  return rows;
+}
+function matchesText(haystack, needle) {
+  return haystack.toLowerCase().includes(needle.toLowerCase());
+}
+function queryPlaces(opts) {
+  const docs = getDocumentsByType("place");
+  let rows = buildPlaceRows(docs);
+  if (opts.filter === "wishlist") rows = rows.filter((r) => !r.visited);
+  if (opts.filter === "visited") rows = rows.filter((r) => r.visited);
+  if (opts.area) rows = rows.filter((r) => matchesText(r.area, opts.area));
+  if (opts.city) rows = rows.filter((r) => matchesText(r.city, opts.city));
+  if (opts.cuisine) rows = rows.filter((r) => matchesText(r.cuisineType, opts.cuisine));
+  if (opts.type) rows = rows.filter((r) => matchesText(r.placeType, opts.type));
+  if (opts.limit && opts.limit > 0) rows = rows.slice(0, opts.limit);
+  return rows;
+}
+function renderPlacesTable(rows) {
+  if (rows.length === 0) return "No places found.";
+  const header = "| Place | Area | Cuisine | Status | \u2B50 | Maps |\n|---|---|---|---|---|---|";
+  const lines = rows.map((r) => {
+    const status = r.visited ? "\u2713 Visited" : "Wishlist";
+    const stars = r.userRating > 0 ? "\u2605".repeat(r.userRating) : "\u2014";
+    const maps = r.mapsUrl ? `[Open](${r.mapsUrl})` : "\u2014";
+    const cuisine = [r.cuisineType, r.priceRange].filter(Boolean).join(" \xB7 ");
+    return `| ${r.placeName} | ${r.locality || "\u2014"} | ${cuisine || "\u2014"} | ${status} | ${stars} | ${maps} |`;
+  });
+  return [header, ...lines].join("\n");
+}
+function buildWishlistRows(docs) {
+  return docs.map((doc) => {
+    const f = doc.fields ?? {};
+    const status = asString(f.purchaseStatus).toLowerCase();
+    const isOwned = /^(owned|purchased|bought)/.test(status);
+    const isResearching = /^research/.test(status);
+    const productUrl = asString(f.productUrl);
+    const sourceUrl = asString(f.sourceUrl) || asString(f.url);
+    return {
+      docId: doc.id,
+      productName: asString(f.productName) || doc.title,
+      brand: asString(f.brand),
+      model: asString(f.model),
+      category: asString(f.category),
+      price: asString(f.price),
+      currency: asString(f.currency),
+      status: isOwned ? "owned" : isResearching ? "researching" : "wishlist",
+      rating: Number(f.rating || 0),
+      recommendedBy: asString(f.recommendedBy),
+      productUrl,
+      sourceUrl
+    };
+  });
+}
+function queryWishlist(opts) {
+  const docs = getDocumentsByType("product_research");
+  let rows = buildWishlistRows(docs);
+  if (opts.filter && opts.filter !== "all") rows = rows.filter((r) => r.status === opts.filter);
+  if (opts.brand) rows = rows.filter((r) => matchesText(r.brand, opts.brand));
+  if (opts.category) rows = rows.filter((r) => matchesText(r.category, opts.category));
+  if (opts.limit && opts.limit > 0) rows = rows.slice(0, opts.limit);
+  return rows;
+}
+function renderWishlistTable(rows) {
+  if (rows.length === 0) return "No products found.";
+  const header = "| Product | Brand | Price | Status | \u2B50 | Link |\n|---|---|---|---|---|---|";
+  const lines = rows.map((r) => {
+    const price = r.price ? r.currency && !r.price.includes(r.currency) ? `${r.currency} ${r.price}` : r.price : "\u2014";
+    const stars = r.rating > 0 ? "\u2605".repeat(Math.round(r.rating)) : "\u2014";
+    const linkUrl = r.productUrl || r.sourceUrl;
+    const linkLabel = r.productUrl ? "Buy" : r.sourceUrl ? "Source" : "";
+    const link = linkUrl ? `[${linkLabel}](${linkUrl})` : "\u2014";
+    const status = r.status === "owned" ? "\u2713 Owned" : r.status === "researching" ? "Researching" : "Wishlist";
+    return `| ${r.productName} | ${r.brand || "\u2014"} | ${price} | ${status} | ${stars} | ${link} |`;
+  });
+  return [header, ...lines].join("\n");
+}
+function buildRecipeRows(docs) {
+  return docs.map((doc) => {
+    const f = doc.fields ?? {};
+    const sourceUrl = asString(f.sourceUrl) || asString(f.url);
+    const totalTime = Number(f.totalTime) || (Number(f.prepTime) || 0) + (Number(f.cookTime) || 0);
+    return {
+      docId: doc.id,
+      dishName: asString(f.dishName) || doc.title,
+      cuisine: asString(f.cuisine),
+      course: asString(f.course),
+      totalTime,
+      prepTime: Number(f.prepTime) || 0,
+      cookTime: Number(f.cookTime) || 0,
+      servings: Number(f.servings) || 0,
+      difficulty: asString(f.difficulty),
+      calories: Number(f.calories) || 0,
+      proteinGrams: Number(f.proteinGrams) || 0,
+      dietaryTags: asArray(f.dietaryTags),
+      keyIngredients: asArray(f.keyIngredients),
+      recommendedBy: asString(f.recommendedBy),
+      sourceUrl
+    };
+  });
+}
+function queryRecipes(opts) {
+  const docs = getDocumentsByType("recipe");
+  let rows = buildRecipeRows(docs);
+  if (opts.cuisine) rows = rows.filter((r) => matchesText(r.cuisine, opts.cuisine));
+  if (opts.course) rows = rows.filter((r) => matchesText(r.course, opts.course));
+  if (opts.dietary) {
+    rows = rows.filter((r) => r.dietaryTags.some((t) => matchesText(t, opts.dietary)));
+  }
+  if (opts.maxMinutes && opts.maxMinutes > 0) {
+    rows = rows.filter((r) => r.totalTime > 0 && r.totalTime <= opts.maxMinutes);
+  }
+  if (opts.limit && opts.limit > 0) rows = rows.slice(0, opts.limit);
+  return rows;
+}
+function renderRecipesTable(rows) {
+  if (rows.length === 0) return "No recipes found.";
+  const showProtein = rows.some((r) => r.proteinGrams > 0);
+  const fmtTime = (m) => m > 0 ? m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? ` ${m % 60}m` : ""}` : `${m}m` : "\u2014";
+  const protCol = showProtein ? " | Protein" : "";
+  const protSep = showProtein ? " | ---" : "";
+  const header = `| Dish | Cuisine \xB7 Course | Time | Serves${protCol} | Source |
+| --- | --- | --- | ---${protSep} | --- |`;
+  const lines = rows.map((r) => {
+    const cc = [r.cuisine, r.course].filter(Boolean).join(" \xB7 ") || "\u2014";
+    const time = fmtTime(r.totalTime);
+    const serves = r.servings > 0 ? String(r.servings) : "\u2014";
+    const protein = showProtein ? ` | ${r.proteinGrams > 0 ? `${r.proteinGrams}g` : "\u2014"}` : "";
+    const link = r.sourceUrl ? `[link](${r.sourceUrl})` : "\u2014";
+    return `| ${r.dishName} | ${cc} | ${time} | ${serves}${protein} | ${link} |`;
+  });
+  return [header, ...lines].join("\n");
+}
+function registerLifestyleCommands(program2) {
+  program2.command("places").description("List saved places (visited + wishlist) with map links").option("--filter <which>", "wishlist | visited | all", "all").option("--area <area>", "Filter by neighborhood/locality (substring)").option("--city <city>", "Filter by city (substring)").option("--cuisine <cuisine>", "Filter by cuisine (substring)").option("--type <type>", "Filter by place type (Restaurant/Cafe/Bar/etc.)").option("--limit <n>", "Max rows", "50").action((opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked2(isJson);
+    const rows = queryPlaces({
+      filter: opts.filter,
+      area: opts.area,
+      city: opts.city,
+      cuisine: opts.cuisine,
+      type: opts.type,
+      limit: parseInt(opts.limit)
+    });
+    if (isJson) {
+      output({ count: rows.length, places: rows });
+    } else {
+      console.log(renderPlacesTable(rows));
+      console.log(`
+  \x1B[2m${rows.length} place(s)\x1B[0m`);
+    }
+  });
+  program2.command("wishlist").description("List products on the wishlist (or owned/researching)").option("--filter <which>", "wishlist | owned | researching | all", "wishlist").option("--brand <brand>", "Filter by brand (substring)").option("--category <category>", "Filter by category (substring)").option("--limit <n>", "Max rows", "50").action((opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked2(isJson);
+    const rows = queryWishlist({
+      filter: opts.filter,
+      brand: opts.brand,
+      category: opts.category,
+      limit: parseInt(opts.limit)
+    });
+    if (isJson) {
+      output({ count: rows.length, items: rows });
+    } else {
+      console.log(renderWishlistTable(rows));
+      console.log(`
+  \x1B[2m${rows.length} item(s)\x1B[0m`);
+    }
+  });
+  program2.command("recipes").description("List saved recipes with prep/cook/serves at a glance").option("--cuisine <cuisine>", "Filter by cuisine (substring)").option("--course <course>", "Filter by course (breakfast, dinner, dessert, etc.)").option("--dietary <tag>", "Filter by dietary tag (high-protein, vegan, keto, etc.)").option("--max-minutes <n>", "Only recipes with totalTime <= n minutes").option("--limit <n>", "Max rows", "50").action((opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked2(isJson);
+    const rows = queryRecipes({
+      cuisine: opts.cuisine,
+      course: opts.course,
+      dietary: opts.dietary,
+      maxMinutes: opts.maxMinutes ? parseInt(opts.maxMinutes) : void 0,
+      limit: parseInt(opts.limit)
+    });
+    if (isJson) {
+      output({ count: rows.length, recipes: rows });
+    } else {
+      console.log(renderRecipesTable(rows));
+      console.log(`
+  \x1B[2m${rows.length} recipe(s)\x1B[0m`);
+    }
+  });
+}
+
 // src/mcp/server.ts
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -3907,6 +4184,54 @@ async function startMcpServer() {
       }, null, 2) }] };
     }
   );
+  server.tool(
+    "vault_places",
+    "List saved places (restaurants/cafes/bars/attractions). Each row is a single venue with a Google Maps URL and visit/wishlist status; multi-place reels are flattened. Use for 'places to visit', 'where should we eat', 'have we been to <X>'.",
+    {
+      filter: z.enum(["wishlist", "visited", "all"]).default("all").describe("wishlist (not yet visited) | visited | all"),
+      area: z.string().optional().describe("Filter by neighborhood/locality (substring)"),
+      city: z.string().optional().describe("Filter by city (substring)"),
+      cuisine: z.string().optional().describe("Filter by cuisine (substring)"),
+      placeType: z.string().optional().describe("Filter by place type (Restaurant/Cafe/Bar/Hotel/etc.)"),
+      limit: z.number().default(50).describe("Max rows")
+    },
+    async ({ filter, area, city, cuisine, placeType, limit }) => {
+      await ensureSynced();
+      const rows = queryPlaces({ filter, area, city, cuisine, type: placeType, limit });
+      return { content: [{ type: "text", text: JSON.stringify({ count: rows.length, places: rows }, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_wishlist",
+    "List products the user has saved. Defaults to wishlist (things they want to buy); flip filter to 'owned' for things they already have or 'researching' for items still being compared. Use for 'my wishlist', 'do I already have <X>', 'what was that thing I wanted'.",
+    {
+      filter: z.enum(["wishlist", "owned", "researching", "all"]).default("wishlist").describe("Status filter"),
+      brand: z.string().optional().describe("Filter by brand (substring)"),
+      category: z.string().optional().describe("Filter by category (substring)"),
+      limit: z.number().default(50).describe("Max rows")
+    },
+    async ({ filter, brand, category, limit }) => {
+      await ensureSynced();
+      const rows = queryWishlist({ filter, brand, category, limit });
+      return { content: [{ type: "text", text: JSON.stringify({ count: rows.length, items: rows }, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_recipes",
+    "List saved recipes with dish name, cuisine, course, total time, servings, calories, protein, dietary tags, and source URL. Use for 'what should I cook', 'high-protein meals', 'quick dinner ideas'.",
+    {
+      cuisine: z.string().optional().describe("Filter by cuisine (substring)"),
+      course: z.string().optional().describe("Filter by course (breakfast/lunch/dinner/snack/dessert/drink)"),
+      dietary: z.string().optional().describe("Filter by dietary tag (high-protein/vegan/keto/etc.)"),
+      maxMinutes: z.number().optional().describe("Only recipes with totalTime <= maxMinutes"),
+      limit: z.number().default(50).describe("Max rows")
+    },
+    async ({ cuisine, course, dietary, maxMinutes, limit }) => {
+      await ensureSynced();
+      const rows = queryRecipes({ cuisine, course, dietary, maxMinutes, limit });
+      return { content: [{ type: "text", text: JSON.stringify({ count: rows.length, recipes: rows }, null, 2) }] };
+    }
+  );
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
@@ -3952,6 +4277,7 @@ registerUsageCommand(program);
 registerPeopleCommands(program);
 registerChunkCommands(program);
 registerContextCommand(program);
+registerLifestyleCommands(program);
 program.command("mcp").description("Start MCP server (stdio transport) for Claude Desktop, Cursor, etc.").action(async () => {
   await startMcpServer();
 });

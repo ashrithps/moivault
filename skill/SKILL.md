@@ -137,7 +137,77 @@ Common types in the vault: `flight`, `id`, `visa`, `business_card`, `receipt`, `
 `utility_bill`, `prescription`, `drivers_license`, `birth_certificate`, `certificate`,
 `marriage_certificate`, `loan`, `invoice`, `salary_slip`, `investment`, `vaccination`,
 `travel_itinerary`, `boarding_pass`, `train_ticket`, `car_rental`, `hotel_booking`,
-`gift_card`, `rent_agreement`, `membership`, `note`, `generic`.
+`gift_card`, `rent_agreement`, `membership`, `note`, `generic`,
+`place`, `recipe`, `product_research`.
+
+## Places, Wishlist, Recipes — Smart Triggers
+
+Three high-signal types. Always render as a markdown table with a clickable
+link column so the user can jump straight from chat to action.
+
+### `place` — saved venues from reels/articles
+Trigger phrases: "places to visit", "where should we eat", "where to go in <city>",
+"what's on our wishlist for <city>", "restaurants we want to try", "have we been to <X>",
+"any good <cuisine> spots", "list our food spots", "wife and I are going to <city>".
+
+Query strategy:
+1. `moivault doc list --type place`
+2. Filter by `fields.area`, `fields.city`, `fields.cuisineType`, or `fields.placeType` if user mentioned them
+3. Split by `fields.visitStatus`: "visited" vs the rest (wishlist/planned)
+4. For multi-place docs, `fields.places` is an array — flatten one row per entry
+
+Fields you'll see: `placeName`, `placeType` (Restaurant/Cafe/Bar/Hotel/Attraction), `cuisineType`,
+`area` (neighborhood), `city`, `country`, `priceRange`, `signatureItems[]`, `recommendedBy`,
+`visitStatus` ("visited" | "planned"), `userRating` (0-5), `userVisitDate`, `mapsUrl`, `sourceUrl`.
+
+**Maps link rule:** every place row MUST have a clickable Maps link.
+- If `fields.mapsUrl` exists, use it.
+- Otherwise build: `https://www.google.com/maps/search/?api=1&query=<URL-encoded "placeName, area, city">`
+
+Default response format:
+
+| Place | Area | Cuisine | Status | ⭐ | Maps |
+|-------|------|---------|--------|---|------|
+| The Patty Shack | HSR Layout · Bangalore | Burgers | Wishlist | — | [Open](https://www.google.com/maps/search/?api=1&query=The+Patty+Shack%2C+HSR+Layout%2C+Bangalore) |
+| GoodMood India | HSR Layout · Bangalore | Gelato | ✓ Visited | ★★★★ | [Open](https://www.google.com/maps/search/?api=1&query=GoodMood+India%2C+HSR+Layout%2C+Bangalore) |
+
+Group by city when results span multiple cities. Lead with wishlist by default; flip to visited only when user asked.
+
+### `product_research` — wishlist / things to buy
+Trigger phrases: "my wishlist", "what do I want to buy", "things on my list", "what gear
+have I saved", "do I already have <X>", "should I buy <X>", "what was that thing I wanted".
+
+Read `fields.purchaseStatus`:
+- `wishlist` / `wanted` / blank with a price → on the wishlist
+- `owned` / `purchased` / `bought` → already owned
+- `researching` → still comparing
+
+Default response format:
+
+| Product | Brand | Price | Status | ⭐ | Link |
+|---------|-------|-------|--------|---|------|
+| AirPods Pro 3 | Apple | $249 | Wishlist | — | [Buy](productUrl) or [Source](sourceUrl) |
+
+Use `fields.productUrl` for the buy link if present, else `fields.sourceUrl`.
+
+### `recipe` — saved dishes
+Trigger phrases: "what should I cook", "any chicken recipes", "high-protein meals",
+"quick dinner ideas", "the recipe I saved", "what was that <dish>".
+
+Filter by `fields.cuisine`, `fields.course`, `fields.dietaryTags[]`, or `fields.totalTime` (minutes).
+
+Default response format:
+
+| Dish | Cuisine | Time | Serves | Protein | Source |
+|------|---------|------|--------|---------|--------|
+| Miso Glazed Salmon | Japanese | 25m | 4 | 32g | [link](sourceUrl) |
+
+Show calories/protein columns only when at least one row has them. Sort by relevance
+(if user asked for "quick", sort by `totalTime` asc; for "high-protein", sort by `proteinGrams` desc).
+
+### When NOT to use the table format
+- Single place/product/recipe → answer conversationally, then add the link inline.
+- User asked a yes/no question ("have we been to X?") → answer in one sentence; only add a table if they ask for the list.
 
 ## CRITICAL: Search Strategy
 
