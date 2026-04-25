@@ -138,7 +138,7 @@ Common types in the vault: `flight`, `id`, `visa`, `business_card`, `receipt`, `
 `marriage_certificate`, `loan`, `invoice`, `salary_slip`, `investment`, `vaccination`,
 `travel_itinerary`, `boarding_pass`, `train_ticket`, `car_rental`, `hotel_booking`,
 `gift_card`, `rent_agreement`, `membership`, `note`, `generic`,
-`place`, `recipe`, `product_research`.
+`place`, `recipe`, `product_research`, `app`, `life_hack`.
 
 ## Places, Wishlist, Recipes — Smart Triggers
 
@@ -205,8 +205,34 @@ Default response format:
 Show calories/protein columns only when at least one row has them. Sort by relevance
 (if user asked for "quick", sort by `totalTime` asc; for "high-protein", sort by `proteinGrams` desc).
 
+### `app` — saved software apps
+Trigger phrases: "apps I want to try", "what was that app", "the app for X", "any productivity apps", "apps I use".
+
+Read `fields.downloadStatus`: `wishlist` (default — they saved it to try) or `installed`.
+
+Default response format:
+
+| App | Developer | Platforms | Price | Status | Link |
+|-----|-----------|-----------|-------|--------|------|
+| Things 3 | Cultured Code | iOS, macOS | $49.99 | Wishlist | [App Store](appStoreUrl) |
+
+Use `productUrl` order: `appStoreUrl` → `playStoreUrl` → `websiteUrl` (whichever exists).
+
+### `life_hack` — saved tips, tricks, hacks
+Trigger phrases: "any tips for X", "how do I X", "that hack about Y", "lifehack for Z", "tricks I saved".
+
+Filter by `fields.category` (Kitchen/Home/Money/Productivity/Travel/Study/Health/Beauty/Parenting).
+
+Default response format:
+
+| Tip | Category | Steps | Time | Source |
+|-----|----------|-------|------|--------|
+| Unclog drain with baking soda | Home | 4 | 10m | [link](sourceUrl) |
+
+Add a "Savings" column when at least one row has a `savings` value.
+
 ### When NOT to use the table format
-- Single place/product/recipe → answer conversationally, then add the link inline.
+- Single place/product/recipe/app/hack → answer conversationally, then add the link inline.
 - User asked a yes/no question ("have we been to X?") → answer in one sentence; only add a table if they ask for the list.
 
 ## CRITICAL: Search Strategy

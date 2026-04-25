@@ -3508,6 +3508,95 @@ function queryRecipes(opts) {
   if (opts.limit && opts.limit > 0) rows = rows.slice(0, opts.limit);
   return rows;
 }
+function buildAppRows(docs) {
+  return docs.map((doc) => {
+    const f = doc.fields ?? {};
+    const status = asString(f.downloadStatus).toLowerCase();
+    const isInstalled = /^(installed|using|owned)/.test(status);
+    return {
+      docId: doc.id,
+      appName: asString(f.appName) || doc.title,
+      developer: asString(f.developer),
+      category: asString(f.category),
+      platforms: asArray(f.platforms),
+      price: asString(f.price),
+      rating: Number(f.rating || 0),
+      status: isInstalled ? "installed" : "wishlist",
+      verdict: asString(f.verdict),
+      appStoreUrl: asString(f.appStoreUrl),
+      playStoreUrl: asString(f.playStoreUrl),
+      websiteUrl: asString(f.websiteUrl),
+      recommendedBy: asString(f.recommendedBy),
+      sourceUrl: asString(f.sourceUrl) || asString(f.url)
+    };
+  });
+}
+function queryApps(opts) {
+  const docs = getDocumentsByType("app");
+  let rows = buildAppRows(docs);
+  if (opts.filter && opts.filter !== "all") rows = rows.filter((r) => r.status === opts.filter);
+  if (opts.platform) {
+    rows = rows.filter((r) => r.platforms.some((p) => matchesText(p, opts.platform)));
+  }
+  if (opts.category) rows = rows.filter((r) => matchesText(r.category, opts.category));
+  if (opts.limit && opts.limit > 0) rows = rows.slice(0, opts.limit);
+  return rows;
+}
+function renderAppsTable(rows) {
+  if (rows.length === 0) return "No apps found.";
+  const header = "| App | Developer | Platforms | Price | Status | Link |\n|---|---|---|---|---|---|";
+  const lines = rows.map((r) => {
+    const stars = r.rating > 0 ? "\u2605".repeat(Math.round(r.rating)) : "\u2014";
+    const linkUrl = r.appStoreUrl || r.playStoreUrl || r.websiteUrl;
+    const linkLabel = r.appStoreUrl ? "App Store" : r.playStoreUrl ? "Play Store" : r.websiteUrl ? "Website" : "";
+    const link = linkUrl ? `[${linkLabel}](${linkUrl})` : "\u2014";
+    const platforms = r.platforms.length > 0 ? r.platforms.join(", ") : "\u2014";
+    const status = r.status === "installed" ? "\u2713 Installed" : "Wishlist";
+    return `| ${r.appName} | ${r.developer || "\u2014"} | ${platforms} | ${r.price || "\u2014"} | ${status} ${stars !== "\u2014" ? stars : ""} | ${link} |`;
+  });
+  return [header, ...lines].join("\n");
+}
+function buildLifeHackRows(docs) {
+  return docs.map((doc) => {
+    const f = doc.fields ?? {};
+    const steps = Array.isArray(f.steps) ? f.steps.map(asString).filter(Boolean) : [];
+    return {
+      docId: doc.id,
+      title: asString(f.title) || doc.title,
+      category: asString(f.category),
+      summary: asString(f.summary),
+      difficulty: asString(f.difficulty),
+      timeNeeded: asString(f.timeNeeded),
+      savings: asString(f.savings),
+      stepCount: steps.length,
+      requiredItems: asArray(f.requiredItems),
+      recommendedBy: asString(f.recommendedBy),
+      sourceUrl: asString(f.sourceUrl) || asString(f.url)
+    };
+  });
+}
+function queryLifeHacks(opts) {
+  const docs = getDocumentsByType("life_hack");
+  let rows = buildLifeHackRows(docs);
+  if (opts.category) rows = rows.filter((r) => matchesText(r.category, opts.category));
+  if (opts.difficulty) rows = rows.filter((r) => matchesText(r.difficulty, opts.difficulty));
+  if (opts.limit && opts.limit > 0) rows = rows.slice(0, opts.limit);
+  return rows;
+}
+function renderLifeHacksTable(rows) {
+  if (rows.length === 0) return "No life hacks found.";
+  const showSavings = rows.some((r) => r.savings);
+  const sCol = showSavings ? " | Savings" : "";
+  const sSep = showSavings ? " | ---" : "";
+  const header = `| Tip | Category | Steps | Time${sCol} | Source |
+| --- | --- | --- | ---${sSep} | --- |`;
+  const lines = rows.map((r) => {
+    const saved = showSavings ? ` | ${r.savings || "\u2014"}` : "";
+    const link = r.sourceUrl ? `[link](${r.sourceUrl})` : "\u2014";
+    return `| ${r.title} | ${r.category || "\u2014"} | ${r.stepCount > 0 ? r.stepCount : "\u2014"} | ${r.timeNeeded || "\u2014"}${saved} | ${link} |`;
+  });
+  return [header, ...lines].join("\n");
+}
 function renderRecipesTable(rows) {
   if (rows.length === 0) return "No recipes found.";
   const showProtein = rows.some((r) => r.proteinGrams > 0);
@@ -3561,6 +3650,39 @@ function registerLifestyleCommands(program2) {
       console.log(renderWishlistTable(rows));
       console.log(`
   \x1B[2m${rows.length} item(s)\x1B[0m`);
+    }
+  });
+  program2.command("apps").description("List saved apps (wishlist + installed) with download links").option("--filter <which>", "wishlist | installed | all", "all").option("--platform <platform>", "Filter by platform (iOS / Android / macOS / Windows / Web)").option("--category <category>", "Filter by category (substring)").option("--limit <n>", "Max rows", "50").action((opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked2(isJson);
+    const rows = queryApps({
+      filter: opts.filter,
+      platform: opts.platform,
+      category: opts.category,
+      limit: parseInt(opts.limit)
+    });
+    if (isJson) {
+      output({ count: rows.length, apps: rows });
+    } else {
+      console.log(renderAppsTable(rows));
+      console.log(`
+  \x1B[2m${rows.length} app(s)\x1B[0m`);
+    }
+  });
+  program2.command("hacks").description("List saved life hacks / tips with steps and time").option("--category <category>", "Filter by category (Kitchen/Home/Money/etc.)").option("--difficulty <level>", "Easy | Medium | Hard").option("--limit <n>", "Max rows", "50").action((opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked2(isJson);
+    const rows = queryLifeHacks({
+      category: opts.category,
+      difficulty: opts.difficulty,
+      limit: parseInt(opts.limit)
+    });
+    if (isJson) {
+      output({ count: rows.length, hacks: rows });
+    } else {
+      console.log(renderLifeHacksTable(rows));
+      console.log(`
+  \x1B[2m${rows.length} hack(s)\x1B[0m`);
     }
   });
   program2.command("recipes").description("List saved recipes with prep/cook/serves at a glance").option("--cuisine <cuisine>", "Filter by cuisine (substring)").option("--course <course>", "Filter by course (breakfast, dinner, dessert, etc.)").option("--dietary <tag>", "Filter by dietary tag (high-protein, vegan, keto, etc.)").option("--max-minutes <n>", "Only recipes with totalTime <= n minutes").option("--limit <n>", "Max rows", "50").action((opts) => {
@@ -4230,6 +4352,35 @@ async function startMcpServer() {
       await ensureSynced();
       const rows = queryRecipes({ cuisine, course, dietary, maxMinutes, limit });
       return { content: [{ type: "text", text: JSON.stringify({ count: rows.length, recipes: rows }, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_apps",
+    "List software apps the user has saved (wishlist + already-installed). Each row has the app name, developer, platforms, price, status, and a download link (App Store, Play Store, or website). Use for 'apps I want to try', 'what was that app', 'apps I use'.",
+    {
+      filter: z.enum(["wishlist", "installed", "all"]).default("all").describe("Status filter"),
+      platform: z.string().optional().describe("Filter by platform (iOS/Android/macOS/Windows/Web)"),
+      category: z.string().optional().describe("Filter by category (Productivity/Health/Finance/etc.)"),
+      limit: z.number().default(50).describe("Max rows")
+    },
+    async ({ filter, platform, category, limit }) => {
+      await ensureSynced();
+      const rows = queryApps({ filter, platform, category, limit });
+      return { content: [{ type: "text", text: JSON.stringify({ count: rows.length, apps: rows }, null, 2) }] };
+    }
+  );
+  server.tool(
+    "vault_hacks",
+    "List life hacks / tips / tricks the user has saved (kitchen, home, productivity, money, travel, etc.). Each row has title, category, steps, time, savings, and a source URL. Use for 'any tips for X', 'how do I X', 'that hack about Y'.",
+    {
+      category: z.string().optional().describe("Filter by category (Kitchen/Home/Money/Productivity/Travel/etc.)"),
+      difficulty: z.string().optional().describe("Easy / Medium / Hard"),
+      limit: z.number().default(50).describe("Max rows")
+    },
+    async ({ category, difficulty, limit }) => {
+      await ensureSynced();
+      const rows = queryLifeHacks({ category, difficulty, limit });
+      return { content: [{ type: "text", text: JSON.stringify({ count: rows.length, hacks: rows }, null, 2) }] };
     }
   );
   const transport = new StdioServerTransport();

@@ -78,11 +78,15 @@ moivault people rename <from> <to>   # Bulk rename owner on docs
 moivault places                      # Saved places with Maps links (table view)
 moivault places --filter wishlist    # Just the ones you want to visit
 moivault places --filter visited     # Just the ones you've been to
-moivault places --area HSR --cuisine pizza  # Filter by neighborhood / cuisine
+moivault places --area X --cuisine pizza  # Filter by neighborhood / cuisine
 moivault wishlist                    # Products you want to buy
 moivault wishlist --filter owned     # Already-purchased items
 moivault recipes                     # Saved dishes with prep / cook / serves
 moivault recipes --max-minutes 30 --dietary high-protein
+moivault apps                        # Software apps you've saved (wishlist + installed)
+moivault apps --platform iOS         # Filter by platform
+moivault hacks                       # Saved life hacks / tips with steps and time
+moivault hacks --category Kitchen    # Filter by category
 
 moivault context <query>             # RAG retrieval — structured context for any agent
 moivault context <query> --limit 5 --include-fields
@@ -115,9 +119,9 @@ Works with any AI coding agent. The installer auto-detects and installs the skil
 
 ### MCP Server (Claude Desktop, Cursor)
 
-The installer auto-configures Claude Desktop with the moivault MCP server. After install, restart Claude Desktop and **19 vault tools** are available natively:
+The installer auto-configures Claude Desktop with the moivault MCP server. After install, restart Claude Desktop and **21 vault tools** are available natively:
 
-`vault_search` · `vault_context` · `vault_doc_get` · `vault_doc_text` · `vault_doc_fields` · `vault_doc_list` · `vault_doc_types` · `vault_doc_edit` · `vault_doc_delete` · `vault_doc_download` · `vault_doc_upload` · `vault_sync` · `vault_stats` · `vault_people_list` · `vault_people_docs` · `vault_chunk_status` · `vault_places` · `vault_wishlist` · `vault_recipes`
+`vault_search` · `vault_context` · `vault_doc_get` · `vault_doc_text` · `vault_doc_fields` · `vault_doc_list` · `vault_doc_types` · `vault_doc_edit` · `vault_doc_delete` · `vault_doc_download` · `vault_doc_upload` · `vault_sync` · `vault_stats` · `vault_people_list` · `vault_people_docs` · `vault_chunk_status` · `vault_places` · `vault_wishlist` · `vault_recipes` · `vault_apps` · `vault_hacks`
 
 Features:
 - JSON output by default (non-TTY). Pretty output with colors in interactive terminals.
@@ -139,6 +143,8 @@ The vault classifies docs into 40+ types so each one renders with the right card
 - **`place`** — saved venues (restaurants, cafes, bars, attractions, hotels) from reels/articles. Fields: `placeName`, `placeType`, `cuisineType`, `area`, `city`, `country`, `priceRange`, `signatureItems[]`, `recommendedBy`, `mapsUrl`, `sourceUrl`, `visitStatus` ("visited" | "planned"), `userRating` (0-5), `userVisitDate`. Multi-place reels populate a `places[]` array with one entry per venue.
 - **`recipe`** — saved dishes from cooking reels/shorts/articles. Fields: `dishName`, `cuisine`, `course`, `prepTime`, `cookTime`, `totalTime`, `servings`, `difficulty`, `calories`, `proteinGrams`, `dietaryTags[]`, `ingredients[]`, `keyIngredients[]`, `method[]`, `tips[]`, `recommendedBy`, `sourceUrl`.
 - **`product_research`** — products you've saved (wishlist / owned / researching). Fields: `productName`, `brand`, `model`, `category`, `price`, `currency`, `purchaseStatus` ("wishlist" | "owned" | "researching"), `rating`, `keyPros[]`, `keyCons[]`, `verdict`, `recommendedBy`, `productUrl` (buy link), `sourceUrl`.
+- **`app`** — software apps you've saved (mobile, desktop, web). Fields: `appName`, `developer`, `platforms[]` (iOS/Android/macOS/Windows/Web), `category`, `price`, `currency`, `rating`, `downloadStatus` ("wishlist" | "installed"), `keyFeatures[]`, `verdict`, `appStoreUrl`, `playStoreUrl`, `websiteUrl`, `recommendedBy`, `sourceUrl`.
+- **`life_hack`** — saved tips, tricks, and how-tos (kitchen, home, money, productivity, travel, etc.). Fields: `title`, `category`, `summary`, `steps[]`, `requiredItems[]`, `difficulty`, `timeNeeded`, `savings`, `warnings[]`, `recommendedBy`, `sourceUrl`.
 
 Identity & validity types — `id`, `drivers_license`, `visa`, `warranty`, `certification`, `membership`, `insurance`, `contract`, `rent_agreement` — share canonical `issueDate` + `expiryDate` so cards render a live validity timeline + status chip (Active / Expiring / Expired).
 
