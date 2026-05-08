@@ -4010,15 +4010,15 @@ async function startMcpServer() {
       } else {
         fileBytes = rawBytes;
       }
-      const { default: fs5 } = await import("fs");
-      const { default: path5 } = await import("path");
-      const { default: os4 } = await import("os");
+      const { default: fs6 } = await import("fs");
+      const { default: path6 } = await import("path");
+      const { default: os5 } = await import("os");
       const ext = doc.mimeType ? { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[doc.mimeType] ?? "bin" : "bin";
       const safeName = (doc.title || "document").replace(/[/\\:*?"<>|]/g, "_");
-      const finalPath = outputPath || path5.join(os4.homedir(), "Downloads", `${safeName}.${ext}`);
-      const dir = path5.dirname(finalPath);
-      if (!fs5.existsSync(dir)) fs5.mkdirSync(dir, { recursive: true });
-      fs5.writeFileSync(finalPath, fileBytes);
+      const finalPath = outputPath || path6.join(os5.homedir(), "Downloads", `${safeName}.${ext}`);
+      const dir = path6.dirname(finalPath);
+      if (!fs6.existsSync(dir)) fs6.mkdirSync(dir, { recursive: true });
+      fs6.writeFileSync(finalPath, fileBytes);
       return { content: [{ type: "text", text: JSON.stringify({ status: "downloaded", path: finalPath, size: fileBytes.length, title: doc.title }) }] };
     }
   );
@@ -4059,16 +4059,16 @@ async function startMcpServer() {
     { filePath: z.string().describe("Absolute path to the file") },
     async ({ filePath }) => {
       await ensureUnlocked();
-      const { default: fs5 } = await import("fs");
-      const { default: path5 } = await import("path");
-      const crypto5 = await import("crypto");
-      if (!fs5.existsSync(filePath)) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found" }) }] };
-      const fileBuffer = fs5.readFileSync(filePath);
+      const { default: fs6 } = await import("fs");
+      const { default: path6 } = await import("path");
+      const crypto6 = await import("crypto");
+      if (!fs6.existsSync(filePath)) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found" }) }] };
+      const fileBuffer = fs6.readFileSync(filePath);
       const fileBytes = new Uint8Array(fileBuffer);
-      const fileName = path5.basename(filePath);
-      const ext = path5.extname(filePath).toLowerCase().slice(1);
+      const fileName = path6.basename(filePath);
+      const ext = path6.extname(filePath).toLowerCase().slice(1);
       const mimeType = { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", heic: "image/heic" }[ext] ?? "application/octet-stream";
-      const hash = crypto5.createHash("sha256").update(fileBytes).digest("hex");
+      const hash = crypto6.createHash("sha256").update(fileBytes).digest("hex");
       const docId = hash;
       const convex = await authenticateConvexClient();
       const uploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
@@ -4132,12 +4132,12 @@ async function startMcpServer() {
     },
     async ({ title, content, type, tags }) => {
       await ensureUnlocked();
-      const crypto5 = await import("crypto");
+      const crypto6 = await import("crypto");
       const contentBytes = new TextEncoder().encode(content);
       if (contentBytes.byteLength > 200 * 1024) {
         return { content: [{ type: "text", text: JSON.stringify({ error: "Content exceeds 200KB limit" }) }] };
       }
-      const hash = crypto5.createHash("sha256").update(contentBytes).digest("hex");
+      const hash = crypto6.createHash("sha256").update(contentBytes).digest("hex");
       const docId = hash;
       const existingDoc = getDocumentById(docId);
       if (existingDoc) {
@@ -4387,6 +4387,694 @@ async function startMcpServer() {
   await server.connect(transport);
 }
 
+// src/mcp/rest.ts
+import http2 from "http";
+import { spawn as spawn2 } from "child_process";
+import fs5 from "fs";
+import os4 from "os";
+import path5 from "path";
+import crypto5 from "crypto";
+var DEFAULT_PORT = 8797;
+var DEFAULT_PUBLIC_URL = "https://moivaultmcp.wiloop.io";
+var DEFAULT_DOWNLOAD_TTL_SECONDS = 15 * 60;
+var MAX_BODY_BYTES = 1024 * 1024;
+var MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+var mcp = null;
+var mcpReady = false;
+var mcpInitPromise = null;
+var stdoutBuf = "";
+var nextId = 1;
+var pending = /* @__PURE__ */ new Map();
+var downloadTokens = /* @__PURE__ */ new Map();
+function inferContentType(filePath) {
+  const ext = path5.extname(filePath).toLowerCase();
+  if (ext === ".pdf") return "application/pdf";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".png") return "image/png";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".heic") return "image/heic";
+  if (ext === ".md") return "text/markdown; charset=utf-8";
+  if (ext === ".txt") return "text/plain; charset=utf-8";
+  return "application/octet-stream";
+}
+function extensionForMime(mimeType) {
+  if (mimeType === "application/pdf") return "pdf";
+  if (mimeType === "image/jpeg") return "jpg";
+  if (mimeType === "image/png") return "png";
+  if (mimeType === "image/webp") return "webp";
+  if (mimeType === "image/heic") return "heic";
+  if (mimeType === "text/markdown") return "md";
+  if (mimeType === "text/plain") return "txt";
+  return "bin";
+}
+function safeFilename(name) {
+  return (name || "document").replace(/[/\\:*?"<>|\r\n]/g, "_");
+}
+function headerFilename(name, filePath) {
+  const ext = path5.extname(filePath);
+  const base = safeFilename(name).replace(/[^\x20-\x7E]/g, "_").trim() || "document";
+  return `${base}${ext}`;
+}
+function json(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(body));
+}
+function text(res, status, body) {
+  res.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
+  res.end(body);
+}
+function getPublicBase(req) {
+  if (process.env.MOIVAULT_PUBLIC_URL) return process.env.MOIVAULT_PUBLIC_URL.replace(/\/$/, "");
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  if (host) {
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    return `${proto}://${Array.isArray(host) ? host[0] : host}`.replace(/\/$/, "");
+  }
+  return DEFAULT_PUBLIC_URL;
+}
+function authOk(req, key) {
+  return (req.headers.authorization || "") === `Bearer ${key}`;
+}
+function parseBool(value) {
+  if (value === void 0 || value === null || value === "") return void 0;
+  if (value === true || value === "true" || value === "1") return true;
+  if (value === false || value === "false" || value === "0") return false;
+  return void 0;
+}
+function parseIntParam(value, fallback) {
+  if (value === void 0 || value === null || value === "") return fallback;
+  const n = Number.parseInt(String(value), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+async function readBody(req) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.byteLength;
+    if (total > MAX_BODY_BYTES) throw Object.assign(new Error("request body too large"), { statusCode: 413 });
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+async function readJsonBody(req) {
+  const raw = await readBody(req);
+  if (!raw) return {};
+  const contentType = req.headers["content-type"] || "";
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    return Object.fromEntries(new URLSearchParams(raw));
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    throw Object.assign(new Error("invalid JSON body"), { statusCode: 400 });
+  }
+}
+function startMcp() {
+  const bin = process.env.MOIVAULT_BIN;
+  const command = bin || process.execPath;
+  const args = bin ? ["mcp"] : [process.argv[1], "mcp"];
+  console.log(`[moivault-rest] spawning MCP child: ${command} ${args.join(" ")}`);
+  mcp = spawn2(command, args, {
+    env: { ...process.env, NO_COLOR: "1" },
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  mcp.stderr.on("data", (buf) => process.stderr.write(`[mcp] ${buf}`));
+  mcp.stdout.on("data", (chunk) => {
+    stdoutBuf += chunk.toString("utf8");
+    let nl;
+    while ((nl = stdoutBuf.indexOf("\n")) !== -1) {
+      const line = stdoutBuf.slice(0, nl).trimEnd();
+      stdoutBuf = stdoutBuf.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        console.warn("[mcp] non-JSON stdout:", line);
+        continue;
+      }
+      if (typeof msg.id === "number" && pending.has(msg.id)) {
+        const call = pending.get(msg.id);
+        pending.delete(msg.id);
+        clearTimeout(call.timeout);
+        if (msg.error) call.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+        else call.resolve(msg.result);
+      }
+    }
+  });
+  mcp.on("exit", (code) => {
+    console.error(`[moivault-rest] MCP child exited ${code}; restarting in 2s`);
+    mcpReady = false;
+    mcpInitPromise = null;
+    for (const [, call] of pending) {
+      clearTimeout(call.timeout);
+      call.reject(new Error("MCP child exited"));
+    }
+    pending.clear();
+    setTimeout(startMcp, 2e3);
+  });
+  mcpInitPromise = initializeMcp();
+}
+async function initializeMcp() {
+  const initId = nextId++;
+  const frame = {
+    jsonrpc: "2.0",
+    id: initId,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "moivault-rest", version: "1.0.0" }
+    }
+  };
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pending.delete(initId);
+      reject(new Error("MCP initialize timeout"));
+    }, 6e4);
+    pending.set(initId, { resolve, reject, timeout });
+    mcp.stdin.write(`${JSON.stringify(frame)}
+`);
+  });
+  mcp.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized", params: {} }) + "\n");
+  mcpReady = true;
+  console.log("[moivault-rest] MCP initialized");
+}
+async function callTool(name, args = {}, timeoutMs = 12e4) {
+  if (!mcp) startMcp();
+  if (!mcpReady) await mcpInitPromise;
+  const id = nextId++;
+  const frame = { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } };
+  const result = await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`tool ${name} timeout`));
+    }, timeoutMs);
+    pending.set(id, { resolve, reject, timeout });
+    mcp.stdin.write(`${JSON.stringify(frame)}
+`);
+  });
+  return unwrapMcp(result);
+}
+function unwrapMcp(result) {
+  const content = result?.content;
+  if (!Array.isArray(content) || content.length === 0) return null;
+  const first = content[0];
+  if (first?.type !== "text" || typeof first.text !== "string") return content;
+  try {
+    return JSON.parse(first.text);
+  } catch {
+    return first.text;
+  }
+}
+async function downloadDocument(id) {
+  const meta = await callTool("vault_doc_get", { id });
+  if (meta?.error) throw Object.assign(new Error(meta.error), { statusCode: 404 });
+  const ext = extensionForMime(meta?.mimeType);
+  const tmpDir = fs5.mkdtempSync(path5.join(os4.tmpdir(), "moivault-rest-"));
+  const outputPath = path5.join(tmpDir, `${safeFilename(id)}.${ext}`);
+  const result = await callTool("vault_doc_download", { id, outputPath }, 18e4);
+  if (result?.error) throw Object.assign(new Error(result.error), { statusCode: 404 });
+  if (!result?.path) throw new Error("download did not return a path");
+  const stat = fs5.statSync(result.path);
+  return {
+    path: result.path,
+    title: result.title || meta?.title || id,
+    size: result.size || stat.size,
+    contentType: meta?.mimeType || inferContentType(result.path),
+    expiresAt: Date.now() + DEFAULT_DOWNLOAD_TTL_SECONDS * 1e3
+  };
+}
+function issueDownloadToken(file, ttlSeconds) {
+  const token = crypto5.randomBytes(32).toString("base64url");
+  const ttl = Math.max(60, Math.min(ttlSeconds || DEFAULT_DOWNLOAD_TTL_SECONDS, 3600));
+  downloadTokens.set(token, { ...file, expiresAt: Date.now() + ttl * 1e3 });
+  return token;
+}
+function cleanupDownloads() {
+  const now = Date.now();
+  for (const [token, entry] of downloadTokens) {
+    if (entry.expiresAt > now) continue;
+    downloadTokens.delete(token);
+    try {
+      fs5.unlinkSync(entry.path);
+    } catch {
+    }
+    try {
+      fs5.rmdirSync(path5.dirname(entry.path));
+    } catch {
+    }
+  }
+}
+async function uploadFromUrl(sourceUrl) {
+  const parsed = new URL(sourceUrl);
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw Object.assign(new Error("sourceUrl must be http or https"), { statusCode: 400 });
+  }
+  const response = await fetch(sourceUrl);
+  if (!response.ok) throw Object.assign(new Error(`sourceUrl fetch failed: ${response.status}`), { statusCode: 400 });
+  const length = Number(response.headers.get("content-length") || "0");
+  if (length > MAX_UPLOAD_BYTES) throw Object.assign(new Error("sourceUrl file too large"), { statusCode: 413 });
+  const arrayBuffer = await response.arrayBuffer();
+  if (arrayBuffer.byteLength > MAX_UPLOAD_BYTES) throw Object.assign(new Error("sourceUrl file too large"), { statusCode: 413 });
+  const pathname = decodeURIComponent(parsed.pathname);
+  const basename = safeFilename(path5.basename(pathname) || "upload.bin");
+  const tmpDir = fs5.mkdtempSync(path5.join(os4.tmpdir(), "moivault-upload-"));
+  const filePath = path5.join(tmpDir, basename.includes(".") ? basename : `${basename}.bin`);
+  fs5.writeFileSync(filePath, Buffer.from(arrayBuffer));
+  return filePath;
+}
+function routeParams(pathname, prefix, suffix = "") {
+  if (!pathname.startsWith(prefix)) return null;
+  if (suffix && !pathname.endsWith(suffix)) return null;
+  const raw = pathname.slice(prefix.length, suffix ? -suffix.length : void 0);
+  if (!raw || raw.includes("/")) return null;
+  return decodeURIComponent(raw);
+}
+async function handleDownloadToken(req, res, token) {
+  cleanupDownloads();
+  const entry = downloadTokens.get(token);
+  if (!entry || entry.expiresAt <= Date.now()) {
+    if (entry) downloadTokens.delete(token);
+    return json(res, 404, { error: "download link expired or not found" });
+  }
+  const disposition = new URL(req.url || "/", "http://x").searchParams.get("disposition") === "inline" ? "inline" : "attachment";
+  const body = fs5.readFileSync(entry.path);
+  res.writeHead(200, {
+    "content-type": entry.contentType,
+    "content-length": body.byteLength,
+    "content-disposition": `${disposition}; filename="${headerFilename(entry.title, entry.path)}"`,
+    "cache-control": "private, max-age=300"
+  });
+  res.end(body);
+}
+async function handle(req, res, key) {
+  cleanupDownloads();
+  const url = new URL(req.url || "/", "http://x");
+  const pathname = url.pathname;
+  const q = Object.fromEntries(url.searchParams);
+  if (req.method === "GET" && pathname === "/health") return json(res, 200, { ok: true, mcpReady });
+  if (req.method === "GET" && pathname === "/openapi.json") return json(res, 200, openApiSpec(getPublicBase(req)));
+  if (req.method === "GET" && pathname.startsWith("/downloads/")) {
+    return handleDownloadToken(req, res, decodeURIComponent(pathname.slice("/downloads/".length)));
+  }
+  if (!authOk(req, key)) {
+    res.writeHead(401, { "www-authenticate": "Bearer", "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: "unauthorized" }));
+    return;
+  }
+  const body = ["POST", "PUT", "PATCH", "DELETE"].includes(req.method || "") ? await readJsonBody(req) : {};
+  if (req.method === "GET" && pathname === "/search") {
+    if (!q.query) return json(res, 400, { error: "query is required" });
+    return json(res, 200, await callTool("vault_search", {
+      query: q.query,
+      mode: q.mode || "hybrid",
+      type: q.type || void 0,
+      limit: parseIntParam(q.limit, 10)
+    }));
+  }
+  if ((req.method === "GET" || req.method === "POST") && pathname === "/context") {
+    const source = req.method === "GET" ? q : body;
+    if (!source.query) return json(res, 400, { error: "query is required" });
+    return json(res, 200, await callTool("vault_context", {
+      query: source.query,
+      limit: parseIntParam(source.limit, 5),
+      maxChunksPerDoc: parseIntParam(source.maxChunksPerDoc, 4),
+      includeFields: parseBool(source.includeFields) ?? false
+    }));
+  }
+  if (req.method === "GET" && pathname === "/documents") {
+    return json(res, 200, await callTool("vault_doc_list", { type: q.type || void 0, limit: parseIntParam(q.limit, 50) }));
+  }
+  if (req.method === "POST" && pathname === "/documents") {
+    if (!body.title || !body.content) return json(res, 400, { error: "title and content are required" });
+    return json(res, 200, await callTool("vault_doc_create", {
+      title: body.title,
+      content: body.content,
+      type: body.type,
+      tags: Array.isArray(body.tags) ? body.tags.join(",") : body.tags
+    }, 18e4));
+  }
+  if (req.method === "POST" && pathname === "/documents/upload-url") {
+    if (!body.sourceUrl || typeof body.sourceUrl !== "string") return json(res, 400, { error: "sourceUrl is required" });
+    const filePath = await uploadFromUrl(body.sourceUrl);
+    try {
+      return json(res, 200, await callTool("vault_doc_upload", { filePath }, 3e5));
+    } finally {
+      try {
+        fs5.unlinkSync(filePath);
+      } catch {
+      }
+      try {
+        fs5.rmdirSync(path5.dirname(filePath));
+      } catch {
+      }
+    }
+  }
+  if (req.method === "GET" && pathname === "/documents/types") {
+    const types = await callTool("vault_doc_types");
+    const rows = Array.isArray(types) ? types : types?.types;
+    const total = Array.isArray(rows) ? rows.reduce((sum, row) => sum + (Number(row?.count) || 0), 0) : void 0;
+    return json(res, 200, Array.isArray(rows) ? { types: rows, total } : types);
+  }
+  const docId = routeParams(pathname, "/documents/");
+  if (docId && req.method === "GET") return json(res, 200, await callTool("vault_doc_get", { id: docId }));
+  const docTextId = routeParams(pathname, "/documents/", "/text");
+  if (docTextId && req.method === "GET") return text(res, 200, String(await callTool("vault_doc_text", { id: docTextId })));
+  const docFieldsId = routeParams(pathname, "/documents/", "/fields");
+  if (docFieldsId && req.method === "GET") return json(res, 200, await callTool("vault_doc_fields", { id: docFieldsId }));
+  const docFileId = routeParams(pathname, "/documents/", "/file");
+  if (docFileId && req.method === "GET") {
+    const file = await downloadDocument(docFileId);
+    try {
+      const bodyBytes = fs5.readFileSync(file.path);
+      res.writeHead(200, {
+        "content-type": file.contentType,
+        "content-length": bodyBytes.byteLength,
+        "content-disposition": `attachment; filename="${headerFilename(file.title, file.path)}"`
+      });
+      res.end(bodyBytes);
+      return;
+    } finally {
+      try {
+        fs5.unlinkSync(file.path);
+      } catch {
+      }
+      try {
+        fs5.rmdirSync(path5.dirname(file.path));
+      } catch {
+      }
+    }
+  }
+  const docDownloadUrlId = routeParams(pathname, "/documents/", "/download-url");
+  if (docDownloadUrlId && req.method === "POST") {
+    const file = await downloadDocument(docDownloadUrlId);
+    const token = issueDownloadToken(file, parseIntParam(body.ttlSeconds, DEFAULT_DOWNLOAD_TTL_SECONDS));
+    return json(res, 200, {
+      url: `${getPublicBase(req)}/downloads/${encodeURIComponent(token)}`,
+      expiresAt: new Date(downloadTokens.get(token).expiresAt).toISOString(),
+      title: file.title,
+      size: file.size,
+      contentType: file.contentType
+    });
+  }
+  if (docId && req.method === "PATCH") {
+    if (!body.field || body.value === void 0) return json(res, 400, { error: "field and value are required" });
+    return json(res, 200, await callTool("vault_doc_edit", { id: docId, field: body.field, value: String(body.value) }, 18e4));
+  }
+  const docContentId = routeParams(pathname, "/documents/", "/content");
+  if (docContentId && req.method === "PUT") {
+    if (typeof body.content !== "string") return json(res, 400, { error: "content is required" });
+    return json(res, 200, await callTool("vault_doc_update_content", { docId: docContentId, content: body.content }, 18e4));
+  }
+  if (docId && req.method === "DELETE") return json(res, 200, await callTool("vault_doc_delete", { id: docId }, 18e4));
+  if (req.method === "POST" && pathname === "/sync") return json(res, 200, await callTool("vault_sync", { full: parseBool(body.full) ?? false }, 3e5));
+  if (req.method === "GET" && pathname === "/stats") return json(res, 200, await callTool("vault_stats"));
+  if (req.method === "GET" && pathname === "/chunks/status") return json(res, 200, await callTool("vault_chunk_status"));
+  if (req.method === "GET" && pathname === "/people") return json(res, 200, await callTool("vault_people_list"));
+  const personName = routeParams(pathname, "/people/", "/documents");
+  if (personName && req.method === "GET") return json(res, 200, await callTool("vault_people_docs", { name: personName }));
+  if (req.method === "GET" && pathname === "/places") return json(res, 200, await callTool("vault_places", {
+    filter: q.filter || "all",
+    area: q.area || void 0,
+    city: q.city || void 0,
+    cuisine: q.cuisine || void 0,
+    placeType: q.placeType || void 0,
+    limit: parseIntParam(q.limit, 50)
+  }));
+  if (req.method === "GET" && pathname === "/wishlist") return json(res, 200, await callTool("vault_wishlist", {
+    filter: q.filter || "wishlist",
+    brand: q.brand || void 0,
+    category: q.category || void 0,
+    limit: parseIntParam(q.limit, 50)
+  }));
+  if (req.method === "GET" && pathname === "/recipes") return json(res, 200, await callTool("vault_recipes", {
+    cuisine: q.cuisine || void 0,
+    course: q.course || void 0,
+    dietary: q.dietary || void 0,
+    maxMinutes: parseIntParam(q.maxMinutes),
+    limit: parseIntParam(q.limit, 50)
+  }));
+  if (req.method === "GET" && pathname === "/apps") return json(res, 200, await callTool("vault_apps", {
+    filter: q.filter || "all",
+    platform: q.platform || void 0,
+    category: q.category || void 0,
+    limit: parseIntParam(q.limit, 50)
+  }));
+  if (req.method === "GET" && pathname === "/hacks") return json(res, 200, await callTool("vault_hacks", {
+    category: q.category || void 0,
+    difficulty: q.difficulty || void 0,
+    limit: parseIntParam(q.limit, 50)
+  }));
+  if (req.method === "POST" && pathname.startsWith("/tools/")) {
+    const name = decodeURIComponent(pathname.slice("/tools/".length));
+    return json(res, 200, await callTool(name, body));
+  }
+  json(res, 404, { error: "not found", method: req.method, path: pathname });
+}
+function openApiSpec(publicUrl) {
+  const jsonResponse = {
+    "200": {
+      description: "OK",
+      content: { "application/json": { schema: {} } }
+    }
+  };
+  const textResponse = {
+    "200": {
+      description: "OK",
+      content: { "text/plain": { schema: { type: "string" } } }
+    }
+  };
+  const queryParam = (name, schema = { type: "string" }, description) => ({
+    name,
+    in: "query",
+    required: false,
+    description,
+    schema
+  });
+  const pathParam = (name, description) => ({
+    name,
+    in: "path",
+    required: true,
+    description,
+    schema: { type: "string" }
+  });
+  return {
+    openapi: "3.1.0",
+    info: {
+      title: "moivault Document Vault API",
+      description: "REST API over the encrypted moivault CLI/MCP server for Custom GPT Actions. Read endpoints automatically run moivault's incremental sync before returning data. Use /context for natural-language RAG over vector-indexed chunks, /search with mode=hybrid for normal lookup, and /search with mode=vector when semantic matching matters. After finding a document, fetch metadata, text, fields, or create a short-lived download link for original files.",
+      version: "1.0.0"
+    },
+    servers: [{ url: publicUrl, description: "Production" }],
+    security: [{ bearerAuth: [] }],
+    components: {
+      securitySchemes: { bearerAuth: { type: "http", scheme: "bearer" } },
+      schemas: {
+        Error: { type: "object", properties: { error: { type: "string" } } },
+        CreateDocument: {
+          type: "object",
+          required: ["title", "content"],
+          properties: {
+            title: { type: "string" },
+            content: { type: "string", description: "Markdown or plain text content, max 200KB." },
+            type: { type: "string" },
+            tags: { oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] }
+          }
+        },
+        UploadFromUrl: { type: "object", required: ["sourceUrl"], properties: { sourceUrl: { type: "string", format: "uri" } } },
+        EditField: { type: "object", required: ["field", "value"], properties: { field: { type: "string" }, value: { type: "string" } } },
+        UpdateContent: { type: "object", required: ["content"], properties: { content: { type: "string" } } },
+        DownloadUrlRequest: { type: "object", properties: { ttlSeconds: { type: "integer", minimum: 60, maximum: 3600 } } },
+        DownloadUrlResponse: {
+          type: "object",
+          properties: {
+            url: { type: "string", format: "uri" },
+            expiresAt: { type: "string", format: "date-time" },
+            title: { type: "string" },
+            size: { type: "integer" },
+            contentType: { type: "string" }
+          }
+        }
+      }
+    },
+    paths: {
+      "/health": { get: { operationId: "health", summary: "Health check.", security: [], responses: jsonResponse } },
+      "/openapi.json": { get: { operationId: "openapi", summary: "OpenAPI schema.", security: [], responses: jsonResponse } },
+      "/search": {
+        get: {
+          operationId: "searchVault",
+          summary: "Search documents using hybrid, FTS, or vector search.",
+          parameters: [
+            { name: "query", in: "query", required: true, schema: { type: "string" } },
+            queryParam("mode", { type: "string", enum: ["hybrid", "fts", "vector"], default: "hybrid" }, "hybrid combines keyword and vector results; vector is semantic only; fts is exact keyword search."),
+            queryParam("type", { type: "string" }, "Optional document type filter. Discover available values with listDocumentTypes."),
+            queryParam("limit", { type: "integer", default: 10 })
+          ],
+          responses: jsonResponse
+        }
+      },
+      "/context": {
+        get: {
+          operationId: "getVaultContext",
+          summary: "Retrieve vector-search RAG context chunks for a natural-language question. Prefer this before answering broad questions about the vault.",
+          parameters: [
+            { name: "query", in: "query", required: true, schema: { type: "string" } },
+            queryParam("limit", { type: "integer", default: 5 }),
+            queryParam("maxChunksPerDoc", { type: "integer", default: 4 }),
+            queryParam("includeFields", { type: "boolean", default: false })
+          ],
+          responses: jsonResponse
+        },
+        post: {
+          operationId: "postVaultContext",
+          summary: "Retrieve vector-search RAG context chunks with a JSON body. Prefer this for longer questions.",
+          requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["query"], properties: { query: { type: "string" }, limit: { type: "integer" }, maxChunksPerDoc: { type: "integer" }, includeFields: { type: "boolean" } } } } } },
+          responses: jsonResponse
+        }
+      },
+      "/documents": {
+        get: {
+          operationId: "listDocuments",
+          summary: "List documents, optionally filtered by type.",
+          parameters: [queryParam("type"), queryParam("limit", { type: "integer", default: 50 })],
+          responses: jsonResponse
+        },
+        post: {
+          operationId: "createTextDocument",
+          summary: "Create a text or markdown document in the vault.",
+          requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/CreateDocument" } } } },
+          responses: jsonResponse
+        }
+      },
+      "/documents/upload-url": {
+        post: {
+          operationId: "uploadDocumentFromUrl",
+          summary: "Fetch a public file URL server-side and upload it into the vault.",
+          requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/UploadFromUrl" } } } },
+          responses: jsonResponse
+        }
+      },
+      "/documents/types": { get: { operationId: "listDocumentTypes", summary: "List document types with counts. Call this when choosing filters or explaining what the vault contains.", responses: jsonResponse } },
+      "/documents/{id}": {
+        get: { operationId: "getDocument", summary: "Get document metadata and structured fields.", parameters: [pathParam("id", "Document id.")], responses: jsonResponse },
+        patch: { operationId: "editDocumentField", summary: "Edit one document field.", parameters: [pathParam("id")], requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/EditField" } } } }, responses: jsonResponse },
+        delete: { operationId: "deleteDocument", summary: "Delete a document from the vault. Only call after explicit user confirmation.", parameters: [pathParam("id")], responses: jsonResponse }
+      },
+      "/documents/{id}/text": { get: { operationId: "getDocumentText", summary: "Get full OCR/extracted text.", parameters: [pathParam("id")], responses: textResponse } },
+      "/documents/{id}/fields": { get: { operationId: "getDocumentFields", summary: "Get structured extracted fields.", parameters: [pathParam("id")], responses: jsonResponse } },
+      "/documents/{id}/file": {
+        get: {
+          operationId: "downloadDocumentFile",
+          summary: "Download the original document file directly. Use download-url if the client cannot consume binary action responses.",
+          parameters: [pathParam("id")],
+          responses: { "200": { description: "Original document file.", content: { "application/octet-stream": { schema: { type: "string", format: "binary" } } } } }
+        }
+      },
+      "/documents/{id}/download-url": {
+        post: {
+          operationId: "createDocumentDownloadUrl",
+          summary: "Create a short-lived unauthenticated link for the original file.",
+          parameters: [pathParam("id")],
+          requestBody: { required: false, content: { "application/json": { schema: { $ref: "#/components/schemas/DownloadUrlRequest" } } } },
+          responses: { "200": { description: "Download link.", content: { "application/json": { schema: { $ref: "#/components/schemas/DownloadUrlResponse" } } } } }
+        }
+      },
+      "/documents/{id}/content": {
+        put: {
+          operationId: "replaceDocumentContent",
+          summary: "Replace markdown/text content and reprocess the document.",
+          parameters: [pathParam("id")],
+          requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/UpdateContent" } } } },
+          responses: jsonResponse
+        }
+      },
+      "/sync": {
+        post: {
+          operationId: "syncVault",
+          summary: "Sync from the backend.",
+          requestBody: { required: false, content: { "application/json": { schema: { type: "object", properties: { full: { type: "boolean", default: false } } } } } },
+          responses: jsonResponse
+        }
+      },
+      "/stats": { get: { operationId: "getStats", summary: "Vault statistics.", responses: jsonResponse } },
+      "/chunks/status": { get: { operationId: "getChunkStatus", summary: "Chunk index status.", responses: jsonResponse } },
+      "/people": { get: { operationId: "listPeople", summary: "List people with document counts.", responses: jsonResponse } },
+      "/people/{name}/documents": { get: { operationId: "listPersonDocuments", summary: "List documents for a person.", parameters: [pathParam("name")], responses: jsonResponse } },
+      "/places": {
+        get: {
+          operationId: "listPlaces",
+          summary: "List saved places with Maps URLs.",
+          parameters: [queryParam("filter", { type: "string", enum: ["wishlist", "visited", "all"], default: "all" }), queryParam("area"), queryParam("city"), queryParam("cuisine"), queryParam("placeType"), queryParam("limit", { type: "integer", default: 50 })],
+          responses: jsonResponse
+        }
+      },
+      "/wishlist": {
+        get: {
+          operationId: "listWishlist",
+          summary: "List saved product research and wishlist items.",
+          parameters: [queryParam("filter", { type: "string", enum: ["wishlist", "owned", "researching", "all"], default: "wishlist" }), queryParam("brand"), queryParam("category"), queryParam("limit", { type: "integer", default: 50 })],
+          responses: jsonResponse
+        }
+      },
+      "/recipes": {
+        get: {
+          operationId: "listRecipes",
+          summary: "List saved recipes.",
+          parameters: [queryParam("cuisine"), queryParam("course"), queryParam("dietary"), queryParam("maxMinutes", { type: "integer" }), queryParam("limit", { type: "integer", default: 50 })],
+          responses: jsonResponse
+        }
+      },
+      "/apps": {
+        get: {
+          operationId: "listApps",
+          summary: "List saved apps.",
+          parameters: [queryParam("filter", { type: "string", enum: ["wishlist", "installed", "all"], default: "all" }), queryParam("platform"), queryParam("category"), queryParam("limit", { type: "integer", default: 50 })],
+          responses: jsonResponse
+        }
+      },
+      "/hacks": {
+        get: {
+          operationId: "listLifeHacks",
+          summary: "List saved life hacks and tips.",
+          parameters: [queryParam("category"), queryParam("difficulty"), queryParam("limit", { type: "integer", default: 50 })],
+          responses: jsonResponse
+        }
+      },
+      "/tools/{name}": {
+        post: {
+          operationId: "callMcpTool",
+          summary: "Escape hatch: call a moivault MCP tool directly with a JSON argument object.",
+          parameters: [pathParam("name", "MCP tool name, for example vault_search.")],
+          requestBody: { required: false, content: { "application/json": { schema: { type: "object" } } } },
+          responses: jsonResponse
+        }
+      }
+    }
+  };
+}
+async function startRestServer() {
+  const key = process.env.MOIVAULT_API_KEY;
+  if (!key || key.length < 32) {
+    console.error("[moivault-rest] MOIVAULT_API_KEY env var missing or shorter than 32 characters.");
+    process.exit(1);
+  }
+  const port = Number.parseInt(process.env.MOIVAULT_REST_PORT || String(DEFAULT_PORT), 10);
+  startMcp();
+  const server = http2.createServer((req, res) => {
+    handle(req, res, key).catch((err) => {
+      const status = typeof err?.statusCode === "number" ? err.statusCode : 500;
+      console.error("[moivault-rest] request failed:", err);
+      json(res, status, { error: err?.message || String(err) });
+    });
+  });
+  server.listen(port, "127.0.0.1", () => {
+    console.log(`[moivault-rest] listening on 127.0.0.1:${port}`);
+  });
+}
+
 // src/cli/index.ts
 init_database();
 var program = new Command();
@@ -4431,6 +5119,9 @@ registerContextCommand(program);
 registerLifestyleCommands(program);
 program.command("mcp").description("Start MCP server (stdio transport) for Claude Desktop, Cursor, etc.").action(async () => {
   await startMcpServer();
+});
+program.command("rest").description("Start REST/OpenAPI server for Custom GPT Actions").action(async () => {
+  await startRestServer();
 });
 program.parseAsync(process.argv).catch((err) => {
   console.error(err.message);
