@@ -5042,15 +5042,6 @@ function openApiSpec(publicUrl) {
           parameters: [queryParam("category"), queryParam("difficulty"), queryParam("limit", { type: "integer", default: 50 })],
           responses: jsonResponse
         }
-      },
-      "/tools/{name}": {
-        post: {
-          operationId: "callMcpTool",
-          summary: "Escape hatch: call a moivault MCP tool directly with a JSON argument object.",
-          parameters: [pathParam("name", "MCP tool name, for example vault_search.")],
-          requestBody: { required: false, content: { "application/json": { schema: { type: "object" } } } },
-          responses: jsonResponse
-        }
       }
     }
   };
