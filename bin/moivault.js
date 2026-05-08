@@ -4439,10 +4439,6 @@ function json(res, status, body) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(body));
 }
-function text(res, status, body) {
-  res.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
-  res.end(body);
-}
 function getPublicBase(req) {
   if (process.env.MOIVAULT_PUBLIC_URL) return process.env.MOIVAULT_PUBLIC_URL.replace(/\/$/, "");
   const host = req.headers["x-forwarded-host"] || req.headers.host;
@@ -4742,7 +4738,12 @@ async function handle(req, res, key) {
   const docId = routeParams(pathname, "/documents/");
   if (docId && req.method === "GET") return json(res, 200, await callTool("vault_doc_get", { id: docId }));
   const docTextId = routeParams(pathname, "/documents/", "/text");
-  if (docTextId && req.method === "GET") return text(res, 200, String(await callTool("vault_doc_text", { id: docTextId })));
+  if (docTextId && req.method === "GET") {
+    const fullText = String(await callTool("vault_doc_text", { id: docTextId }));
+    const maxChars = parseIntParam(q.maxChars);
+    const text = maxChars && maxChars > 0 ? fullText.slice(0, maxChars) : fullText;
+    return json(res, 200, { id: docTextId, text, length: fullText.length, truncated: text.length < fullText.length });
+  }
   const docFieldsId = routeParams(pathname, "/documents/", "/fields");
   if (docFieldsId && req.method === "GET") return json(res, 200, await callTool("vault_doc_fields", { id: docFieldsId }));
   const docFileId = routeParams(pathname, "/documents/", "/file");
@@ -4841,10 +4842,22 @@ function openApiSpec(publicUrl) {
       content: { "application/json": { schema: {} } }
     }
   };
-  const textResponse = {
+  const documentTextResponse = {
     "200": {
       description: "OK",
-      content: { "text/plain": { schema: { type: "string" } } }
+      content: {
+        "application/json": {
+          schema: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              text: { type: "string" },
+              length: { type: "integer" },
+              truncated: { type: "boolean" }
+            }
+          }
+        }
+      }
     }
   };
   const queryParam = (name, schema = { type: "string" }, description) => ({
@@ -4963,7 +4976,14 @@ function openApiSpec(publicUrl) {
         patch: { operationId: "editDocumentField", summary: "Edit one document field.", parameters: [pathParam("id")], requestBody: { required: true, content: { "application/json": { schema: { $ref: "#/components/schemas/EditField" } } } }, responses: jsonResponse },
         delete: { operationId: "deleteDocument", summary: "Delete a document from the vault. Only call after explicit user confirmation.", parameters: [pathParam("id")], responses: jsonResponse }
       },
-      "/documents/{id}/text": { get: { operationId: "getDocumentText", summary: "Get full OCR/extracted text.", parameters: [pathParam("id")], responses: textResponse } },
+      "/documents/{id}/text": {
+        get: {
+          operationId: "getDocumentText",
+          summary: "Get OCR/extracted text as JSON. Use maxChars to keep large documents manageable.",
+          parameters: [pathParam("id"), queryParam("maxChars", { type: "integer" }, "Optional character limit for the returned text.")],
+          responses: documentTextResponse
+        }
+      },
       "/documents/{id}/fields": { get: { operationId: "getDocumentFields", summary: "Get structured extracted fields.", parameters: [pathParam("id")], responses: jsonResponse } },
       "/documents/{id}/file": {
         get: {
@@ -5055,6 +5075,11 @@ async function startRestServer() {
   const port = Number.parseInt(process.env.MOIVAULT_REST_PORT || String(DEFAULT_PORT), 10);
   startMcp();
   const server = http2.createServer((req, res) => {
+    const startedAt = Date.now();
+    const reqPath = new URL(req.url || "/", "http://x").pathname;
+    res.on("finish", () => {
+      console.log(`[moivault-rest] ${req.method} ${reqPath} ${res.statusCode} ${Date.now() - startedAt}ms`);
+    });
     handle(req, res, key).catch((err) => {
       const status = typeof err?.statusCode === "number" ? err.statusCode : 500;
       console.error("[moivault-rest] request failed:", err);
