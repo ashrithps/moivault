@@ -2,16 +2,18 @@
 # moivault installer — one-line install for macOS
 #
 # Basic install:
-#   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash
 #
 # Install + authenticate (one-click setup):
-#   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash -s -- \
+#   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash -s -- \
 #     --payload '{"sessionCookie":"...","secretKey":"...","salt":"...","wrappedVaultKey":"..."}' \
 #     --password 'your-master-password'
 
 set -e
 
 REPO="ashrithps/moivault"
+# Branch to pull artifacts from (the repo's default branch is `master`).
+BRANCH="${MOIVAULT_BRANCH:-master}"
 INSTALL_DIR="$HOME/.moivault"
 BIN_DIR="$HOME/.local/bin"
 AUTH_PAYLOAD=""
@@ -49,10 +51,10 @@ mkdir -p "$INSTALL_DIR" "$BIN_DIR"
 
 # Download latest from GitHub
 echo "  ↓ Downloading moivault..."
-curl -fsSL "https://raw.githubusercontent.com/$REPO/main/bin/moivault.js" -o "$INSTALL_DIR/moivault.js"
-curl -fsSL "https://raw.githubusercontent.com/$REPO/main/package.json" -o "$INSTALL_DIR/package.json"
+curl -fsSL "https://raw.githubusercontent.com/$REPO/$BRANCH/bin/moivault.js" -o "$INSTALL_DIR/moivault.js"
+curl -fsSL "https://raw.githubusercontent.com/$REPO/$BRANCH/package.json" -o "$INSTALL_DIR/package.json"
 mkdir -p "$INSTALL_DIR/skill"
-curl -fsSL "https://raw.githubusercontent.com/$REPO/main/skill/SKILL.md" -o "$INSTALL_DIR/skill/SKILL.md"
+curl -fsSL "https://raw.githubusercontent.com/$REPO/$BRANCH/skill/SKILL.md" -o "$INSTALL_DIR/skill/SKILL.md"
 
 # Install dependencies (better-sqlite3 requires C++ compiler)
 echo "  ↓ Installing dependencies..."

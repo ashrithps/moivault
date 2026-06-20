@@ -7,7 +7,7 @@ Search, retrieve, and correlate documents from your encrypted vault. Designed fo
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash
 ```
 
 ### One-click install with auth (fully automated)
@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh 
 Get the auth payload from the Vault app (Settings → Developer → Link CLI), then:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/main/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash -s -- \
   --payload '<json from app>' \
   --password 'your-master-password'
 ```
