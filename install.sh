@@ -167,7 +167,6 @@ fi
 VSCODE_DIR="$HOME/.vscode"
 [ -d "$HOME/Library/Application Support/Code" ] && VSCODE_DIR="$HOME/Library/Application Support/Code/User"
 [ -d "$VSCODE_DIR" ] && install_skill "$VSCODE_DIR/skills" "vscode"
-fi
 
 # ── Claude Desktop (MCP server auto-config) ──
 CLAUDE_DESKTOP_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
