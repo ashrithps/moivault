@@ -52,7 +52,7 @@ var init_config = __esm({
     "use strict";
     CONVEX_URL = "https://perfect-mallard-90.convex.cloud";
     CONVEX_SITE_URL = "https://perfect-mallard-90.convex.site";
-    CONFIG_DIR = path.join(os.homedir(), ".vault-cli");
+    CONFIG_DIR = process.env.MOIVAULT_CONFIG_DIR || path.join(os.homedir(), ".vault-cli");
     CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
     DEFAULT_DB_PATH = path.join(CONFIG_DIR, "vault.db");
   }
