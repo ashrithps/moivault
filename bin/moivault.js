@@ -1155,11 +1155,22 @@ function decryptBlob(blob, vaultKey) {
 async function syncFull(vaultKey, vaultId, onProgress) {
   const convex = await authenticateConvexClient();
   onProgress?.({ total: 0, current: 0, phase: "downloading" });
-  let blobs;
-  if (vaultId) {
-    blobs = await convex.query(api.encryptedSync.getAllBlobsByVault, { vaultId });
-  } else {
-    blobs = await convex.query(api.encryptedSync.getAllBlobs, {});
+  // Page through encrypted metadata blobs (OCR text + fields + embedding). The
+  // actual document FILES are NOT here — they stay server-side (R2 asset refs) and
+  // are fetched on demand by `download`. A single getAllBlobs* query .collect()s
+  // the whole vault and busts Convex's response limit on large vaults
+  // ("Server Error"), so page via getBlobPage(ByVault) instead.
+  const blobs = [];
+  let cursor = null;
+  for (;;) {
+    const paginationOpts = { numItems: 20, cursor };
+    const result = vaultId
+      ? await convex.query(api.encryptedSync.getBlobPageByVault, { vaultId, paginationOpts })
+      : await convex.query(api.encryptedSync.getBlobPage, { paginationOpts });
+    blobs.push(...result.page);
+    onProgress?.({ total: blobs.length, current: blobs.length, phase: "downloading" });
+    if (result.isDone) break;
+    cursor = result.continueCursor;
   }
   const total = blobs.length;
   let count = 0;
@@ -3714,6 +3725,22 @@ init_config();
 init_database();
 init_crypto();
 var hasSyncedThisSession = false;
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function fallbackTextExtraction(content, forcedType) {
+  return {
+    rawText: content,
+    type: forcedType || "note",
+    tags: [],
+    fields: {
+      processing: "AI extraction unavailable; archived with original text content."
+    },
+    organizations: [],
+    mentions: [],
+    owner: "Unknown"
+  };
+}
 async function ensureUnlocked() {
   if (isVaultUnlocked()) return;
   let password = process.env.VAULT_MASTER_PASSWORD;
@@ -4144,7 +4171,10 @@ async function startMcpServer() {
         return { content: [{ type: "text", text: JSON.stringify({ status: "duplicate", id: docId, title: existingDoc.title }) }] };
       }
       const convex = await authenticateConvexClient();
-      const extracted = await convex.action(api.proxy.processText, { textContent: content, fileName: title });
+      let extracted = await convex.action(api.proxy.processText, { textContent: content, fileName: title }).catch((error) => {
+        console.warn(`[moivault] processText failed for "${title}"; storing text document without AI extraction: ${errorMessage(error)}`);
+        return fallbackTextExtraction(content, type);
+      });
       if (type) extracted.type = type;
       if (tags) {
         const extraTags = tags.split(",").map((t) => t.trim()).filter(Boolean);
