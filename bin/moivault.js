@@ -59,10 +59,11 @@ var init_config = __esm({
 });
 
 // src/shared/constants.ts
-var DOCUMENT_KEY_BYTES, MUK_BYTES, IV_BYTES, AUTH_TAG_BYTES, PBKDF2_ITERATIONS, PBKDF2_HASH, BLOB_VERSION;
+var VAULT_KEY_BYTES, DOCUMENT_KEY_BYTES, MUK_BYTES, IV_BYTES, AUTH_TAG_BYTES, PBKDF2_ITERATIONS, PBKDF2_HASH, BLOB_VERSION;
 var init_constants = __esm({
   "src/shared/constants.ts"() {
     "use strict";
+    VAULT_KEY_BYTES = 32;
     DOCUMENT_KEY_BYTES = 32;
     MUK_BYTES = 32;
     IV_BYTES = 12;
@@ -222,6 +223,7 @@ function openDatabase(dbPath) {
       dateAdded TEXT,
       status TEXT DEFAULT 'ready',
       vaultId TEXT,
+      keyVersion INTEGER,
       createdAt INTEGER,
       updatedAt INTEGER,
       syncStatus TEXT DEFAULT 'pending',
@@ -244,6 +246,9 @@ function openDatabase(dbPath) {
   const existingCols = db.pragma("table_info(documents)");
   const colNames = new Set(existingCols.map((c) => c.name));
   const r2Cols = [
+    // The space-key generation this row's wrapped document key belongs to.
+    // NULL means 1 — written before rotation existed — never "current".
+    "keyVersion INTEGER",
     "markdownContent TEXT",
     "fileAssetProvider TEXT",
     "fileAssetKey TEXT",
@@ -401,6 +406,7 @@ function deserializeRow(row) {
     dateAdded: row.dateAdded,
     status: row.status,
     vaultId: row.vaultId,
+    keyVersion: row.keyVersion,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     syncStatus: row.syncStatus ?? "synced"
@@ -410,8 +416,8 @@ function upsertDocument(doc) {
   const database = getDatabase();
   const stmt = database.prepare(`
     INSERT OR REPLACE INTO documents
-    (id, title, rawText, markdownContent, type, tags, fields, organizations, mentions, overview, embedding, encryptedDocKey, mimeType, storageId, encryptedStorageId, fileEncrypted, fileAssetProvider, fileAssetKey, fileAssetMimeType, fileAssetSize, fileAssetVersion, fileAssetStatus, previewAssetProvider, previewAssetKey, previewAssetMimeType, previewAssetSize, previewAssetVersion, previewAssetStatus, owner, originalOwner, addedBy, imageUrl, dateAdded, status, vaultId, createdAt, updatedAt, syncStatus)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    (id, title, rawText, markdownContent, type, tags, fields, organizations, mentions, overview, embedding, encryptedDocKey, mimeType, storageId, encryptedStorageId, fileEncrypted, fileAssetProvider, fileAssetKey, fileAssetMimeType, fileAssetSize, fileAssetVersion, fileAssetStatus, previewAssetProvider, previewAssetKey, previewAssetMimeType, previewAssetSize, previewAssetVersion, previewAssetStatus, owner, originalOwner, addedBy, imageUrl, dateAdded, status, vaultId, keyVersion, createdAt, updatedAt, syncStatus)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const embeddingBlob = doc.embedding ? Buffer.from(new Float64Array(doc.embedding).buffer) : null;
   stmt.run(
@@ -450,6 +456,7 @@ function upsertDocument(doc) {
     doc.dateAdded ?? null,
     doc.status ?? "ready",
     doc.vaultId ?? null,
+    doc.keyVersion ?? null,
     doc.createdAt,
     doc.updatedAt,
     doc.syncStatus
@@ -1012,7 +1019,216 @@ function registerAuthCommands(program2) {
 // src/core/vault.ts
 init_crypto();
 init_constants();
+
+// src/core/keyRing.ts
+init_crypto();
+
+// src/core/keyExchange.ts
+init_crypto();
 import crypto2 from "crypto";
+var X25519_KEY_BYTES = 32;
+var ENVELOPE_VERSION = 2;
+var SPKI_PREFIX = Buffer.from("302a300506032b656e032100", "hex");
+var PKCS8_PREFIX = Buffer.from("302e020100300506032b656e04220420", "hex");
+function publicKeyObject(raw) {
+  if (raw.length !== X25519_KEY_BYTES) {
+    throw new Error(`X25519 public key must be 32 bytes, got ${raw.length}`);
+  }
+  return crypto2.createPublicKey({
+    key: Buffer.concat([SPKI_PREFIX, Buffer.from(raw)]),
+    format: "der",
+    type: "spki"
+  });
+}
+function privateKeyObject(raw) {
+  if (raw.length !== X25519_KEY_BYTES) {
+    throw new Error(`X25519 private key must be 32 bytes, got ${raw.length}`);
+  }
+  return crypto2.createPrivateKey({
+    key: Buffer.concat([PKCS8_PREFIX, Buffer.from(raw)]),
+    format: "der",
+    type: "pkcs8"
+  });
+}
+function deriveWrappingKey(sharedSecret, ephemeralPublicKey, recipientPublicKey) {
+  const hash = crypto2.createHash("sha256");
+  hash.update(sharedSecret);
+  hash.update(ephemeralPublicKey);
+  hash.update(recipientPublicKey);
+  return new Uint8Array(hash.digest());
+}
+function openSealed(envelope, recipientPrivateKey, recipientPublicKey) {
+  if (envelope.length < 1 + X25519_KEY_BYTES + 1) {
+    throw new Error("Sealed envelope too short");
+  }
+  if (envelope[0] !== ENVELOPE_VERSION) {
+    throw new Error(`Unsupported envelope version: ${envelope[0]}`);
+  }
+  const ephemeralPublicKey = envelope.subarray(1, 1 + X25519_KEY_BYTES);
+  const payload = envelope.subarray(1 + X25519_KEY_BYTES);
+  const shared = new Uint8Array(
+    crypto2.diffieHellman({
+      privateKey: privateKeyObject(recipientPrivateKey),
+      publicKey: publicKeyObject(ephemeralPublicKey)
+    })
+  );
+  const wrappingKey = deriveWrappingKey(shared, ephemeralPublicKey, recipientPublicKey);
+  try {
+    return decrypt(payload, wrappingKey);
+  } finally {
+    shared.fill(0);
+    wrappingKey.fill(0);
+  }
+}
+
+// src/core/keyRing.ts
+init_constants();
+var LEGACY_SPACE_ID = "__legacy__";
+var KeyRingMiss = class extends Error {
+  constructor(spaceId, version) {
+    super(`No key held for space ${spaceId ?? "(none)"} version ${version ?? "(current)"}`);
+    this.spaceId = spaceId;
+    this.version = version;
+    this.name = "KeyRingMiss";
+  }
+};
+var KeyRing = class _KeyRing {
+  spaces = /* @__PURE__ */ new Map();
+  personalId = null;
+  familyId = null;
+  legacyMode = false;
+  constructor() {
+  }
+  get primaryId() {
+    return this.familyId ?? this.personalId;
+  }
+  get primaryKey() {
+    const id = this.primaryId;
+    return id ? this.spaces.get(id)?.key ?? null : null;
+  }
+  /** The primary space id as a document should record it; null for the sentinel. */
+  get primaryStorageId() {
+    const id = this.primaryId;
+    return id === null || id === LEGACY_SPACE_ID ? null : id;
+  }
+  get isLegacy() {
+    return this.legacyMode;
+  }
+  /** The ring before the server has been asked: one key, standing in for everything. */
+  static legacy(vaultId, vaultKey) {
+    const ring = new _KeyRing();
+    const id = vaultId ?? LEGACY_SPACE_ID;
+    ring.legacyMode = true;
+    ring.personalId = id;
+    ring.spaces.set(id, {
+      spaceId: id,
+      kind: null,
+      name: null,
+      role: "owner",
+      isOwner: true,
+      key: vaultKey,
+      version: 1
+    });
+    return ring;
+  }
+  /** Build from the server's membership rows by opening each sealed envelope. */
+  static fromMemberships(rows, identity) {
+    const ring = new _KeyRing();
+    for (const row of rows) {
+      if (!row.wrappedSpaceKey) continue;
+      let key;
+      try {
+        key = openSealed(
+          new Uint8Array(row.wrappedSpaceKey),
+          identity.privateKey,
+          identity.publicKey
+        );
+      } catch {
+        continue;
+      }
+      if (key.length !== VAULT_KEY_BYTES) continue;
+      let prior;
+      if (row.priorWrappedSpaceKey && row.priorKeyVersion !== null) {
+        try {
+          const priorKey = openSealed(
+            new Uint8Array(row.priorWrappedSpaceKey),
+            identity.privateKey,
+            identity.publicKey
+          );
+          if (priorKey.length === VAULT_KEY_BYTES) {
+            prior = { version: row.priorKeyVersion, key: priorKey };
+          }
+        } catch {
+        }
+      }
+      ring.spaces.set(row.spaceId, {
+        spaceId: row.spaceId,
+        kind: row.kind,
+        name: row.name,
+        role: row.role,
+        isOwner: row.isOwner,
+        key,
+        version: row.keyVersion ?? row.spaceKeyVersion ?? 1,
+        prior
+      });
+      if (row.kind === "personal" && row.isOwner) ring.personalId = row.spaceId;
+      if (row.kind === "family") ring.familyId = row.spaceId;
+    }
+    return ring;
+  }
+  has(spaceId) {
+    return this.spaces.has(spaceId);
+  }
+  roleIn(spaceId) {
+    return this.spaces.get(spaceId)?.role ?? null;
+  }
+  /** Every space held, personal first, then family, then the rest. */
+  list() {
+    const rank = (e) => e.spaceId === this.personalId ? 0 : e.spaceId === this.familyId ? 1 : 2;
+    return [...this.spaces.values()].sort((a, b) => rank(a) - rank(b));
+  }
+  keyFor(spaceId, version) {
+    const id = spaceId ?? this.primaryId;
+    if (!id) throw new KeyRingMiss(spaceId ?? null, version ?? null);
+    const entry = this.spaces.get(id) ?? (this.legacyMode ? this.spaces.get(this.primaryId) : void 0);
+    if (!entry) throw new KeyRingMiss(id, version ?? null);
+    const wanted = version ?? entry.version;
+    if (wanted === entry.version) return entry.key;
+    if (entry.prior && wanted === entry.prior.version) return entry.prior.key;
+    throw new KeyRingMiss(id, wanted);
+  }
+  /**
+   * An absent `keyVersion` means 1 — written before rotation existed — and
+   * emphatically not "the current version".
+   */
+  unwrapDocKey(doc) {
+    return decrypt(doc.encryptedDocKey, this.keyFor(doc.vaultId, doc.keyVersion ?? 1));
+  }
+  wrapDocKey(docKey, spaceId) {
+    const id = spaceId ?? this.primaryId;
+    if (!id) throw new KeyRingMiss(spaceId ?? null, null);
+    const entry = this.spaces.get(id);
+    if (!entry) throw new KeyRingMiss(id, null);
+    return {
+      encryptedDocKey: encrypt(docKey, entry.key),
+      keyVersion: entry.version,
+      spaceId: entry.spaceId === LEGACY_SPACE_ID ? null : entry.spaceId
+    };
+  }
+  zero() {
+    for (const entry of this.spaces.values()) {
+      entry.key.fill(0);
+      entry.prior?.key.fill(0);
+    }
+    this.spaces.clear();
+    this.personalId = null;
+    this.familyId = null;
+  }
+};
+
+// src/core/vault.ts
+init_config();
+import crypto3 from "crypto";
 var currentKeys = null;
 function isVaultUnlocked() {
   return currentKeys !== null;
@@ -1042,24 +1258,41 @@ async function unlockVault(masterPassword) {
   const wrappedVaultKey = base64ToBytes(wrappedVaultKeyB64);
   const muk = await deriveMUK(masterPassword, secretKey, salt);
   const vaultKey = decrypt(wrappedVaultKey, muk);
-  currentKeys = { muk, vaultKey };
+  currentKeys = {
+    muk,
+    vaultKey,
+    identity: null,
+    keyRing: KeyRing.legacy(loadConfig().vaultId ?? null, vaultKey)
+  };
   return currentKeys;
+}
+function applyKeyRing(keys, ring, identity) {
+  keys.keyRing = ring;
+  keys.identity = identity;
+  const primary = ring.primaryKey;
+  if (primary) keys.vaultKey = primary;
 }
 function lockVault() {
   if (currentKeys) {
     currentKeys.muk.fill(0);
     currentKeys.vaultKey.fill(0);
+    currentKeys.identity?.privateKey.fill(0);
+    currentKeys.keyRing.zero();
     currentKeys = null;
   }
 }
-function unwrapDocumentKey(wrappedDocKey, vaultKey) {
-  return decrypt(wrappedDocKey, vaultKey);
+function unwrapDocumentKey(wrappedDocKey, doc) {
+  return getVaultKeys().keyRing.unwrapDocKey({
+    vaultId: doc.vaultId,
+    keyVersion: doc.keyVersion,
+    encryptedDocKey: wrappedDocKey
+  });
 }
-function wrapDocumentKey(documentKey, vaultKey) {
-  return encrypt(documentKey, vaultKey);
+function wrapDocumentKey(documentKey, spaceId) {
+  return getVaultKeys().keyRing.wrapDocKey(documentKey, spaceId);
 }
 function generateDocumentKey() {
-  return new Uint8Array(crypto2.randomBytes(DOCUMENT_KEY_BYTES));
+  return new Uint8Array(crypto3.randomBytes(DOCUMENT_KEY_BYTES));
 }
 
 // src/core/sync.ts
@@ -1074,6 +1307,7 @@ var api = anyApi;
 
 // src/core/sync.ts
 var client = null;
+var keyRingRefreshed = false;
 function getConvexClient() {
   if (client) return client;
   client = new ConvexHttpClient(CONVEX_URL);
@@ -1100,11 +1334,24 @@ async function authenticateConvexClient() {
     throw new Error("No token returned from auth endpoint");
   }
   convex.setAuth(data.token);
+  if (!keyRingRefreshed) {
+    keyRingRefreshed = true;
+    if (isVaultUnlocked()) {
+      try {
+        await refreshKeyRing(convex, getVaultKeys());
+      } catch {
+      }
+    }
+  }
   return convex;
 }
-function decryptBlob(blob, vaultKey) {
+function decryptBlob(blob, keyRing) {
   const encryptedDocKey = new Uint8Array(blob.encryptedDocKey);
-  const docKey = unwrapDocumentKey(encryptedDocKey, vaultKey);
+  const docKey = keyRing.unwrapDocKey({
+    vaultId: blob.vaultId,
+    keyVersion: blob.keyVersion,
+    encryptedDocKey
+  });
   const encryptedData = new Uint8Array(blob.encryptedBlob);
   const decryptedData = decrypt(encryptedData, docKey);
   docKey.fill(0);
@@ -1146,60 +1393,123 @@ function decryptBlob(blob, vaultKey) {
     imageUrl: metadata.imageUrl,
     dateAdded: metadata.dateAdded,
     status: "ready",
-    vaultId: metadata.vaultId,
+    // The blob column, not the encrypted payload: a document that has been
+    // moved between spaces carries the old id inside its own ciphertext.
+    vaultId: blob.vaultId ?? metadata.vaultId,
+    keyVersion: blob.keyVersion,
     createdAt: metadata.createdAt ?? blob.updatedAt,
     updatedAt: blob.updatedAt,
     syncStatus: "synced"
   };
 }
-async function syncFull(vaultKey, vaultId, onProgress) {
-  const convex = await authenticateConvexClient();
-  onProgress?.({ total: 0, current: 0, phase: "downloading" });
-  // Page through encrypted metadata blobs (OCR text + fields + embedding). The
-  // actual document FILES are NOT here — they stay server-side (R2 asset refs) and
-  // are fetched on demand by `download`. A single getAllBlobs* query .collect()s
-  // the whole vault and busts Convex's response limit on large vaults
-  // ("Server Error"), so page via getBlobPage(ByVault) instead.
+async function upsertEncryptedBlob(convex, args) {
+  const keys = getVaultKeys();
+  const wrapped = keys.keyRing.wrapDocKey(args.docKey, args.spaceId);
+  const blobBuffer = new ArrayBuffer(args.encryptedBlob.byteLength);
+  new Uint8Array(blobBuffer).set(args.encryptedBlob);
+  const keyBuffer = new ArrayBuffer(wrapped.encryptedDocKey.byteLength);
+  new Uint8Array(keyBuffer).set(wrapped.encryptedDocKey);
+  const common = {
+    blobId: args.blobId,
+    encryptedBlob: blobBuffer,
+    encryptedDocKey: keyBuffer,
+    blobSize: args.encryptedBlob.length,
+    keyVersion: wrapped.keyVersion,
+    ...args.addedBy ? { addedBy: args.addedBy } : {}
+  };
+  const result = wrapped.spaceId ? await convex.mutation(api.encryptedSync.upsertBlobByVault, {
+    vaultId: wrapped.spaceId,
+    ...common
+  }) : await convex.mutation(api.encryptedSync.upsertBlob, common);
+  return { ...wrapped, updatedAt: result?.updatedAt };
+}
+async function refreshKeyRing(convex, keys) {
+  const meta = await convex.query(api.vaultMeta.getIdentity, {});
+  if (!meta?.wrappedPrivateKey || !meta.publicKey) return false;
+  let identity;
+  try {
+    identity = {
+      privateKey: decrypt(new Uint8Array(meta.wrappedPrivateKey), keys.muk),
+      publicKey: new Uint8Array(meta.publicKey)
+    };
+  } catch {
+    return false;
+  }
+  keys.identity = identity;
+  const rows = await convex.query(api.vaults.getMyMemberships, {});
+  const ring = KeyRing.fromMemberships(rows, identity);
+  if (ring.spaces.size === 0) return false;
+  applyKeyRing(keys, ring, identity);
+  if (ring.primaryStorageId) updateConfig({ vaultId: ring.primaryStorageId });
+  return true;
+}
+function spaceTargets(keyRing) {
+  if (keyRing.isLegacy) return [keyRing.primaryStorageId ?? void 0];
+  const ids = keyRing.list().map((entry) => entry.spaceId);
+  return ids.length > 0 ? ids : [void 0];
+}
+var SYNC_PAGE_SIZE = 20;
+async function fetchBlobs(convex, spaceId, since, onPage) {
   const blobs = [];
   let cursor = null;
-  for (;;) {
-    const paginationOpts = { numItems: 20, cursor };
-    const result = vaultId
-      ? await convex.query(api.encryptedSync.getBlobPageByVault, { vaultId, paginationOpts })
-      : await convex.query(api.encryptedSync.getBlobPage, { paginationOpts });
+  for (; ; ) {
+    const paginationOpts = { numItems: SYNC_PAGE_SIZE, cursor };
+    const result = spaceId ? since === null ? await convex.query(api.encryptedSync.getBlobPageByVault, {
+      vaultId: spaceId,
+      paginationOpts
+    }) : await convex.query(api.encryptedSync.getUpdatedSincePageByVault, {
+      vaultId: spaceId,
+      since,
+      paginationOpts
+    }) : since === null ? await convex.query(api.encryptedSync.getBlobPage, { paginationOpts }) : await convex.query(api.encryptedSync.getUpdatedSincePage, {
+      since,
+      paginationOpts
+    });
     blobs.push(...result.page);
-    onProgress?.({ total: blobs.length, current: blobs.length, phase: "downloading" });
+    onPage?.(blobs.length);
     if (result.isDone) break;
     cursor = result.continueCursor;
   }
+  return blobs;
+}
+async function syncFull(keys, onProgress) {
+  const convex = await authenticateConvexClient();
+  onProgress?.({ total: 0, current: 0, phase: "downloading" });
+  const blobs = [];
+  for (const spaceId of spaceTargets(keys.keyRing)) {
+    blobs.push(
+      ...await fetchBlobs(
+        convex,
+        spaceId,
+        null,
+        (soFar) => onProgress?.({ total: soFar, current: soFar, phase: "downloading" })
+      )
+    );
+  }
   const total = blobs.length;
   let count = 0;
-  let skipped = 0;
   const failures = [];
   const database = getDatabase();
   const transaction = database.transaction(() => {
     for (const blob of blobs) {
       try {
         onProgress?.({ total, current: count, phase: "decrypting" });
-        const doc = decryptBlob(blob, vaultKey);
+        const doc = decryptBlob(blob, keys.keyRing);
         upsertDocument(doc);
         count++;
         onProgress?.({ total, current: count, phase: "saving" });
       } catch (err) {
-        skipped++;
-        failures.push({
-          blobId: blob.blobId,
-          error: err.message
-        });
+        failures.push({ blobId: blob.blobId, error: err.message });
       }
     }
   });
   transaction();
   if (failures.length > 0) {
     const jsonFails = failures.filter((f) => f.error.includes("not valid JSON"));
+    const missing = failures.filter((f) => f.error.startsWith("No key held"));
     const authFails = failures.filter((f) => f.error.includes("authenticate data") || f.error.includes("Unsupported state"));
-    const otherFails = failures.filter((f) => !f.error.includes("not valid JSON") && !f.error.includes("authenticate data") && !f.error.includes("Unsupported state"));
-    process.stderr.write(`[sync] Skipped ${failures.length} blobs: ${jsonFails.length} non-JSON (avatars), ${authFails.length} auth failures (wrong key), ${otherFails.length} other
+    const otherFails = failures.length - jsonFails.length - missing.length - authFails.length;
+    process.stderr.write(`[sync] Skipped ${failures.length} blobs: ${jsonFails.length} non-JSON (avatars), ${missing.length} no key held, ${authFails.length} auth failures, ${otherFails} other
 `);
   }
   const latestTimestamp = blobs.reduce((max, b) => Math.max(max, b.updatedAt), 0);
@@ -1208,16 +1518,21 @@ async function syncFull(vaultKey, vaultId, onProgress) {
   }
   return count;
 }
-async function syncIncremental(vaultKey, vaultId, onProgress) {
+async function syncIncremental(keys, onProgress) {
   const convex = await authenticateConvexClient();
   const config = loadConfig();
   const since = config.lastSyncTimestamp ?? 0;
   onProgress?.({ total: 0, current: 0, phase: "downloading" });
-  let blobs;
-  if (vaultId) {
-    blobs = await convex.query(api.encryptedSync.getUpdatedSinceByVault, { vaultId, since });
-  } else {
-    blobs = await convex.query(api.encryptedSync.getUpdatedSince, { since });
+  const blobs = [];
+  for (const spaceId of spaceTargets(keys.keyRing)) {
+    blobs.push(
+      ...await fetchBlobs(
+        convex,
+        spaceId,
+        since,
+        (soFar) => onProgress?.({ total: soFar, current: soFar, phase: "downloading" })
+      )
+    );
   }
   if (blobs.length === 0) {
     return { count: 0, deleted: 0 };
@@ -1235,7 +1550,7 @@ async function syncIncremental(vaultKey, vaultId, onProgress) {
       }
       try {
         onProgress?.({ total, current: count, phase: "decrypting" });
-        const doc = decryptBlob(blob, vaultKey);
+        const doc = decryptBlob(blob, keys.keyRing);
         upsertDocument(doc);
         count++;
         onProgress?.({ total, current: count, phase: "saving" });
@@ -1412,7 +1727,7 @@ function registerSyncCommands(program2) {
       }
       process.exit(1);
     }
-    const { vaultKey } = getVaultKeys();
+    const keys = getVaultKeys();
     const config = loadConfig();
     try {
       await fetchAndStoreVaultMeta(config.vaultId);
@@ -1421,7 +1736,7 @@ function registerSyncCommands(program2) {
     const startTime = Date.now();
     if (opts.full || !config.lastSyncTimestamp) {
       if (!isJson) process.stderr.write("Syncing all documents...\n");
-      const count = await syncFull(vaultKey, config.vaultId, (progress) => {
+      const count = await syncFull(keys, (progress) => {
         if (!isJson && process.stderr.isTTY) {
           process.stderr.write(`\r  ${progress.phase}: ${progress.current}/${progress.total}`);
         }
@@ -1435,7 +1750,7 @@ function registerSyncCommands(program2) {
       }
     } else {
       if (!isJson) process.stderr.write("Syncing updates...\n");
-      const { count, deleted } = await syncIncremental(vaultKey, config.vaultId, (progress) => {
+      const { count, deleted } = await syncIncremental(keys, (progress) => {
         if (!isJson && process.stderr.isTTY) {
           process.stderr.write(`\r  ${progress.phase}: ${progress.current}/${progress.total}`);
         }
@@ -1455,12 +1770,76 @@ function registerSyncCommands(program2) {
   });
 }
 
+// src/cli/commands/spaces.ts
+function registerSpacesCommand(program2) {
+  program2.command("spaces").description("List the spaces this machine holds keys for").action(async () => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (!isVaultUnlocked()) {
+      const msg = "Vault is locked \u2014 run `moivault unlock` first";
+      if (isJson) {
+        output({ error: msg });
+      } else {
+        console.error(msg);
+      }
+      process.exit(1);
+    }
+    const keys = getVaultKeys();
+    let serverSpaces = [];
+    try {
+      const convex = await authenticateConvexClient();
+      serverSpaces = await convex.query(api.vaults.getMyMemberships, {});
+    } catch {
+    }
+    const held = keys.keyRing.list().map((entry) => ({
+      spaceId: entry.spaceId,
+      name: entry.name,
+      kind: entry.kind,
+      role: entry.role,
+      keyVersion: entry.version,
+      hasPriorKey: !!entry.prior
+    }));
+    const heldIds = new Set(held.map((h) => h.spaceId));
+    const unopened = serverSpaces.filter((s) => s.kind !== null && !heldIds.has(s.spaceId)).map((s) => ({ spaceId: s.spaceId, name: s.name, kind: s.kind }));
+    const payload = {
+      migrated: !keys.keyRing.isLegacy,
+      hasIdentity: !!keys.identity,
+      primarySpaceId: keys.keyRing.primaryStorageId,
+      personalSpaceId: keys.keyRing.personalId,
+      familySpaceId: keys.keyRing.familyId,
+      spaces: held,
+      unopened
+    };
+    if (isJson) {
+      output(payload);
+      return;
+    }
+    if (!payload.migrated) {
+      console.log("Not migrated to spaces yet \u2014 using the single vault key.");
+      console.log("Open the app once to migrate; this will fill in afterwards.\n");
+    }
+    console.log(`Identity: ${payload.hasIdentity ? "present" : "none"}`);
+    for (const space of held) {
+      const label = space.name ?? space.spaceId;
+      const kind = space.kind ?? "legacy";
+      const primary = space.spaceId === keys.keyRing.primaryId ? "  (primary)" : "";
+      console.log(`  ${label} \u2014 ${kind}, ${space.role}, key v${space.keyVersion}${primary}`);
+    }
+    if (unopened.length > 0) {
+      console.log("\nListed by the server but not openable here:");
+      for (const space of unopened) {
+        console.log(`  ${space.name ?? space.spaceId} (${space.kind ?? "unknown"})`);
+      }
+      console.log("Open the app on this account to publish a key for this machine.");
+    }
+  });
+}
+
 // src/cli/commands/doc.ts
 init_database();
 import fs4 from "fs";
 import path4 from "path";
 import os3 from "os";
-import crypto3 from "crypto";
+import crypto4 from "crypto";
 init_crypto();
 
 // src/core/thumbnail.ts
@@ -1651,7 +2030,7 @@ function registerDocCommands(program2) {
       const { vaultKey } = getVaultKeys();
       let docKey;
       if (updatedDoc.encryptedDocKey) {
-        docKey = unwrapDocumentKey(updatedDoc.encryptedDocKey, vaultKey);
+        docKey = unwrapDocumentKey(updatedDoc.encryptedDocKey, updatedDoc);
       } else {
         docKey = generateDocumentKey();
       }
@@ -1673,30 +2052,33 @@ function registerDocCommands(program2) {
         dateAdded: updatedDoc.dateAdded
       });
       const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
-      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const wrapped = wrapDocumentKey(docKey, updatedDoc.vaultId);
+      const wrappedDocKey = wrapped.encryptedDocKey;
       const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
       new Uint8Array(blobBuffer).set(encryptedBlob);
       const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
       const convex = await authenticateConvexClient();
-      const vaultId = config.vaultId;
-      if (vaultId) {
+      const vaultId = wrapped.spaceId ?? void 0;
+      if (wrapped.spaceId) {
         await convex.mutation(api.encryptedSync.upsertBlobByVault, {
-          vaultId,
+          vaultId: wrapped.spaceId,
           blobId: id,
           encryptedBlob: blobBuffer,
           encryptedDocKey: keyBuffer,
-          blobSize: encryptedBlob.length
+          blobSize: encryptedBlob.length,
+          keyVersion: wrapped.keyVersion
         });
       } else {
         await convex.mutation(api.encryptedSync.upsertBlob, {
           blobId: id,
           encryptedBlob: blobBuffer,
           encryptedDocKey: keyBuffer,
-          blobSize: encryptedBlob.length
+          blobSize: encryptedBlob.length,
+          keyVersion: wrapped.keyVersion
         });
       }
-      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, syncStatus: "synced" });
+      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, keyVersion: wrapped.keyVersion, syncStatus: "synced" });
       docKey.fill(0);
       if (isJson) {
         output({ status: "updated", id, field, value });
@@ -1810,7 +2192,7 @@ function registerDocCommands(program2) {
       if ((hasR2 || document.encryptedStorageId) && document.encryptedDocKey) {
         if (!isJson) process.stderr.write("Decrypting...\n");
         const { vaultKey } = getVaultKeys();
-        const docKey = unwrapDocumentKey(document.encryptedDocKey, vaultKey);
+        const docKey = unwrapDocumentKey(document.encryptedDocKey, document);
         fileBytes = decrypt(rawBytes, docKey);
         docKey.fill(0);
       } else {
@@ -1879,7 +2261,7 @@ function registerDocCommands(program2) {
         }
         process.exit(1);
       }
-      const hash = crypto3.createHash("sha256").update(contentBytes).digest("hex");
+      const hash = crypto4.createHash("sha256").update(contentBytes).digest("hex");
       const docId = hash;
       const existingDoc = getDocumentById(docId);
       if (existingDoc) {
@@ -1904,10 +2286,11 @@ function registerDocCommands(program2) {
       if (!isJson) process.stderr.write("Encrypting...\n");
       const { vaultKey } = getVaultKeys();
       const docKey = generateDocumentKey();
-      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const wrapped = wrapDocumentKey(docKey);
+      const wrappedDocKey = wrapped.encryptedDocKey;
       const now = Date.now();
       const config = loadConfig();
-      const vaultId = config.vaultId;
+      const vaultId = wrapped.spaceId ?? void 0;
       const localDoc = {
         id: docId,
         title: opts.title,
@@ -1922,6 +2305,8 @@ function registerDocCommands(program2) {
         owner: extracted.owner || "Unknown",
         mimeType: "text/markdown",
         encryptedDocKey: wrappedDocKey,
+        vaultId: wrapped.spaceId ?? void 0,
+        keyVersion: wrapped.keyVersion,
         dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
         status: "ready",
         createdAt: now,
@@ -1947,20 +2332,22 @@ function registerDocCommands(program2) {
       new Uint8Array(blobBuffer).set(encryptedBlob);
       const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
-      if (vaultId) {
+      if (wrapped.spaceId) {
         await convex.mutation(api.encryptedSync.upsertBlobByVault, {
-          vaultId,
+          vaultId: wrapped.spaceId,
           blobId: docId,
           encryptedBlob: blobBuffer,
           encryptedDocKey: keyBuffer,
-          blobSize: encryptedBlob.length
+          blobSize: encryptedBlob.length,
+          keyVersion: wrapped.keyVersion
         });
       } else {
         await convex.mutation(api.encryptedSync.upsertBlob, {
           blobId: docId,
           encryptedBlob: blobBuffer,
           encryptedDocKey: keyBuffer,
-          blobSize: encryptedBlob.length
+          blobSize: encryptedBlob.length,
+          keyVersion: wrapped.keyVersion
         });
       }
       upsertDocument(localDoc);
@@ -2060,7 +2447,7 @@ function registerDocCommands(program2) {
       const { vaultKey } = getVaultKeys();
       let docKey;
       if (localDoc.encryptedDocKey) {
-        docKey = unwrapDocumentKey(localDoc.encryptedDocKey, vaultKey);
+        docKey = unwrapDocumentKey(localDoc.encryptedDocKey, localDoc);
       } else {
         docKey = generateDocumentKey();
       }
@@ -2081,30 +2468,33 @@ function registerDocCommands(program2) {
         dateAdded: updatedDoc.dateAdded
       });
       const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
-      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const wrapped = wrapDocumentKey(docKey, updatedDoc.vaultId);
+      const wrappedDocKey = wrapped.encryptedDocKey;
       const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
       new Uint8Array(blobBuffer).set(encryptedBlob);
       const keyBuffer = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuffer).set(new Uint8Array(wrappedDocKey));
       const config = loadConfig();
-      const vaultId = config.vaultId;
-      if (vaultId) {
+      const vaultId = wrapped.spaceId ?? void 0;
+      if (wrapped.spaceId) {
         await convex.mutation(api.encryptedSync.upsertBlobByVault, {
-          vaultId,
+          vaultId: wrapped.spaceId,
           blobId: id,
           encryptedBlob: blobBuffer,
           encryptedDocKey: keyBuffer,
-          blobSize: encryptedBlob.length
+          blobSize: encryptedBlob.length,
+          keyVersion: wrapped.keyVersion
         });
       } else {
         await convex.mutation(api.encryptedSync.upsertBlob, {
           blobId: id,
           encryptedBlob: blobBuffer,
           encryptedDocKey: keyBuffer,
-          blobSize: encryptedBlob.length
+          blobSize: encryptedBlob.length,
+          keyVersion: wrapped.keyVersion
         });
       }
-      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey });
+      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, keyVersion: wrapped.keyVersion });
       docKey.fill(0);
       if (isJson) {
         output({ status: "updated", id, title: localDoc.title });
@@ -2156,7 +2546,7 @@ function registerDocCommands(program2) {
           const content = fileBuffer.toString("utf-8");
           const contentEncoded = new TextEncoder().encode(content);
           if (contentEncoded.byteLength > 200 * 1024) throw new Error("Content exceeds 200KB limit");
-          const hash2 = crypto3.createHash("sha256").update(contentEncoded).digest("hex");
+          const hash2 = crypto4.createHash("sha256").update(contentEncoded).digest("hex");
           const docId2 = hash2;
           const existingDoc = getDocumentById(docId2);
           if (existingDoc) {
@@ -2178,10 +2568,11 @@ function registerDocCommands(program2) {
           if (!isJson) process.stderr.write("Encrypting...\n");
           const { vaultKey: vaultKey2 } = getVaultKeys();
           const docKey2 = generateDocumentKey();
-          const wrappedDocKey2 = wrapDocumentKey(docKey2, vaultKey2);
+          const wrapped2 = wrapDocumentKey(docKey2);
+          const wrappedDocKey2 = wrapped2.encryptedDocKey;
           const now2 = Date.now();
           const config2 = loadConfig();
-          const vaultId2 = config2.vaultId;
+          const vaultId2 = wrapped2.spaceId ?? void 0;
           const localDoc2 = {
             id: docId2,
             title: extracted2.title || path4.basename(fileName, path4.extname(fileName)),
@@ -2196,6 +2587,8 @@ function registerDocCommands(program2) {
             owner: extracted2.owner || "Unknown",
             mimeType,
             encryptedDocKey: wrappedDocKey2,
+            vaultId: wrapped2.spaceId ?? void 0,
+            keyVersion: wrapped2.keyVersion,
             dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
             status: "ready",
             createdAt: now2,
@@ -2224,9 +2617,9 @@ function registerDocCommands(program2) {
           const keyBuffer2 = new ArrayBuffer(wrappedDocKey2.byteLength);
           new Uint8Array(keyBuffer2).set(new Uint8Array(wrappedDocKey2));
           if (vaultId2) {
-            await convex2.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: vaultId2, blobId: docId2, encryptedBlob: blobBuffer2, encryptedDocKey: keyBuffer2, blobSize: encryptedBlob2.length });
+            await convex2.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: vaultId2, blobId: docId2, encryptedBlob: blobBuffer2, encryptedDocKey: keyBuffer2, blobSize: encryptedBlob2.length, keyVersion: wrapped2.keyVersion });
           } else {
-            await convex2.mutation(api.encryptedSync.upsertBlob, { blobId: docId2, encryptedBlob: blobBuffer2, encryptedDocKey: keyBuffer2, blobSize: encryptedBlob2.length });
+            await convex2.mutation(api.encryptedSync.upsertBlob, { blobId: docId2, encryptedBlob: blobBuffer2, encryptedDocKey: keyBuffer2, blobSize: encryptedBlob2.length, keyVersion: wrapped2.keyVersion });
           }
           upsertDocument(localDoc2);
           docKey2.fill(0);
@@ -2244,7 +2637,7 @@ function registerDocCommands(program2) {
           }
           continue;
         }
-        const hash = crypto3.createHash("sha256").update(fileBytes).digest("hex");
+        const hash = crypto4.createHash("sha256").update(fileBytes).digest("hex");
         const docId = hash;
         if (!isJson) process.stderr.write("Uploading to server...\n");
         const convex = await authenticateConvexClient();
@@ -2286,10 +2679,11 @@ function registerDocCommands(program2) {
           await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
         } catch {
         }
-        const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+        const wrapped = wrapDocumentKey(docKey);
+        const wrappedDocKey = wrapped.encryptedDocKey;
         const now = Date.now();
         const config = loadConfig();
-        const vaultId = config.vaultId;
+        const vaultId = wrapped.spaceId ?? void 0;
         const localDoc = {
           id: docId,
           title: extracted.title || fileName,
@@ -2303,6 +2697,8 @@ function registerDocCommands(program2) {
           owner: extracted.owner || "Unknown",
           mimeType,
           encryptedDocKey: wrappedDocKey,
+          vaultId: wrapped.spaceId ?? void 0,
+          keyVersion: wrapped.keyVersion,
           dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
           status: "ready",
           createdAt: now,
@@ -2336,14 +2732,16 @@ function registerDocCommands(program2) {
             blobId: docId,
             encryptedBlob: blobBuffer,
             encryptedDocKey: keyBuffer,
-            blobSize: encryptedBlob.length
+            blobSize: encryptedBlob.length,
+            keyVersion: wrapped.keyVersion
           });
         } else {
           await convex.mutation(api.encryptedSync.upsertBlob, {
             blobId: docId,
             encryptedBlob: blobBuffer,
             encryptedDocKey: keyBuffer,
-            blobSize: encryptedBlob.length
+            blobSize: encryptedBlob.length,
+            keyVersion: wrapped.keyVersion
           });
         }
         if (!isJson) process.stderr.write("Uploading encrypted file to R2...\n");
@@ -2770,9 +3168,9 @@ init_database();
 init_crypto();
 init_config();
 init_constants();
-import crypto4 from "crypto";
+import crypto5 from "crypto";
 var REGISTRY_BLOB_ID = "__people_registry__";
-async function fetchRegistry(vaultKey) {
+async function fetchRegistry() {
   const convex = await authenticateConvexClient();
   const config = loadConfig();
   let blob;
@@ -2791,7 +3189,7 @@ async function fetchRegistry(vaultKey) {
   if (!blob) return { people: [] };
   try {
     const encDocKey = new Uint8Array(blob.encryptedDocKey);
-    const docKey = unwrapDocumentKey(encDocKey, vaultKey);
+    const docKey = unwrapDocumentKey(encDocKey, blob);
     const decrypted = decryptString(new Uint8Array(blob.encryptedBlob), docKey);
     docKey.fill(0);
     return JSON.parse(decrypted);
@@ -2799,33 +3197,16 @@ async function fetchRegistry(vaultKey) {
     return { people: [] };
   }
 }
-async function syncRegistry(registry, vaultKey) {
+async function syncRegistry(registry) {
   const convex = await authenticateConvexClient();
-  const config = loadConfig();
-  const docKey = new Uint8Array(crypto4.randomBytes(DOCUMENT_KEY_BYTES));
+  const docKey = new Uint8Array(crypto5.randomBytes(DOCUMENT_KEY_BYTES));
   const encryptedBlob = encryptString(JSON.stringify(registry), docKey);
-  const encryptedDocKey = encrypt(docKey, vaultKey);
+  await upsertEncryptedBlob(convex, {
+    blobId: REGISTRY_BLOB_ID,
+    docKey,
+    encryptedBlob
+  });
   docKey.fill(0);
-  const blobBuffer = new ArrayBuffer(encryptedBlob.byteLength);
-  new Uint8Array(blobBuffer).set(encryptedBlob);
-  const keyBuffer = new ArrayBuffer(encryptedDocKey.byteLength);
-  new Uint8Array(keyBuffer).set(encryptedDocKey);
-  if (config.vaultId) {
-    await convex.mutation(api.encryptedSync.upsertBlobByVault, {
-      vaultId: config.vaultId,
-      blobId: REGISTRY_BLOB_ID,
-      encryptedBlob: blobBuffer,
-      encryptedDocKey: keyBuffer,
-      blobSize: encryptedBlob.length
-    });
-  } else {
-    await convex.mutation(api.encryptedSync.upsertBlob, {
-      blobId: REGISTRY_BLOB_ID,
-      encryptedBlob: blobBuffer,
-      encryptedDocKey: keyBuffer,
-      blobSize: encryptedBlob.length
-    });
-  }
 }
 function registerPeopleCommands(program2) {
   const people = program2.command("people").description("People management & merge");
@@ -2899,8 +3280,7 @@ function registerPeopleCommands(program2) {
       }
       process.exit(1);
     }
-    const { vaultKey } = getVaultKeys();
-    const registry = await fetchRegistry(vaultKey);
+    const registry = await fetchRegistry();
     if (isJson) {
       output(registry.people.map((p) => ({
         id: p.id,
@@ -2930,8 +3310,7 @@ function registerPeopleCommands(program2) {
       }
       process.exit(1);
     }
-    const { vaultKey } = getVaultKeys();
-    const registry = await fetchRegistry(vaultKey);
+    const registry = await fetchRegistry();
     let person = registry.people.find(
       (p) => p.canonicalName.toUpperCase() === canonical.toUpperCase()
     );
@@ -2947,7 +3326,7 @@ function registerPeopleCommands(program2) {
     if (!person.aliases.some((a) => a.toUpperCase() === normalizedAlias.toUpperCase()) && person.canonicalName.toUpperCase() !== normalizedAlias.toUpperCase()) {
       person.aliases.push(normalizedAlias);
     }
-    await syncRegistry(registry, vaultKey);
+    await syncRegistry(registry);
     if (isJson) {
       output({ status: "merged", canonical: person.canonicalName, alias: normalizedAlias, totalAliases: person.aliases.length });
     } else {
@@ -3756,9 +4135,7 @@ async function ensureSynced() {
   await ensureUnlocked();
   if (hasSyncedThisSession) return;
   try {
-    const { vaultKey } = getVaultKeys();
-    const config = loadConfig();
-    await syncIncremental(vaultKey, config.vaultId);
+    await syncIncremental(getVaultKeys());
     hasSyncedThisSession = true;
   } catch {
     hasSyncedThisSession = true;
@@ -3948,7 +4325,7 @@ async function startMcpServer() {
       const { vaultKey } = getVaultKeys();
       let docKey;
       if (updatedDoc.encryptedDocKey) {
-        docKey = unwrapDocumentKey(updatedDoc.encryptedDocKey, vaultKey);
+        docKey = unwrapDocumentKey(updatedDoc.encryptedDocKey, updatedDoc);
       } else {
         docKey = generateDocumentKey();
       }
@@ -3969,18 +4346,19 @@ async function startMcpServer() {
         storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
         dateAdded: updatedDoc.dateAdded
       })), docKey);
-      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const wrapped = wrapDocumentKey(docKey, updatedDoc.vaultId);
+      const wrappedDocKey = wrapped.encryptedDocKey;
       const blobBuf = new ArrayBuffer(encryptedBlob.byteLength);
       new Uint8Array(blobBuf).set(encryptedBlob);
       const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
       const convex = await authenticateConvexClient();
-      if (config.vaultId) {
-        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: config.vaultId, blobId: id, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encryptedBlob.length });
+      if (wrapped.spaceId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: wrapped.spaceId, blobId: id, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encryptedBlob.length, keyVersion: wrapped.keyVersion });
       } else {
-        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: id, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encryptedBlob.length });
+        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: id, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encryptedBlob.length, keyVersion: wrapped.keyVersion });
       }
-      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, syncStatus: "synced" });
+      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, keyVersion: wrapped.keyVersion, syncStatus: "synced" });
       docKey.fill(0);
       return { content: [{ type: "text", text: JSON.stringify({ status: "updated", id, field, value }) }] };
     }
@@ -4017,7 +4395,7 @@ async function startMcpServer() {
       const config = loadConfig();
       let rawBytes;
       if (hasR2) {
-        const downloadInfo = await convex.action(api.r2Assets.requestFileDownloadUrl, { blobId: doc.id, vaultId: config.vaultId });
+        const downloadInfo = await convex.action(api.r2Assets.requestFileDownloadUrl, { blobId: doc.id, vaultId: doc.vaultId ?? config.vaultId });
         const response = await fetch(downloadInfo.url);
         if (!response.ok) return { content: [{ type: "text", text: JSON.stringify({ error: `R2 download failed: ${response.status}` }) }] };
         rawBytes = new Uint8Array(await response.arrayBuffer());
@@ -4031,7 +4409,7 @@ async function startMcpServer() {
       let fileBytes;
       if ((hasR2 || doc.encryptedStorageId) && doc.encryptedDocKey) {
         const { vaultKey } = getVaultKeys();
-        const docKey = unwrapDocumentKey(doc.encryptedDocKey, vaultKey);
+        const docKey = unwrapDocumentKey(doc.encryptedDocKey, doc);
         fileBytes = decrypt(rawBytes, docKey);
         docKey.fill(0);
       } else {
@@ -4055,13 +4433,13 @@ async function startMcpServer() {
     { full: z.boolean().default(false).describe("Force full sync") },
     async ({ full }) => {
       await ensureUnlocked();
-      const { vaultKey } = getVaultKeys();
+      const keys = getVaultKeys();
       const config = loadConfig();
       if (full || !config.lastSyncTimestamp) {
-        const count = await syncFull(vaultKey, config.vaultId);
+        const count = await syncFull(keys);
         return { content: [{ type: "text", text: JSON.stringify({ status: "synced", mode: "full", documents: count }) }] };
       } else {
-        const { count, deleted } = await syncIncremental(vaultKey, config.vaultId);
+        const { count, deleted } = await syncIncremental(keys);
         return { content: [{ type: "text", text: JSON.stringify({ status: "synced", mode: "incremental", updated: count, deleted }) }] };
       }
     }
@@ -4088,14 +4466,14 @@ async function startMcpServer() {
       await ensureUnlocked();
       const { default: fs6 } = await import("fs");
       const { default: path6 } = await import("path");
-      const crypto6 = await import("crypto");
+      const crypto7 = await import("crypto");
       if (!fs6.existsSync(filePath)) return { content: [{ type: "text", text: JSON.stringify({ error: "File not found" }) }] };
       const fileBuffer = fs6.readFileSync(filePath);
       const fileBytes = new Uint8Array(fileBuffer);
       const fileName = path6.basename(filePath);
       const ext = path6.extname(filePath).toLowerCase().slice(1);
       const mimeType = { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", heic: "image/heic" }[ext] ?? "application/octet-stream";
-      const hash = crypto6.createHash("sha256").update(fileBytes).digest("hex");
+      const hash = crypto7.createHash("sha256").update(fileBytes).digest("hex");
       const docId = hash;
       const convex = await authenticateConvexClient();
       const uploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
@@ -4117,11 +4495,12 @@ async function startMcpServer() {
         await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
       } catch {
       }
-      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const wrapped = wrapDocumentKey(docKey);
+      const wrappedDocKey = wrapped.encryptedDocKey;
       const now = Date.now();
       const config = loadConfig();
-      const vaultId = config.vaultId;
-      const localDoc = { id: docId, title: extracted.title || fileName, rawText: extracted.rawText || "", type: extracted.type || "generic", tags: extracted.tags || [], fields: extracted.fields || {}, organizations: extracted.organizations || [], mentions: extracted.mentions || [], embedding: extracted.embedding || void 0, owner: extracted.owner || "Unknown", mimeType, encryptedDocKey: wrappedDocKey, dateAdded: (/* @__PURE__ */ new Date()).toISOString(), status: "ready", createdAt: now, updatedAt: now, syncStatus: "synced" };
+      const vaultId = wrapped.spaceId ?? void 0;
+      const localDoc = { id: docId, title: extracted.title || fileName, rawText: extracted.rawText || "", type: extracted.type || "generic", tags: extracted.tags || [], fields: extracted.fields || {}, organizations: extracted.organizations || [], mentions: extracted.mentions || [], embedding: extracted.embedding || void 0, owner: extracted.owner || "Unknown", mimeType, encryptedDocKey: wrappedDocKey, vaultId: wrapped.spaceId ?? void 0, keyVersion: wrapped.keyVersion, dateAdded: (/* @__PURE__ */ new Date()).toISOString(), status: "ready", createdAt: now, updatedAt: now, syncStatus: "synced" };
       const docContent = JSON.stringify({ title: localDoc.title, rawText: localDoc.rawText, type: localDoc.type, tags: localDoc.tags, fields: localDoc.fields, organizations: localDoc.organizations, mentions: localDoc.mentions, owner: localDoc.owner, embedding: extracted.embedding || null, mimeType, fileName, fileHash: hash, dateAdded: localDoc.dateAdded });
       const encBlob = encrypt(new TextEncoder().encode(docContent), docKey);
       const blobBuf = new ArrayBuffer(encBlob.byteLength);
@@ -4129,9 +4508,9 @@ async function startMcpServer() {
       const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
       if (vaultId) {
-        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length, keyVersion: wrapped.keyVersion });
       } else {
-        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length, keyVersion: wrapped.keyVersion });
       }
       const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, { blobId: docId, vaultId: vaultId ?? void 0, mimeType: "application/octet-stream", size: encFileBytes.length });
       const r2Resp = await fetch(fileUploadInfo.url, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: encFileBytes });
@@ -4159,12 +4538,12 @@ async function startMcpServer() {
     },
     async ({ title, content, type, tags }) => {
       await ensureUnlocked();
-      const crypto6 = await import("crypto");
+      const crypto7 = await import("crypto");
       const contentBytes = new TextEncoder().encode(content);
       if (contentBytes.byteLength > 200 * 1024) {
         return { content: [{ type: "text", text: JSON.stringify({ error: "Content exceeds 200KB limit" }) }] };
       }
-      const hash = crypto6.createHash("sha256").update(contentBytes).digest("hex");
+      const hash = crypto7.createHash("sha256").update(contentBytes).digest("hex");
       const docId = hash;
       const existingDoc = getDocumentById(docId);
       if (existingDoc) {
@@ -4182,10 +4561,11 @@ async function startMcpServer() {
       }
       const { vaultKey } = getVaultKeys();
       const docKey = generateDocumentKey();
-      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const wrapped = wrapDocumentKey(docKey);
+      const wrappedDocKey = wrapped.encryptedDocKey;
       const now = Date.now();
       const config = loadConfig();
-      const vaultId = config.vaultId;
+      const vaultId = wrapped.spaceId ?? void 0;
       const localDoc = {
         id: docId,
         title,
@@ -4200,6 +4580,8 @@ async function startMcpServer() {
         owner: extracted.owner || "Unknown",
         mimeType: "text/markdown",
         encryptedDocKey: wrappedDocKey,
+        vaultId: wrapped.spaceId ?? void 0,
+        keyVersion: wrapped.keyVersion,
         dateAdded: (/* @__PURE__ */ new Date()).toISOString(),
         status: "ready",
         createdAt: now,
@@ -4226,9 +4608,9 @@ async function startMcpServer() {
       const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
       if (vaultId) {
-        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length, keyVersion: wrapped.keyVersion });
       } else {
-        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length, keyVersion: wrapped.keyVersion });
       }
       upsertDocument(localDoc);
       docKey.fill(0);
@@ -4255,7 +4637,7 @@ async function startMcpServer() {
       const { vaultKey } = getVaultKeys();
       let docKey;
       if (localDoc.encryptedDocKey) {
-        docKey = unwrapDocumentKey(localDoc.encryptedDocKey, vaultKey);
+        docKey = unwrapDocumentKey(localDoc.encryptedDocKey, localDoc);
       } else {
         docKey = generateDocumentKey();
       }
@@ -4285,18 +4667,19 @@ async function startMcpServer() {
         dateAdded: updatedDoc.dateAdded
       });
       const encBlob = encrypt(new TextEncoder().encode(docContentStr), docKey);
-      const wrappedDocKey = wrapDocumentKey(docKey, vaultKey);
+      const wrapped = wrapDocumentKey(docKey, updatedDoc.vaultId);
+      const wrappedDocKey = wrapped.encryptedDocKey;
       const blobBuf = new ArrayBuffer(encBlob.byteLength);
       new Uint8Array(blobBuf).set(encBlob);
       const keyBuf = new ArrayBuffer(wrappedDocKey.byteLength);
       new Uint8Array(keyBuf).set(new Uint8Array(wrappedDocKey));
       const config = loadConfig();
-      if (config.vaultId) {
-        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: config.vaultId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+      if (wrapped.spaceId) {
+        await convex.mutation(api.encryptedSync.upsertBlobByVault, { vaultId: wrapped.spaceId, blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length, keyVersion: wrapped.keyVersion });
       } else {
-        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length });
+        await convex.mutation(api.encryptedSync.upsertBlob, { blobId: docId, encryptedBlob: blobBuf, encryptedDocKey: keyBuf, blobSize: encBlob.length, keyVersion: wrapped.keyVersion });
       }
-      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey });
+      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, keyVersion: wrapped.keyVersion });
       docKey.fill(0);
       return { content: [{ type: "text", text: JSON.stringify({ status: "updated", id: docId, title: localDoc.title }) }] };
     }
@@ -4423,7 +4806,7 @@ import { spawn as spawn2 } from "child_process";
 import fs5 from "fs";
 import os4 from "os";
 import path5 from "path";
-import crypto5 from "crypto";
+import crypto6 from "crypto";
 var DEFAULT_PORT = 8797;
 var DEFAULT_PUBLIC_URL = "https://moivaultmcp.wiloop.io";
 var DEFAULT_DOWNLOAD_TTL_SECONDS = 15 * 60;
@@ -4634,7 +5017,7 @@ async function downloadDocument(id) {
   };
 }
 function issueDownloadToken(file, ttlSeconds) {
-  const token = crypto5.randomBytes(32).toString("base64url");
+  const token = crypto6.randomBytes(32).toString("base64url");
   const ttl = Math.max(60, Math.min(ttlSeconds || DEFAULT_DOWNLOAD_TTL_SECONDS, 3600));
   downloadTokens.set(token, { ...file, expiresAt: Date.now() + ttl * 1e3 });
   return token;
@@ -5155,6 +5538,7 @@ program.name("moivault").description("CLI for Vault \u2014 encrypted document ma
 registerAuthCommands(program);
 registerUnlockCommands(program);
 registerSyncCommands(program);
+registerSpacesCommand(program);
 registerDocCommands(program);
 registerSearchCommands(program);
 registerStatsCommand(program);
