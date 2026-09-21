@@ -4,10 +4,13 @@
 # Basic install:
 #   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash
 #
-# Install + authenticate (one-click setup):
+# Install + authenticate (one command, nothing to edit):
 #   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash -s -- \
-#     --payload '{"sessionCookie":"...","secretKey":"...","salt":"...","wrappedVaultKey":"..."}' \
-#     --password 'your-master-password'
+#     --payload '{"sessionCookie":"...","secretKey":"...","salt":"...","wrappedVaultKey":"...","muk":"..."}'
+#
+# The payload carries the derived unlock key (`muk`), so the master password is
+# never part of the command. `--password` is still accepted for payloads from
+# older builds of the app.
 
 set -e
 
@@ -231,10 +234,16 @@ if [ -n "$MASTER_PASSWORD" ]; then
   echo "  ✓ Password saved (auto-unlock enabled)"
 fi
 
-if [ -n "$AUTH_PAYLOAD" ] && [ -n "$MASTER_PASSWORD" ]; then
+# Sync on the payload alone. It used to also require --password, which is what
+# made the app hand out a command with a placeholder in it; the payload now
+# carries the unlock key, so there is nothing else to wait for.
+if [ -n "$AUTH_PAYLOAD" ]; then
   echo "  → Syncing vault..."
-  "$BIN_DIR/moivault" sync 2>/dev/null
-  echo "  ✓ Vault synced"
+  if "$BIN_DIR/moivault" sync 2>/dev/null; then
+    echo "  ✓ Vault synced"
+  else
+    echo "  ✗ Sync failed — run: moivault sync"
+  fi
 fi
 
 echo ""
@@ -247,10 +256,8 @@ if [ -n "$AUTH_PAYLOAD" ]; then
   echo "    moivault context 'health risks'"
 else
   echo "  Get started:"
-  echo "    1. Open Vault app → Settings → Developer → Link CLI"
-  echo "    2. Copy the command and run it"
-  echo "    3. moivault auth save-password 'your-password'"
-  echo "    4. moivault sync"
-  echo "    5. moivault search 'passport'"
+  echo "    1. Open moi vault → Settings → CLI & Agents"
+  echo "    2. Copy the install command and paste it here"
+  echo "    3. moivault search 'passport'"
 fi
 echo ""

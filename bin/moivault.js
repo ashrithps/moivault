@@ -832,6 +832,9 @@ async function storeLoginCredentials(payload) {
   await keychain.set("secret_key", payload.secretKey);
   await keychain.set("salt", payload.salt);
   await keychain.set("wrapped_vault_key", payload.wrappedVaultKey);
+  if (payload.muk) {
+    await keychain.set("muk", payload.muk);
+  }
   if (payload.masterPassword) {
     await keychain.set("master_password", payload.masterPassword);
   }
@@ -884,7 +887,7 @@ function startLoginServer() {
 }
 function registerAuthCommands(program2) {
   const auth = program2.command("auth").description("Authentication management");
-  auth.command("login").description("Log in via QR code from Vault mobile app").option("--payload <json>", "Paste login payload JSON directly (skip QR)").option("--cookie <cookie>", "Session cookie string (for scripted setup)").option("--secret-key <key>", "Secret key base64").option("--salt <salt>", "Salt base64").option("--wrapped-key <key>", "Wrapped vault key base64").option("--vault-id <id>", "Vault ID").action(async (opts) => {
+  auth.command("login").description("Log in via QR code from Vault mobile app").option("--payload <json>", "Paste login payload JSON directly (skip QR)").option("--cookie <cookie>", "Session cookie string (for scripted setup)").option("--secret-key <key>", "Secret key base64").option("--salt <salt>", "Salt base64").option("--wrapped-key <key>", "Wrapped vault key base64").option("--muk <key>", "Master unlock key base64 \u2014 unlocks without a password").option("--vault-id <id>", "Vault ID").action(async (opts) => {
     const isJson = shouldOutputJson(program2.opts());
     if (opts.payload) {
       try {
@@ -912,6 +915,7 @@ function registerAuthCommands(program2) {
         secretKey: opts.secretKey,
         salt: opts.salt,
         wrappedVaultKey: opts.wrappedKey,
+        muk: opts.muk,
         vaultId: opts.vaultId
       });
       if (isJson) {
@@ -971,6 +975,8 @@ function registerAuthCommands(program2) {
     await keychain.delete("secret_key");
     await keychain.delete("salt");
     await keychain.delete("wrapped_vault_key");
+    await keychain.delete("muk");
+    await keychain.delete("master_password");
     if (shouldOutputJson(program2.opts())) {
       output({ status: "logged_out" });
     } else {
@@ -993,11 +999,14 @@ function registerAuthCommands(program2) {
     const hasSecretKey = !!await keychain.get("secret_key");
     const hasSalt = !!await keychain.get("salt");
     const hasWrappedKey = !!await keychain.get("wrapped_vault_key");
+    const hasMuk = !!await keychain.get("muk");
+    const hasSavedPassword = !!await keychain.get("master_password");
     const status = {
       authenticated: hasToken,
       secretKeyImported: hasSecretKey,
       vaultMetaSynced: hasSalt && hasWrappedKey,
       readyToUnlock: hasToken && hasSecretKey && hasSalt && hasWrappedKey,
+      autoUnlock: hasMuk ? "linked key" : hasSavedPassword ? "saved password" : "none",
       convexUrl: CONVEX_URL,
       vaultId: config.vaultId ?? null,
       lastSync: config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : null
@@ -1009,6 +1018,7 @@ function registerAuthCommands(program2) {
       console.log(`  Secret key:        ${hasSecretKey ? "imported" : "not set"}`);
       console.log(`  Vault metadata:    ${hasSalt && hasWrappedKey ? "synced" : "not synced"}`);
       console.log(`  Ready to unlock:   ${status.readyToUnlock ? "yes" : "no"}`);
+      console.log(`  Auto-unlock:       ${status.autoUnlock}`);
       console.log(`  Convex URL:        ${CONVEX_URL}`);
       console.log(`  Vault ID:          ${config.vaultId ?? "not set"}`);
       console.log(`  Last sync:         ${config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : "never"}`);
@@ -1249,15 +1259,18 @@ async function unlockVault(masterPassword) {
   if (!saltB64) {
     throw new Error("Salt not found \u2014 run `vault sync` to fetch vault metadata");
   }
+  const secretKey = base64ToBytes(secretKeyB64);
+  const salt = base64ToBytes(saltB64);
+  const muk = await deriveMUK(masterPassword, secretKey, salt);
+  return unlockVaultWithMUK(muk);
+}
+async function unlockVaultWithMUK(muk) {
+  const keychain = getKeychain();
   const wrappedVaultKeyB64 = await keychain.get("wrapped_vault_key");
   if (!wrappedVaultKeyB64) {
     throw new Error("Wrapped vault key not found \u2014 run `vault sync` to fetch vault metadata");
   }
-  const secretKey = base64ToBytes(secretKeyB64);
-  const salt = base64ToBytes(saltB64);
-  const wrappedVaultKey = base64ToBytes(wrappedVaultKeyB64);
-  const muk = await deriveMUK(masterPassword, secretKey, salt);
-  const vaultKey = decrypt(wrappedVaultKey, muk);
+  const vaultKey = decrypt(base64ToBytes(wrappedVaultKeyB64), muk);
   currentKeys = {
     muk,
     vaultKey,
@@ -1265,6 +1278,26 @@ async function unlockVault(masterPassword) {
     keyRing: KeyRing.legacy(loadConfig().vaultId ?? null, vaultKey)
   };
   return currentKeys;
+}
+async function autoUnlock() {
+  if (isVaultUnlocked()) return true;
+  const envPassword = process.env.VAULT_MASTER_PASSWORD;
+  if (envPassword) {
+    await unlockVault(envPassword);
+    return true;
+  }
+  const keychain = getKeychain();
+  const mukB64 = await keychain.get("muk");
+  if (mukB64) {
+    await unlockVaultWithMUK(base64ToBytes(mukB64));
+    return true;
+  }
+  const savedPassword = await keychain.get("master_password");
+  if (savedPassword) {
+    await unlockVault(savedPassword);
+    return true;
+  }
+  return false;
 }
 function applyKeyRing(keys, ring, identity) {
   keys.keyRing = ring;
@@ -1644,6 +1677,20 @@ function registerUnlockCommands(program2) {
         if (!isJson) console.error("Failed to fetch vault metadata:", err.message);
         process.exit(1);
       }
+    }
+    try {
+      if (await autoUnlock()) {
+        openDatabase(program2.opts().db);
+        if (isJson) {
+          output({ status: "unlocked", method: "linked_key" });
+        } else {
+          console.log("Vault unlocked.");
+        }
+        return;
+      }
+    } catch (err) {
+      const message = err.message;
+      if (!isJson) console.error(`Stored key did not open the vault: ${message}`);
     }
     let password = process.env.VAULT_MASTER_PASSWORD;
     if (!password) {
@@ -4122,13 +4169,11 @@ function fallbackTextExtraction(content, forcedType) {
 }
 async function ensureUnlocked() {
   if (isVaultUnlocked()) return;
-  let password = process.env.VAULT_MASTER_PASSWORD;
-  if (!password) {
-    const keychain = getKeychain();
-    password = await keychain.get("master_password") ?? void 0;
+  if (!await autoUnlock()) {
+    throw new Error(
+      "Vault is locked \u2014 re-link this machine from the app (Settings \u2192 CLI & Agents), or set VAULT_MASTER_PASSWORD"
+    );
   }
-  if (!password) throw new Error("Vault is locked \u2014 set VAULT_MASTER_PASSWORD or run moivault auth save-password");
-  await unlockVault(password);
   openDatabase();
 }
 async function ensureSynced() {
@@ -5513,19 +5558,13 @@ program.name("moivault").description("CLI for Vault \u2014 encrypted document ma
   const skipAutoUnlock = parentName === "auth" || commandName === "unlock" || commandName === "lock";
   if (skipAutoUnlock) return;
   if (!isVaultUnlocked()) {
-    let password = process.env.VAULT_MASTER_PASSWORD;
-    if (!password) {
-      const keychain = getKeychain();
-      password = await keychain.get("master_password") ?? void 0;
-    }
-    if (password) {
-      try {
-        await unlockVault(password);
+    try {
+      if (await autoUnlock()) {
         openDatabase(thisCommand.opts().db);
-      } catch (err) {
-        console.error(`Auto-unlock failed: ${err.message}`);
-        process.exit(1);
       }
+    } catch (err) {
+      console.error(`Auto-unlock failed: ${err.message}`);
+      process.exit(1);
     }
   }
   if (isVaultUnlocked()) {

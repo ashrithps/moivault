@@ -1,2 +1,5 @@
 node_modules/
 .vault-cli/
+
+# graphify generated knowledge graph (regenerate with `graphify update .`)
+graphify-out/

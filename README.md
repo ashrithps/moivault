@@ -12,15 +12,19 @@ curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.s
 
 ### One-click install with auth (fully automated)
 
-Get the auth payload from the Vault app (Settings → Developer → Link CLI), then:
+Open the Vault app → Settings → CLI & Agents → **Copy install command**, then paste
+it into a terminal. It looks like this, and needs no editing:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash -s -- \
-  --payload '<json from app>' \
-  --password 'your-master-password'
+  --payload '<json from app>'
 ```
 
-This installs, authenticates, saves password, and syncs — ready to use immediately.
+This installs, authenticates and syncs — ready to use immediately.
+
+The payload carries `muk`, the key your master password derives, so the CLI unlocks
+without ever holding the password itself. `--password 'your-master-password'` is still
+accepted, for payloads from older builds of the app.
 
 Requires Node.js 20+. Installs to `~/.moivault/` with a launcher at `~/.local/bin/moivault`.
 
@@ -28,22 +32,21 @@ Auto-installs agent skills (Claude Code, Codex, Cursor, etc.) and Claude Desktop
 
 ## Quick Start
 
-1. **Login** — Open the Vault mobile app → Settings → Developer → Link CLI. Copy the command and run it:
+1. **Login** — Open the Vault mobile app → Settings → CLI & Agents. Copy the install
+   command and run it. To authenticate an existing install instead:
    ```bash
    moivault auth login --payload '<json from app>'
    ```
+   The payload carries the unlock key, so every later command unlocks on its own.
+   On a machine linked by an older app build, run
+   `moivault auth save-password 'your-master-password'` once instead.
 
-2. **Save password** for auto-unlock:
-   ```bash
-   moivault auth save-password 'your-master-password'
-   ```
-
-3. **Sync** documents from server:
+2. **Sync** documents from server:
    ```bash
    moivault sync
    ```
 
-4. **Search** your vault:
+3. **Search** your vault:
    ```bash
    moivault search "passport"
    moivault search "medical report" --mode vector   # semantic search
