@@ -1165,6 +1165,70 @@ import crypto4 from "crypto";
 init_config();
 init_database();
 init_crypto();
+
+// src/core/client.ts
+var KNOWN = {
+  "claude-desktop": "Claude Desktop",
+  "claude-code": "Claude Code",
+  "claude-web": "Claude.ai",
+  chatgpt: "ChatGPT",
+  codex: "Codex",
+  cursor: "Cursor",
+  copilot: "Copilot",
+  gemini: "Gemini",
+  windsurf: "Windsurf",
+  terminal: "Terminal"
+};
+var CLIENT_KEYS = Object.keys(KNOWN);
+function parseIntendedClient(value) {
+  const key = (value ?? "").trim().toLowerCase();
+  if (!key || key === "any") return null;
+  if (!(key in KNOWN)) {
+    throw new Error(`Unknown agent "${value}". Use one of: ${CLIENT_KEYS.join(", ")} (or "any").`);
+  }
+  return known(key);
+}
+function clientDisplay(key) {
+  return KNOWN[key] ?? key;
+}
+function slugify(name) {
+  return name.normalize("NFKD").replace(new RegExp("\\p{M}", "gu"), "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+}
+function known(key) {
+  return { key, display: KNOWN[key] };
+}
+function normalizeClientName(name, remote = false) {
+  const raw = (name ?? "").trim();
+  if (!raw) return null;
+  const n = raw.toLowerCase();
+  if (n.includes("claude-code") || n.includes("claude code")) return known("claude-code");
+  if (n.includes("claude")) {
+    if (remote) return known("claude-web");
+    return known("claude-desktop");
+  }
+  if (n.includes("codex")) return known("codex");
+  if (n.includes("openai") || n.includes("chatgpt")) return known("chatgpt");
+  if (n.includes("cursor")) return known("cursor");
+  if (n.includes("copilot") || n.includes("vscode") || n.includes("visual studio code")) return known("copilot");
+  if (n.includes("gemini")) return known("gemini");
+  if (n.includes("windsurf")) return known("windsurf");
+  const key = slugify(raw);
+  if (!key) return null;
+  return { key, display: raw };
+}
+function detectClientFromEnv(env = process.env) {
+  const has = (prefix) => Object.keys(env).some((k) => k.startsWith(prefix));
+  if (env.CLAUDECODE) return known("claude-code");
+  if (has("CURSOR_")) return known("cursor");
+  if (has("CODEX_")) return known("codex");
+  if (env.GEMINI_CLI) return known("gemini");
+  return known("terminal");
+}
+function resolveClient(clientInfoName, remote = false) {
+  return normalizeClientName(clientInfoName, remote) ?? (remote ? { key: "remote", display: "Remote agent" } : detectClientFromEnv());
+}
+
+// src/core/connection.ts
 var LEGACY_SECRET_KEYS = [
   "session_cookie",
   "muk",
@@ -1209,6 +1273,16 @@ function canWriteSpace(spaceId) {
 function canDeleteSpace(spaceId) {
   if (!spaceId || !state) return false;
   return state.grants.some((g) => g.spaceId === spaceId && g.canDelete === true);
+}
+function intendedClient() {
+  const key = loadConfig().connection?.intendedClient;
+  return key ? { key, display: clientDisplay(key) } : null;
+}
+function adoptIntendedClient(key) {
+  const config = loadConfig();
+  if (!config.connection || (config.connection.intendedClient ?? null) === key) return;
+  const { intendedClient: _previous, ...rest } = config.connection;
+  saveConfig({ ...config, connection: key ? { ...rest, intendedClient: key } : rest });
 }
 function getPreset() {
   return state?.preset ?? null;
@@ -1347,7 +1421,7 @@ async function waitForApproval(pending2, opts = {}) {
     await new Promise((r) => setTimeout(r, interval));
   }
 }
-async function storePairing(pending2) {
+async function storePairing(pending2, intendedClient2) {
   const kc = getKeychain();
   await kc.set("connection_id", pending2.connectionId);
   await kc.set("credential", pending2.credential);
@@ -1364,7 +1438,8 @@ async function storePairing(pending2) {
       label: pending2.label,
       hostname: os2.hostname(),
       fingerprint: pending2.fingerprint,
-      pairedAt: Date.now()
+      pairedAt: Date.now(),
+      ...intendedClient2 ? { intendedClient: intendedClient2 } : {}
     }
   });
   secretsCache = void 0;
@@ -1441,311 +1516,6 @@ async function disconnectMachine(message = DISCONNECTED_MESSAGE) {
 `);
     process.exit(1);
   }
-}
-
-// src/cli/commands/auth.ts
-async function storeLoginCredentials(payload) {
-  const keychain = getKeychain();
-  if (!payload.sessionCookie || !payload.secretKey || !payload.salt || !payload.wrappedVaultKey) {
-    throw new Error("Invalid login payload \u2014 missing required fields (sessionCookie, secretKey, salt, wrappedVaultKey)");
-  }
-  await keychain.set("session_cookie", payload.sessionCookie);
-  await keychain.set("secret_key", payload.secretKey);
-  await keychain.set("salt", payload.salt);
-  await keychain.set("wrapped_vault_key", payload.wrappedVaultKey);
-  if (payload.muk) {
-    await keychain.set("muk", payload.muk);
-  }
-  if (payload.masterPassword) {
-    await keychain.set("master_password", payload.masterPassword);
-  }
-  if (payload.vaultId) {
-    updateConfig({ vaultId: payload.vaultId });
-  }
-}
-function startLoginServer() {
-  return new Promise((resolve) => {
-    let resolvePayload;
-    const payloadPromise = new Promise((res) => {
-      resolvePayload = res;
-    });
-    const server = http.createServer((req, res) => {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-      if (req.method === "OPTIONS") {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-      if (req.method === "POST" && req.url === "/auth/callback") {
-        let body = "";
-        req.on("data", (chunk) => {
-          body += chunk;
-        });
-        req.on("end", () => {
-          try {
-            const payload = JSON.parse(body);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "ok" }));
-            resolvePayload(payload);
-          } catch {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Invalid JSON" }));
-          }
-        });
-        return;
-      }
-      res.writeHead(404);
-      res.end();
-    });
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      resolve({ port, server, payloadPromise });
-    });
-  });
-}
-function registerAuthCommands(program2) {
-  const auth = program2.command("auth").description("Authentication management");
-  auth.command("pair").description("Connect this machine to your phone with a pairing code from the app").argument("<token>", "Pairing code from moi vault \u2192 Settings \u2192 AI agents \u2192 Connect").option("--timeout <minutes>", "How long to wait for approval", "10").action(async (token, opts) => {
-    const isJson = shouldOutputJson(program2.opts());
-    const say = (line) => {
-      if (isJson) process.stderr.write(`${line}
-`);
-      else console.log(line);
-    };
-    let pending2;
-    try {
-      pending2 = await claimPairing(token, generateKeyPair);
-    } catch (err) {
-      const msg = err.message;
-      if (isJson) {
-        output({ error: msg, code: err instanceof AgentHttpError ? err.code : null });
-      } else {
-        console.error(`  \u2717 ${msg}`);
-      }
-      process.exit(1);
-    }
-    say("");
-    say(`  This machine:  ${pending2.label}`);
-    say(`  Fingerprint:   ${pending2.fingerprint}`);
-    say("");
-    say("  Approve on your phone. Check the code matches.");
-    say("");
-    const timeoutMs = Math.max(1, Number(opts.timeout) || 10) * 60 * 1e3;
-    let dots = 0;
-    try {
-      await waitForApproval(pending2, {
-        timeoutMs,
-        onTick: () => {
-          if (!isJson && process.stdout.isTTY) {
-            dots = (dots + 1) % 4;
-            process.stdout.write(`\r  Waiting${".".repeat(dots)}${" ".repeat(3 - dots)}`);
-          }
-        }
-      });
-    } catch (err) {
-      if (!isJson && process.stdout.isTTY) process.stdout.write("\r");
-      const msg = err.message;
-      if (isJson) {
-        output({ error: msg, code: err instanceof AgentHttpError ? err.code : null });
-      } else {
-        console.error(`  \u2717 ${msg}`);
-      }
-      process.exit(1);
-    }
-    await storePairing(pending2);
-    if (!isJson && process.stdout.isTTY) process.stdout.write("\r            \r");
-    if (isJson) {
-      output({ status: "paired", connectionId: pending2.connectionId, fingerprint: pending2.fingerprint, label: pending2.label });
-    } else {
-      console.log("  \u2713 Connected. This machine sees only what you allowed on your phone.");
-      console.log("    Revoke it any time from the app: Settings \u2192 AI agents.");
-      console.log("");
-      console.log("  Next: moivault sync");
-    }
-  });
-  auth.command("login").description("Log in via QR code from Vault mobile app").option("--payload <json>", "Paste login payload JSON directly (skip QR)").option("--cookie <cookie>", "Session cookie string (for scripted setup)").option("--secret-key <key>", "Secret key base64").option("--salt <salt>", "Salt base64").option("--wrapped-key <key>", "Wrapped vault key base64").option("--muk <key>", "Master unlock key base64 \u2014 unlocks without a password").option("--vault-id <id>", "Vault ID").action(async (opts) => {
-    const isJson = shouldOutputJson(program2.opts());
-    if (opts.payload) {
-      try {
-        const payload = JSON.parse(opts.payload);
-        await storeLoginCredentials(payload);
-        if (isJson) {
-          output({ status: "authenticated", method: "payload" });
-        } else {
-          console.log("Authenticated successfully.");
-        }
-        return;
-      } catch (err) {
-        const msg = `Invalid payload: ${err.message}`;
-        if (isJson) {
-          output({ error: msg });
-        } else {
-          console.error(msg);
-        }
-        process.exit(1);
-      }
-    }
-    if (opts.cookie && opts.secretKey && opts.salt && opts.wrappedKey) {
-      await storeLoginCredentials({
-        sessionCookie: opts.cookie,
-        secretKey: opts.secretKey,
-        salt: opts.salt,
-        wrappedVaultKey: opts.wrappedKey,
-        muk: opts.muk,
-        vaultId: opts.vaultId
-      });
-      if (isJson) {
-        output({ status: "authenticated", method: "flags" });
-      } else {
-        console.log("Authenticated successfully.");
-      }
-      return;
-    }
-    if (!process.stdin.isTTY) {
-      if (isJson) {
-        output({ error: "QR login requires interactive terminal. Use --payload or individual flags instead." });
-      } else {
-        console.error("QR login requires interactive terminal.");
-        console.error("Use: vault auth login --payload '<json>' for non-interactive login.");
-      }
-      process.exit(1);
-    }
-    const { port, server, payloadPromise } = await startLoginServer();
-    const callbackUrl = `http://127.0.0.1:${port}/auth/callback`;
-    console.log("");
-    console.log("  Open the Vault app \u2192 Settings \u2192 Link CLI");
-    console.log("");
-    console.log("  Callback URL (for the app to send credentials to):");
-    console.log(`  ${callbackUrl}`);
-    console.log("");
-    console.log("  Or scan this QR code with the Vault app:");
-    console.log("");
-    console.log(`  \u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510`);
-    console.log(`  \u2502  vault-cli://login?port=${port}`.padEnd(44) + "\u2502");
-    console.log(`  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518`);
-    console.log("");
-    console.log("  Waiting for login from mobile app...");
-    const timeout = setTimeout(() => {
-      console.error("\n  Login timed out. Try again.");
-      server.close();
-      process.exit(1);
-    }, 5 * 60 * 1e3);
-    try {
-      const payload = await payloadPromise;
-      clearTimeout(timeout);
-      server.close();
-      await storeLoginCredentials(payload);
-      console.log("\n  Authenticated successfully!");
-      console.log("  Run `vault unlock` to unlock your vault.");
-    } catch (err) {
-      clearTimeout(timeout);
-      server.close();
-      console.error(`
-  Login failed: ${err.message}`);
-      process.exit(1);
-    }
-  });
-  auth.command("logout").description("Clear all credentials from this machine (revoke from your phone to cut access server-side)").action(async () => {
-    const keychain = getKeychain();
-    const wasPaired = !!await loadConnectionSecrets();
-    await keychain.delete("connection_id");
-    await keychain.delete("credential");
-    await keychain.delete("conn_private_key");
-    await keychain.delete("conn_public_key");
-    await keychain.delete("serve_secret");
-    if (wasPaired) {
-      const { connection: _connection, ...rest } = loadConfig();
-      saveConfig(rest);
-    }
-    await keychain.delete("session_cookie");
-    await keychain.delete("secret_key");
-    await keychain.delete("salt");
-    await keychain.delete("wrapped_vault_key");
-    await keychain.delete("muk");
-    await keychain.delete("master_password");
-    if (shouldOutputJson(program2.opts())) {
-      output({ status: "logged_out", revokeOnPhone: wasPaired });
-    } else {
-      console.log("Logged out. All credentials cleared from this machine.");
-      if (wasPaired) {
-        console.log("The connection still shows on your phone until you revoke it there: Settings \u2192 AI agents.");
-      }
-    }
-  });
-  auth.command("save-password").description("Save master password for auto-unlock (stored locally)").argument("<password>", "Master password").action(async (password) => {
-    const keychain = getKeychain();
-    await keychain.set("master_password", password);
-    if (shouldOutputJson(program2.opts())) {
-      output({ status: "password_saved" });
-    } else {
-      console.log("Master password saved. Vault will auto-unlock on every command.");
-    }
-  });
-  auth.command("status").description("Show authentication and vault status").action(async () => {
-    const keychain = getKeychain();
-    const config = loadConfig();
-    const connection = await loadConnectionSecrets();
-    if (connection) {
-      const status2 = {
-        mode: "connection",
-        connectionId: connection.connectionId,
-        label: config.connection?.label ?? null,
-        fingerprint: fingerprint(connection.keyPair.publicKey),
-        pairedAt: config.connection?.pairedAt ? new Date(config.connection.pairedAt).toISOString() : null,
-        lastSeenAt: config.lastSeenAt ? new Date(config.lastSeenAt).toISOString() : null,
-        secretStore: getKeychainBackendName(),
-        convexUrl: CONVEX_URL,
-        lastSync: config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : null
-      };
-      if (shouldOutputJson(program2.opts())) {
-        output(status2);
-      } else {
-        console.log(`  Mode:              agent connection (revocable from your phone)`);
-        console.log(`  Machine:           ${status2.label ?? "unknown"}`);
-        console.log(`  Fingerprint:       ${status2.fingerprint}`);
-        console.log(`  Paired:            ${status2.pairedAt ?? "unknown"}`);
-        console.log(`  Last token:        ${status2.lastSeenAt ?? "never"}`);
-        console.log(`  Secrets stored in: ${status2.secretStore}`);
-        console.log(`  Last sync:         ${status2.lastSync ?? "never"}`);
-      }
-      return;
-    }
-    const hasToken = !!await keychain.get("session_cookie");
-    const hasSecretKey = !!await keychain.get("secret_key");
-    const hasSalt = !!await keychain.get("salt");
-    const hasWrappedKey = !!await keychain.get("wrapped_vault_key");
-    const hasMuk = !!await keychain.get("muk");
-    const hasSavedPassword = !!await keychain.get("master_password");
-    const status = {
-      mode: hasToken ? "legacy" : "none",
-      authenticated: hasToken,
-      secretKeyImported: hasSecretKey,
-      vaultMetaSynced: hasSalt && hasWrappedKey,
-      readyToUnlock: hasToken && hasSecretKey && hasSalt && hasWrappedKey,
-      autoUnlock: hasMuk ? "linked key" : hasSavedPassword ? "saved password" : "none",
-      convexUrl: CONVEX_URL,
-      vaultId: config.vaultId ?? null,
-      lastSync: config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : null,
-      secretStore: getKeychainBackendName()
-    };
-    if (shouldOutputJson(program2.opts())) {
-      output(status);
-    } else {
-      console.log(`  Mode:              ${hasToken ? "legacy install (not revocable \u2014 reconnect with `moivault auth pair`)" : "not connected"}`);
-      console.log(`  Authenticated:     ${hasToken ? "yes" : "no"}`);
-      console.log(`  Secret key:        ${hasSecretKey ? "imported" : "not set"}`);
-      console.log(`  Vault metadata:    ${hasSalt && hasWrappedKey ? "synced" : "not synced"}`);
-      console.log(`  Ready to unlock:   ${status.readyToUnlock ? "yes" : "no"}`);
-      console.log(`  Auto-unlock:       ${status.autoUnlock}`);
-      console.log(`  Convex URL:        ${CONVEX_URL}`);
-      console.log(`  Vault ID:          ${config.vaultId ?? "not set"}`);
-      console.log(`  Last sync:         ${config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : "never"}`);
-      console.log(`  Secrets stored in: ${status.secretStore}`);
-    }
-  });
 }
 
 // src/core/vault.ts
@@ -2098,8 +1868,8 @@ function computeDocPaths(docs, ctx) {
   }
   return paths;
 }
-function displayPath(path7) {
-  return PATH_DISPLAY_PREFIX + path7;
+function displayPath(path8) {
+  return PATH_DISPLAY_PREFIX + path8;
 }
 function normalizePathQuery(input) {
   let p = String(input ?? "").trim().replace(/\\/g, "/");
@@ -2325,6 +2095,7 @@ async function refreshConnectionRing(convex, keys) {
     context,
     grants: res.grants ?? []
   });
+  if (res.intendedClient !== void 0) adoptIntendedClient(res.intendedClient);
   const ring = KeyRing.fromMemberships(res.rows ?? [], keyPair);
   applyConnectionRing(keys, ring);
   const directory = /* @__PURE__ */ new Map();
@@ -2513,6 +2284,337 @@ async function fetchAndStoreVaultMeta(vaultId) {
   if (meta.vaultId) {
     updateConfig({ vaultId: meta.vaultId });
   }
+}
+
+// src/cli/commands/auth.ts
+async function storeLoginCredentials(payload) {
+  const keychain = getKeychain();
+  if (!payload.sessionCookie || !payload.secretKey || !payload.salt || !payload.wrappedVaultKey) {
+    throw new Error("Invalid login payload \u2014 missing required fields (sessionCookie, secretKey, salt, wrappedVaultKey)");
+  }
+  await keychain.set("session_cookie", payload.sessionCookie);
+  await keychain.set("secret_key", payload.secretKey);
+  await keychain.set("salt", payload.salt);
+  await keychain.set("wrapped_vault_key", payload.wrappedVaultKey);
+  if (payload.muk) {
+    await keychain.set("muk", payload.muk);
+  }
+  if (payload.masterPassword) {
+    await keychain.set("master_password", payload.masterPassword);
+  }
+  if (payload.vaultId) {
+    updateConfig({ vaultId: payload.vaultId });
+  }
+}
+function startLoginServer() {
+  return new Promise((resolve) => {
+    let resolvePayload;
+    const payloadPromise = new Promise((res) => {
+      resolvePayload = res;
+    });
+    const server = http.createServer((req, res) => {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      if (req.method === "POST" && req.url === "/auth/callback") {
+        let body = "";
+        req.on("data", (chunk) => {
+          body += chunk;
+        });
+        req.on("end", () => {
+          try {
+            const payload = JSON.parse(body);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "ok" }));
+            resolvePayload(payload);
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Invalid JSON" }));
+          }
+        });
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      resolve({ port, server, payloadPromise });
+    });
+  });
+}
+async function refreshFromServer() {
+  try {
+    const attempt = (async () => {
+      if (await autoUnlock()) await authenticateConvexClient();
+    })();
+    await Promise.race([attempt, new Promise((r) => setTimeout(r, 4e3).unref())]);
+  } catch {
+  }
+}
+function registerAuthCommands(program2) {
+  const auth = program2.command("auth").description("Authentication management");
+  auth.command("pair").description("Connect this machine to your phone with a pairing code from the app").argument("<token>", "Pairing code from moi vault \u2192 Settings \u2192 AI agents \u2192 Connect").option("--timeout <minutes>", "How long to wait for approval", "10").option("--agent <key>", `The agent this machine is for: ${CLIENT_KEYS.join(", ")}, or any (default)`).action(async (token, opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    const say = (line) => {
+      if (isJson) process.stderr.write(`${line}
+`);
+      else console.log(line);
+    };
+    let intended;
+    try {
+      intended = parseIntendedClient(opts.agent);
+    } catch (err) {
+      const msg = err.message;
+      if (isJson) {
+        output({ error: msg, code: "UNKNOWN_AGENT" });
+      } else {
+        console.error(`  \u2717 ${msg}`);
+      }
+      process.exit(1);
+    }
+    let pending2;
+    try {
+      pending2 = await claimPairing(token, generateKeyPair);
+    } catch (err) {
+      const msg = err.message;
+      if (isJson) {
+        output({ error: msg, code: err instanceof AgentHttpError ? err.code : null });
+      } else {
+        console.error(`  \u2717 ${msg}`);
+      }
+      process.exit(1);
+    }
+    say("");
+    say(`  This machine:  ${pending2.label}`);
+    if (intended) say(`  For:           ${intended.display}`);
+    say(`  Fingerprint:   ${pending2.fingerprint}`);
+    say("");
+    say("  Approve on your phone. Check the code matches.");
+    say("");
+    const timeoutMs = Math.max(1, Number(opts.timeout) || 10) * 60 * 1e3;
+    let dots = 0;
+    try {
+      await waitForApproval(pending2, {
+        timeoutMs,
+        onTick: () => {
+          if (!isJson && process.stdout.isTTY) {
+            dots = (dots + 1) % 4;
+            process.stdout.write(`\r  Waiting${".".repeat(dots)}${" ".repeat(3 - dots)}`);
+          }
+        }
+      });
+    } catch (err) {
+      if (!isJson && process.stdout.isTTY) process.stdout.write("\r");
+      const msg = err.message;
+      if (isJson) {
+        output({ error: msg, code: err instanceof AgentHttpError ? err.code : null });
+      } else {
+        console.error(`  \u2717 ${msg}`);
+      }
+      process.exit(1);
+    }
+    await storePairing(pending2, intended?.key);
+    if (!isJson && process.stdout.isTTY) process.stdout.write("\r            \r");
+    if (isJson) {
+      output({ status: "paired", connectionId: pending2.connectionId, fingerprint: pending2.fingerprint, label: pending2.label, intendedClient: intended?.key ?? null });
+    } else {
+      console.log("  \u2713 Connected. This machine sees only what you allowed on your phone.");
+      console.log("    Revoke it any time from the app: Settings \u2192 AI agents.");
+      console.log("");
+      console.log("  Next: moivault sync");
+    }
+  });
+  auth.command("login").description("Log in via QR code from Vault mobile app").option("--payload <json>", "Paste login payload JSON directly (skip QR)").option("--cookie <cookie>", "Session cookie string (for scripted setup)").option("--secret-key <key>", "Secret key base64").option("--salt <salt>", "Salt base64").option("--wrapped-key <key>", "Wrapped vault key base64").option("--muk <key>", "Master unlock key base64 \u2014 unlocks without a password").option("--vault-id <id>", "Vault ID").action(async (opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    if (opts.payload) {
+      try {
+        const payload = JSON.parse(opts.payload);
+        await storeLoginCredentials(payload);
+        if (isJson) {
+          output({ status: "authenticated", method: "payload" });
+        } else {
+          console.log("Authenticated successfully.");
+        }
+        return;
+      } catch (err) {
+        const msg = `Invalid payload: ${err.message}`;
+        if (isJson) {
+          output({ error: msg });
+        } else {
+          console.error(msg);
+        }
+        process.exit(1);
+      }
+    }
+    if (opts.cookie && opts.secretKey && opts.salt && opts.wrappedKey) {
+      await storeLoginCredentials({
+        sessionCookie: opts.cookie,
+        secretKey: opts.secretKey,
+        salt: opts.salt,
+        wrappedVaultKey: opts.wrappedKey,
+        muk: opts.muk,
+        vaultId: opts.vaultId
+      });
+      if (isJson) {
+        output({ status: "authenticated", method: "flags" });
+      } else {
+        console.log("Authenticated successfully.");
+      }
+      return;
+    }
+    if (!process.stdin.isTTY) {
+      if (isJson) {
+        output({ error: "QR login requires interactive terminal. Use --payload or individual flags instead." });
+      } else {
+        console.error("QR login requires interactive terminal.");
+        console.error("Use: vault auth login --payload '<json>' for non-interactive login.");
+      }
+      process.exit(1);
+    }
+    const { port, server, payloadPromise } = await startLoginServer();
+    const callbackUrl = `http://127.0.0.1:${port}/auth/callback`;
+    console.log("");
+    console.log("  Open the Vault app \u2192 Settings \u2192 Link CLI");
+    console.log("");
+    console.log("  Callback URL (for the app to send credentials to):");
+    console.log(`  ${callbackUrl}`);
+    console.log("");
+    console.log("  Or scan this QR code with the Vault app:");
+    console.log("");
+    console.log(`  \u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510`);
+    console.log(`  \u2502  vault-cli://login?port=${port}`.padEnd(44) + "\u2502");
+    console.log(`  \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518`);
+    console.log("");
+    console.log("  Waiting for login from mobile app...");
+    const timeout = setTimeout(() => {
+      console.error("\n  Login timed out. Try again.");
+      server.close();
+      process.exit(1);
+    }, 5 * 60 * 1e3);
+    try {
+      const payload = await payloadPromise;
+      clearTimeout(timeout);
+      server.close();
+      await storeLoginCredentials(payload);
+      console.log("\n  Authenticated successfully!");
+      console.log("  Run `vault unlock` to unlock your vault.");
+    } catch (err) {
+      clearTimeout(timeout);
+      server.close();
+      console.error(`
+  Login failed: ${err.message}`);
+      process.exit(1);
+    }
+  });
+  auth.command("logout").description("Clear all credentials from this machine (revoke from your phone to cut access server-side)").action(async () => {
+    const keychain = getKeychain();
+    const wasPaired = !!await loadConnectionSecrets();
+    await keychain.delete("connection_id");
+    await keychain.delete("credential");
+    await keychain.delete("conn_private_key");
+    await keychain.delete("conn_public_key");
+    await keychain.delete("serve_secret");
+    if (wasPaired) {
+      const { connection: _connection, ...rest } = loadConfig();
+      saveConfig(rest);
+    }
+    await keychain.delete("session_cookie");
+    await keychain.delete("secret_key");
+    await keychain.delete("salt");
+    await keychain.delete("wrapped_vault_key");
+    await keychain.delete("muk");
+    await keychain.delete("master_password");
+    if (shouldOutputJson(program2.opts())) {
+      output({ status: "logged_out", revokeOnPhone: wasPaired });
+    } else {
+      console.log("Logged out. All credentials cleared from this machine.");
+      if (wasPaired) {
+        console.log("The connection still shows on your phone until you revoke it there: Settings \u2192 AI agents.");
+      }
+    }
+  });
+  auth.command("save-password").description("Save master password for auto-unlock (stored locally)").argument("<password>", "Master password").action(async (password) => {
+    const keychain = getKeychain();
+    await keychain.set("master_password", password);
+    if (shouldOutputJson(program2.opts())) {
+      output({ status: "password_saved" });
+    } else {
+      console.log("Master password saved. Vault will auto-unlock on every command.");
+    }
+  });
+  auth.command("status").description("Show authentication and vault status").action(async () => {
+    const keychain = getKeychain();
+    const connection = await loadConnectionSecrets();
+    if (connection) {
+      await refreshFromServer();
+      const config2 = loadConfig();
+      const status2 = {
+        mode: "connection",
+        connectionId: connection.connectionId,
+        label: config2.connection?.label ?? null,
+        intendedClient: config2.connection?.intendedClient ?? null,
+        fingerprint: fingerprint(connection.keyPair.publicKey),
+        pairedAt: config2.connection?.pairedAt ? new Date(config2.connection.pairedAt).toISOString() : null,
+        lastSeenAt: config2.lastSeenAt ? new Date(config2.lastSeenAt).toISOString() : null,
+        secretStore: getKeychainBackendName(),
+        convexUrl: CONVEX_URL,
+        lastSync: config2.lastSyncTimestamp ? new Date(config2.lastSyncTimestamp).toISOString() : null
+      };
+      if (shouldOutputJson(program2.opts())) {
+        output(status2);
+      } else {
+        console.log(`  Mode:              agent connection (revocable from your phone)`);
+        console.log(`  Machine:           ${status2.label ?? "unknown"}`);
+        console.log(`  For:               ${status2.intendedClient ? clientDisplay(status2.intendedClient) : "any agent on this machine"}`);
+        console.log(`  Fingerprint:       ${status2.fingerprint}`);
+        console.log(`  Paired:            ${status2.pairedAt ?? "unknown"}`);
+        console.log(`  Last token:        ${status2.lastSeenAt ?? "never"}`);
+        console.log(`  Secrets stored in: ${status2.secretStore}`);
+        console.log(`  Last sync:         ${status2.lastSync ?? "never"}`);
+      }
+      return;
+    }
+    const config = loadConfig();
+    const hasToken = !!await keychain.get("session_cookie");
+    const hasSecretKey = !!await keychain.get("secret_key");
+    const hasSalt = !!await keychain.get("salt");
+    const hasWrappedKey = !!await keychain.get("wrapped_vault_key");
+    const hasMuk = !!await keychain.get("muk");
+    const hasSavedPassword = !!await keychain.get("master_password");
+    const status = {
+      mode: hasToken ? "legacy" : "none",
+      authenticated: hasToken,
+      secretKeyImported: hasSecretKey,
+      vaultMetaSynced: hasSalt && hasWrappedKey,
+      readyToUnlock: hasToken && hasSecretKey && hasSalt && hasWrappedKey,
+      autoUnlock: hasMuk ? "linked key" : hasSavedPassword ? "saved password" : "none",
+      convexUrl: CONVEX_URL,
+      vaultId: config.vaultId ?? null,
+      lastSync: config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : null,
+      secretStore: getKeychainBackendName()
+    };
+    if (shouldOutputJson(program2.opts())) {
+      output(status);
+    } else {
+      console.log(`  Mode:              ${hasToken ? "legacy install (not revocable \u2014 reconnect with `moivault auth pair`)" : "not connected"}`);
+      console.log(`  Authenticated:     ${hasToken ? "yes" : "no"}`);
+      console.log(`  Secret key:        ${hasSecretKey ? "imported" : "not set"}`);
+      console.log(`  Vault metadata:    ${hasSalt && hasWrappedKey ? "synced" : "not synced"}`);
+      console.log(`  Ready to unlock:   ${status.readyToUnlock ? "yes" : "no"}`);
+      console.log(`  Auto-unlock:       ${status.autoUnlock}`);
+      console.log(`  Convex URL:        ${CONVEX_URL}`);
+      console.log(`  Vault ID:          ${config.vaultId ?? "not set"}`);
+      console.log(`  Last sync:         ${config.lastSyncTimestamp ? new Date(config.lastSyncTimestamp).toISOString() : "never"}`);
+      console.log(`  Secrets stored in: ${status.secretStore}`);
+    }
+  });
 }
 
 // src/cli/commands/unlock.ts
@@ -2746,8 +2848,9 @@ function registerSpacesCommand(program2) {
       const cardDocs = getContextCard()?.docs.length ?? null;
       const heldIds2 = new Set(full.map((f) => f.spaceId));
       const ask = (getManifest()?.spaces ?? []).filter((s) => !heldIds2.has(s.spaceId)).map((s) => ({ spaceId: s.spaceId, name: s.name, kind: s.kind }));
+      const intended = intendedClient();
       if (isJson) {
-        output({ mode: "connection", preset, contextCardDocuments: cardDocs, full, ask });
+        output({ mode: "connection", preset, intendedClient: intended?.key ?? null, contextCardDocuments: cardDocs, full, ask });
         return;
       }
       const presetLine = {
@@ -2755,6 +2858,7 @@ function registerSpacesCommand(program2) {
         standard: `Standard \u2014 titles, types and dates only${cardDocs !== null ? ` (${cardDocs} documents on the context card)` : ""}; contents on request`,
         private: "Private \u2014 nothing until you approve a request"
       };
+      console.log(`For:    ${intended?.display ?? "any agent on this machine"}`);
       console.log(`Preset: ${presetLine[preset ?? "private"]}
 `);
       console.log("Shared in full (synced to this machine):");
@@ -2994,56 +3098,6 @@ async function commitDelete(args) {
   return { status: "pending_approval", requestId: result.requestId, dropId: result.dropId };
 }
 var PENDING_APPROVAL_MESSAGE = "Proposed on the user's phone. Nothing is saved until they approve it \u2014 check with vault_request_status.";
-
-// src/core/client.ts
-var KNOWN = {
-  "claude-desktop": "Claude Desktop",
-  "claude-code": "Claude Code",
-  "claude-web": "Claude.ai",
-  chatgpt: "ChatGPT",
-  codex: "Codex",
-  cursor: "Cursor",
-  copilot: "Copilot",
-  gemini: "Gemini",
-  windsurf: "Windsurf",
-  terminal: "Terminal"
-};
-function slugify(name) {
-  return name.normalize("NFKD").replace(new RegExp("\\p{M}", "gu"), "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-}
-function known(key) {
-  return { key, display: KNOWN[key] };
-}
-function normalizeClientName(name, remote = false) {
-  const raw = (name ?? "").trim();
-  if (!raw) return null;
-  const n = raw.toLowerCase();
-  if (n.includes("claude-code") || n.includes("claude code")) return known("claude-code");
-  if (n.includes("claude")) {
-    if (remote) return known("claude-web");
-    return known("claude-desktop");
-  }
-  if (n.includes("codex")) return known("codex");
-  if (n.includes("openai") || n.includes("chatgpt")) return known("chatgpt");
-  if (n.includes("cursor")) return known("cursor");
-  if (n.includes("copilot") || n.includes("vscode") || n.includes("visual studio code")) return known("copilot");
-  if (n.includes("gemini")) return known("gemini");
-  if (n.includes("windsurf")) return known("windsurf");
-  const key = slugify(raw);
-  if (!key) return null;
-  return { key, display: raw };
-}
-function detectClientFromEnv(env = process.env) {
-  const has = (prefix) => Object.keys(env).some((k) => k.startsWith(prefix));
-  if (env.CLAUDECODE) return known("claude-code");
-  if (has("CURSOR_")) return known("cursor");
-  if (has("CODEX_")) return known("codex");
-  if (env.GEMINI_CLI) return known("gemini");
-  return known("terminal");
-}
-function resolveClient(clientInfoName, remote = false) {
-  return normalizeClientName(clientInfoName, remote) ?? (remote ? { key: "remote", display: "Remote agent" } : detectClientFromEnv());
-}
 
 // src/cli/commands/doc.ts
 function requireUnlocked(isJson) {
@@ -5292,8 +5346,8 @@ function buildPathIndex() {
   for (const [id, p] of byId) byPath.set(p, id);
   return { byId, byPath, rows };
 }
-function resolvePath(index2, path7) {
-  return index2.byPath.get(normalizePathQuery(path7)) ?? null;
+function resolvePath(index2, path8) {
+  return index2.byPath.get(normalizePathQuery(path8)) ?? null;
 }
 
 // src/cli/commands/ls.ts
@@ -5360,6 +5414,145 @@ init_database();
 init_config();
 init_database();
 init_crypto();
+
+// src/core/auditDetail.ts
+import path6 from "path";
+var SAFE_STRING_ARGS = /* @__PURE__ */ new Set([
+  "query",
+  "path",
+  "id",
+  "docId",
+  "blobId",
+  "requestId",
+  "spaceId",
+  "type",
+  "mode",
+  "kind",
+  "filter",
+  "name",
+  "hint",
+  "field",
+  "title",
+  "area",
+  "city",
+  "cuisine",
+  "placeType",
+  "brand",
+  "category",
+  "course",
+  "dietary",
+  "platform",
+  "difficulty"
+]);
+var SAFE_LIST_ARGS = /* @__PURE__ */ new Set(["blobIds", "ids"]);
+var MAX_DETAIL_BYTES = 2048;
+var MAX_ERROR_CHARS = 200;
+function clip(s, n) {
+  return s.length > n ? `${s.slice(0, n - 1)}\u2026` : s;
+}
+function redactArgs(raw, stringLimit = 200, listLimit = 50) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const args = {};
+  const omitted = [];
+  for (const [key, value] of Object.entries(raw)) {
+    if (value === void 0 || value === null) continue;
+    if (typeof value === "number" || typeof value === "boolean") {
+      args[key] = value;
+    } else if (typeof value === "string" && SAFE_STRING_ARGS.has(key)) {
+      args[key] = clip(value, stringLimit);
+    } else if (Array.isArray(value) && SAFE_LIST_ARGS.has(key)) {
+      args[key] = value.filter((v) => typeof v === "string").slice(0, listLimit).map((v) => clip(v, 64));
+    } else if (typeof value === "string" && key === "filePath") {
+      args.fileName = clip(path6.basename(value), stringLimit);
+    } else {
+      omitted.push(key);
+    }
+  }
+  if (omitted.length > 0) args.omitted = omitted.sort();
+  return args;
+}
+function buildAuditDetail(rawArgs, extra = {}) {
+  const tail = {};
+  if (typeof extra.resultCount === "number") tail.resultCount = extra.resultCount;
+  if (extra.error) tail.error = clip(extra.error, MAX_ERROR_CHARS);
+  for (const [s, l] of [[200, 50], [64, 10], [24, 3]]) {
+    const detail = { args: redactArgs(rawArgs, s, l), ...tail };
+    if (Buffer.byteLength(JSON.stringify(detail)) <= MAX_DETAIL_BYTES) return detail;
+  }
+  const keys = rawArgs && typeof rawArgs === "object" ? Object.keys(rawArgs).slice(0, 20) : [];
+  return { args: { truncated: true, keys }, ...tail };
+}
+function sealAuditDetail(detail) {
+  if (!getManifest()?.userPublicKey) return void 0;
+  try {
+    return sealJsonToUser(detail);
+  } catch {
+    return void 0;
+  }
+}
+
+// src/core/activity.ts
+var REPORT_TIMEOUT_MS = 2e3;
+async function reportActivity(report) {
+  const convex = await authenticateConvexClient();
+  const sealedDetail = sealAuditDetail(buildAuditDetail(report.args, { resultCount: report.resultCount, error: report.error }));
+  await convex.mutation(api.agentActivity.record, {
+    client: report.client,
+    tool: report.tool.slice(0, 64),
+    docIds: report.docIds.slice(0, 200),
+    result: report.error ? "error" : "ok",
+    ...report.sensitive ? { sensitive: true } : {},
+    ...sealedDetail ? { sealedDetail } : {}
+  });
+}
+async function recordCliActivity(tool, docIds, extra = {}) {
+  if (!connectionModeKnown()) return;
+  try {
+    const report = reportActivity({ client: detectClientFromEnv().key, tool, docIds, ...extra });
+    await Promise.race([report, new Promise((r) => setTimeout(r, REPORT_TIMEOUT_MS).unref())]);
+  } catch {
+  }
+}
+var CommandExit = class extends Error {
+  constructor(code) {
+    super(`exit ${code}`);
+    this.code = code;
+    this.name = "CommandExit";
+  }
+};
+var lastPrintedError = null;
+function lastCommandError() {
+  return lastPrintedError;
+}
+function interceptCommandFailure() {
+  const realExit = process.exit;
+  const realError = console.error;
+  const realLog = console.log;
+  console.error = (...a) => {
+    if (typeof a[0] === "string") lastPrintedError = a[0];
+    realError(...a);
+  };
+  console.log = (...a) => {
+    if (typeof a[0] === "string" && a[0].startsWith("{") && a[0].includes('"error"')) {
+      try {
+        const e = JSON.parse(a[0]).error;
+        if (typeof e === "string") lastPrintedError = e;
+      } catch {
+      }
+    }
+    realLog(...a);
+  };
+  process.exit = ((code) => {
+    const n = Number(code ?? 0);
+    if (n === 0) return realExit(0);
+    throw new CommandExit(n);
+  });
+  return () => {
+    process.exit = realExit;
+    console.error = realError;
+    console.log = realLog;
+  };
+}
 
 // src/core/browse.ts
 function usesContextCard() {
@@ -5485,7 +5678,7 @@ function listGrantedDocs(client2) {
 }
 
 // src/mcp/server.ts
-var MCP_SERVER_VERSION = "0.3.0";
+var MCP_SERVER_VERSION = "0.3.1";
 var stagedDropFiles = /* @__PURE__ */ new Map();
 var hasSyncedThisSession = false;
 function errorMessage(error) {
@@ -5576,20 +5769,35 @@ function docIdsFromResult(result) {
     return [];
   }
 }
-function recordActivity(client2, tool, docIds, sensitive = false) {
-  if (!connectionModeKnown()) return;
-  void (async () => {
-    try {
-      const convex = await authenticateConvexClient();
-      await convex.mutation(api.agentActivity.record, {
-        client: client2.key,
-        tool: tool.slice(0, 64),
-        docIds,
-        ...sensitive ? { sensitive: true } : {}
-      });
-    } catch {
+function resultCountOf(result) {
+  const text = result?.content?.[0]?.text;
+  if (typeof text !== "string" || !/^[\[{]/.test(text.trimStart())) return void 0;
+  try {
+    const value = JSON.parse(text);
+    if (Array.isArray(value)) return value.length;
+    for (const k of ["results", "entries", "documents", "docs", "items"]) {
+      if (Array.isArray(value?.[k])) return value[k].length;
     }
-  })();
+  } catch {
+  }
+  return void 0;
+}
+function resultErrorOf(result) {
+  const r = result;
+  const text = r?.content?.[0]?.text ?? "";
+  if (r?.isError) return text || "error";
+  if (!/^\{/.test(text.trimStart()) || !text.includes('"error"')) return void 0;
+  try {
+    const e = JSON.parse(text).error;
+    return typeof e === "string" ? e : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function recordActivity(client2, tool, docIds, extra = {}) {
+  if (!connectionModeKnown()) return;
+  reportActivity({ client: client2.key, tool, docIds, ...extra }).catch(() => {
+  });
 }
 var CONTENT_TOOLS = /* @__PURE__ */ new Set([
   "vault_doc_get",
@@ -5682,15 +5890,22 @@ function createMcpServer(options = {}) {
     const handler = args[args.length - 1];
     args[args.length - 1] = async (...callArgs) => {
       const argIds = docIdsFromArgs(callArgs[0]);
+      const args2 = callArgs.length > 1 ? callArgs[0] : void 0;
       try {
         const result = await handler(...callArgs);
         const client2 = clientOf();
         const docIds = [.../* @__PURE__ */ new Set([...argIds, ...docIdsFromResult(result)])].slice(0, 200);
-        const read = !result?.isError && !/"status": "not_shared"|"error":/.test(result?.content?.[0]?.text ?? "");
-        recordActivity(client2, name, docIds, read && isSensitiveRead(name, docIds, client2));
+        const error = resultErrorOf(result);
+        const read = !error && !/"status": "not_shared"|"error":/.test(result?.content?.[0]?.text ?? "");
+        recordActivity(client2, name, docIds, {
+          sensitive: read && isSensitiveRead(name, docIds, client2),
+          args: args2,
+          resultCount: error ? void 0 : resultCountOf(result),
+          error
+        });
         return result;
       } catch (err) {
-        recordActivity(clientOf(), name, argIds);
+        recordActivity(clientOf(), name, argIds, { args: args2, error: errorMessage(err) });
         throw err;
       }
     };
@@ -5892,11 +6107,11 @@ function createMcpServer(options = {}) {
       value: z.string().describe("New value (for tags: comma-separated)"),
       reason: z.string().optional().describe("Why, in a sentence \u2014 shown to the user if approval is needed")
     },
-    async ({ id: rawId, path: path7, field, value, reason }) => {
+    async ({ id: rawId, path: path8, field, value, reason }) => {
       await ensureConnectionState();
-      const id = resolveDocRef({ id: rawId, path: path7 });
+      const id = resolveDocRef({ id: rawId, path: path8 });
       const doc = id ? getDocumentById(id) : null;
-      if (!id || !doc) return notFound({ id: rawId, path: path7 });
+      if (!id || !doc) return notFound({ id: rawId, path: path8 });
       const direct = writeGoesDirect(doc.vaultId, false);
       const parsed = field === "tags" ? value.split(",").map((t) => t.trim()) : value;
       let updatedDoc;
@@ -5936,11 +6151,11 @@ function createMcpServer(options = {}) {
       ...docRefShape,
       reason: z.string().optional().describe("Why, in a sentence \u2014 shown to the user if approval is needed")
     },
-    async ({ id: rawId, path: path7, reason }) => {
+    async ({ id: rawId, path: path8, reason }) => {
       await ensureConnectionState();
-      const id = resolveDocRef({ id: rawId, path: path7 });
+      const id = resolveDocRef({ id: rawId, path: path8 });
       const doc = id ? getDocumentById(id) : null;
-      if (!id || !doc) return notFound({ id: rawId, path: path7 });
+      if (!id || !doc) return notFound({ id: rawId, path: path8 });
       const convex = await authenticateConvexClient();
       const outcome = await commitDelete({ convex, doc, client: clientOf(), tool: "vault_doc_delete", reason });
       if (outcome.status === "pending_approval") return pendingResult(outcome, { id, title: doc.title });
@@ -6000,13 +6215,13 @@ function createMcpServer(options = {}) {
         fileBytes = rawBytes;
       }
       const { default: fs7 } = await import("fs");
-      const { default: path7 } = await import("path");
+      const { default: path8 } = await import("path");
       const { default: os7 } = await import("os");
       const mime = doc.mimeType ?? doc.fileAssetMimeType;
       const ext = mime ? { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[mime] ?? "bin" : "bin";
       const safeName = (doc.title || "document").replace(/[/\\:*?"<>|]/g, "_");
-      const finalPath = outputPath || path7.join(os7.homedir(), "Downloads", `${safeName}.${ext}`);
-      const dir = path7.dirname(finalPath);
+      const finalPath = outputPath || path8.join(os7.homedir(), "Downloads", `${safeName}.${ext}`);
+      const dir = path8.dirname(finalPath);
       if (!fs7.existsSync(dir)) fs7.mkdirSync(dir, { recursive: true });
       fs7.writeFileSync(finalPath, fileBytes);
       return json({ status: "downloaded", id, path: finalPath, size: fileBytes.length, title: doc.title });
@@ -6050,14 +6265,14 @@ function createMcpServer(options = {}) {
     async ({ filePath }) => {
       await ensureConnectionState();
       const { default: fs7 } = await import("fs");
-      const { default: path7 } = await import("path");
+      const { default: path8 } = await import("path");
       const crypto10 = await import("crypto");
       if (!fs7.existsSync(filePath)) return json({ error: "File not found" });
       const direct = writeGoesDirect(void 0, true);
       const fileBuffer = fs7.readFileSync(filePath);
       const fileBytes = new Uint8Array(fileBuffer);
-      const fileName = path7.basename(filePath);
-      const ext = path7.extname(filePath).toLowerCase().slice(1);
+      const fileName = path8.basename(filePath);
+      const ext = path8.extname(filePath).toLowerCase().slice(1);
       const mimeType = { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", heic: "image/heic" }[ext] ?? "application/octet-stream";
       const hash = crypto10.createHash("sha256").update(fileBytes).digest("hex");
       const docId = hash;
@@ -6268,13 +6483,13 @@ ${args.content}` });
       content: z.string().describe("New markdown/text content"),
       reason: z.string().optional().describe("Why, in a sentence \u2014 shown to the user if approval is needed")
     },
-    async ({ docId: rawId, path: path7, content, reason }) => {
+    async ({ docId: rawId, path: path8, content, reason }) => {
       await ensureConnectionState();
       const contentBytes = new TextEncoder().encode(content);
       if (contentBytes.byteLength > 200 * 1024) return json({ error: "Content exceeds 200KB limit" });
-      const docId = resolveDocRef({ id: rawId, path: path7 });
+      const docId = resolveDocRef({ id: rawId, path: path8 });
       const localDoc = docId ? getDocumentById(docId) : null;
-      if (!docId || !localDoc) return notFound({ id: rawId, path: path7 });
+      if (!docId || !localDoc) return notFound({ id: rawId, path: path8 });
       const convex = await authenticateConvexClient();
       const extracted = await convex.action(api.proxy.processText, { textContent: content, fileName: localDoc.title });
       const docKey = localDoc.encryptedDocKey && localDoc.encryptedDocKey.length > 0 ? unwrapDocumentKey(localDoc.encryptedDocKey, localDoc) : generateDocumentKey();
@@ -6344,10 +6559,10 @@ ${args.content}` });
     "vault_ls",
     "List a folder of the vault like a filesystem: vault/<space>/<person>/<file>. Start at 'vault/'. On a file path, returns that file's summary.",
     { path: z.string().default("vault/").describe("Folder or file path, e.g. vault/ or vault/family/priya") },
-    async ({ path: path7 }) => {
+    async ({ path: path8 }) => {
       await ensureSynced();
       const index2 = getBrowseIndex();
-      const query = normalizePathQuery(path7);
+      const query = normalizePathQuery(path8);
       const fileId = index2.byPath.get(query);
       if (fileId) {
         const row = index2.rowById.get(fileId);
@@ -6400,10 +6615,10 @@ ${args.content}` });
       depth: z.number().int().min(1).max(3).default(2).describe("1 = spaces, 2 = people, 3 = files"),
       path: z.string().optional().describe("Start below this folder instead of the root")
     },
-    async ({ depth, path: path7 }) => {
+    async ({ depth, path: path8 }) => {
       await ensureSynced();
       const index2 = getBrowseIndex();
-      const root = normalizePathQuery(path7);
+      const root = normalizePathQuery(path8);
       const prefix = root ? `${root}/` : "";
       const tree = { children: /* @__PURE__ */ new Map(), count: 0 };
       for (const [id, p] of index2.byId) {
@@ -6531,6 +6746,7 @@ ${args.content}` });
       }
       const granted = new Map(listGrantedDocs(client2.key).map((d) => [d.id, d]));
       const secrets = await loadConnectionSecrets();
+      const intended = intendedClient();
       const preset = getPreset() ?? "private";
       const presetWords = {
         full: "Full \u2014 you can read every space the user shared, and create or edit documents directly. Deleting a document is proposed to the user unless they allowed deletes. Opening a sensitive document (IDs, medical, tax, bank\u2026) sends them a notice.",
@@ -6544,6 +6760,9 @@ ${args.content}` });
         contextCard: getContextCard() ? { documents: getContextCard().docs.length, generatedAt: new Date(getContextCard().generatedAt).toISOString() } : null,
         agent: client2.display,
         client: client2.key,
+        intendedAgent: intended ? { client: intended.key, display: intended.display } : null,
+        // The user's own shell is never out of place (the server exempts it too).
+        ...intended && intended.key !== client2.key && client2.key !== "terminal" ? { mismatch: `This connection was set up for ${intended.display}. You can keep working, but the user's phone notes that ${client2.display} used it and may ask them to allow or block you.` } : {},
         machine: loadConfig().connection?.label ?? null,
         connectionId: secrets?.connectionId ?? null,
         fullSpaces: (manifest?.spaces ?? []).filter((s) => s.mode === "full").map((s) => ({ spaceId: s.spaceId, name: s.name, kind: s.kind, canWrite: canWrite.get(s.spaceId) ?? false, canDelete: canDelete.get(s.spaceId) ?? false })),
@@ -6763,7 +6982,7 @@ import http2 from "http";
 import { spawn as spawn2 } from "child_process";
 import fs6 from "fs";
 import os6 from "os";
-import path6 from "path";
+import path7 from "path";
 import crypto8 from "crypto";
 var DEFAULT_PORT = 8797;
 var DEFAULT_PUBLIC_URL = "https://moivaultmcp.wiloop.io";
@@ -6778,7 +6997,7 @@ var nextId = 1;
 var pending = /* @__PURE__ */ new Map();
 var downloadTokens = /* @__PURE__ */ new Map();
 function inferContentType(filePath) {
-  const ext = path6.extname(filePath).toLowerCase();
+  const ext = path7.extname(filePath).toLowerCase();
   if (ext === ".pdf") return "application/pdf";
   if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
   if (ext === ".png") return "image/png";
@@ -6802,7 +7021,7 @@ function safeFilename(name) {
   return (name || "document").replace(/[/\\:*?"<>|\r\n]/g, "_");
 }
 function headerFilename(name, filePath) {
-  const ext = path6.extname(filePath);
+  const ext = path7.extname(filePath);
   const base = safeFilename(name).replace(/[^\x20-\x7E]/g, "_").trim() || "document";
   return `${base}${ext}`;
 }
@@ -6960,8 +7179,8 @@ async function downloadDocument(id) {
   const meta = await callTool("vault_doc_get", { id });
   if (meta?.error) throw Object.assign(new Error(meta.error), { statusCode: 404 });
   const ext = extensionForMime(meta?.mimeType);
-  const tmpDir = fs6.mkdtempSync(path6.join(os6.tmpdir(), "moivault-rest-"));
-  const outputPath = path6.join(tmpDir, `${safeFilename(id)}.${ext}`);
+  const tmpDir = fs6.mkdtempSync(path7.join(os6.tmpdir(), "moivault-rest-"));
+  const outputPath = path7.join(tmpDir, `${safeFilename(id)}.${ext}`);
   const result = await callTool("vault_doc_download", { id, outputPath }, 18e4);
   if (result?.error) throw Object.assign(new Error(result.error), { statusCode: 404 });
   if (!result?.path) throw new Error("download did not return a path");
@@ -6990,7 +7209,7 @@ function cleanupDownloads() {
     } catch {
     }
     try {
-      fs6.rmdirSync(path6.dirname(entry.path));
+      fs6.rmdirSync(path7.dirname(entry.path));
     } catch {
     }
   }
@@ -7007,9 +7226,9 @@ async function uploadFromUrl(sourceUrl) {
   const arrayBuffer = await response.arrayBuffer();
   if (arrayBuffer.byteLength > MAX_UPLOAD_BYTES) throw Object.assign(new Error("sourceUrl file too large"), { statusCode: 413 });
   const pathname = decodeURIComponent(parsed.pathname);
-  const basename = safeFilename(path6.basename(pathname) || "upload.bin");
-  const tmpDir = fs6.mkdtempSync(path6.join(os6.tmpdir(), "moivault-upload-"));
-  const filePath = path6.join(tmpDir, basename.includes(".") ? basename : `${basename}.bin`);
+  const basename = safeFilename(path7.basename(pathname) || "upload.bin");
+  const tmpDir = fs6.mkdtempSync(path7.join(os6.tmpdir(), "moivault-upload-"));
+  const filePath = path7.join(tmpDir, basename.includes(".") ? basename : `${basename}.bin`);
   fs6.writeFileSync(filePath, Buffer.from(arrayBuffer));
   return filePath;
 }
@@ -7095,7 +7314,7 @@ async function handle(req, res, key) {
       } catch {
       }
       try {
-        fs6.rmdirSync(path6.dirname(filePath));
+        fs6.rmdirSync(path7.dirname(filePath));
       } catch {
       }
     }
@@ -7135,7 +7354,7 @@ async function handle(req, res, key) {
       } catch {
       }
       try {
-        fs6.rmdirSync(path6.dirname(file.path));
+        fs6.rmdirSync(path7.dirname(file.path));
       } catch {
       }
     }
@@ -7644,27 +7863,6 @@ function printInstructions(args) {
 
 // src/cli/index.ts
 init_database();
-
-// src/core/activity.ts
-var REPORT_TIMEOUT_MS = 2e3;
-async function recordCliActivity(tool, docIds, sensitive = false) {
-  if (!connectionModeKnown()) return;
-  try {
-    const report = (async () => {
-      const convex = await authenticateConvexClient();
-      await convex.mutation(api.agentActivity.record, {
-        client: detectClientFromEnv().key,
-        tool: tool.slice(0, 64),
-        docIds: docIds.slice(0, 200),
-        ...sensitive ? { sensitive: true } : {}
-      });
-    })();
-    await Promise.race([report, new Promise((r) => setTimeout(r, REPORT_TIMEOUT_MS).unref())]);
-  } catch {
-  }
-}
-
-// src/cli/index.ts
 var REPORTED_READS = {
   "doc get": "id",
   "doc text": "id",
@@ -7676,8 +7874,32 @@ var REPORTED_READS = {
   "people docs": "none",
   "ls": "none"
 };
+var POSITIONAL_ARG = {
+  "doc get": "id",
+  "doc text": "id",
+  "doc fields": "id",
+  "doc download": "id",
+  "search": "query",
+  "context": "query",
+  "people docs": "name",
+  "ls": "path"
+};
+function commandKey(actionCommand) {
+  const parent = actionCommand.parent?.name();
+  return parent && parent !== "moivault" ? `${parent} ${actionCommand.name()}` : actionCommand.name();
+}
+function commandArgs(key, actionCommand) {
+  const args = {};
+  for (const [k, v] of Object.entries(actionCommand.opts())) {
+    args[k] = typeof v === "string" && /^\d+(\.\d+)?$/.test(v) ? Number(v) : v;
+  }
+  const name = POSITIONAL_ARG[key];
+  if (name && typeof actionCommand.args[0] === "string") args[name] = actionCommand.args[0];
+  return args;
+}
+var reporting = null;
 var program = new Command();
-program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.0").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
+program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.1").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
   const commandName = actionCommand.name();
   const parentName = actionCommand.parent?.name();
   const skipAutoUnlock = parentName === "auth" || commandName === "unlock" || commandName === "lock";
@@ -7698,19 +7920,24 @@ program.name("moivault").description("CLI for Vault \u2014 encrypted document ma
     } catch {
     }
   }
-});
-program.hook("postAction", async (_thisCommand, actionCommand) => {
-  const parent = actionCommand.parent?.name();
-  const key = parent && parent !== "moivault" ? `${parent} ${actionCommand.name()}` : actionCommand.name();
+  const key = commandKey(actionCommand);
   const mode = REPORTED_READS[key];
-  if (!mode) return;
-  const docIds = mode === "id" && typeof actionCommand.args[0] === "string" ? [actionCommand.args[0]] : [];
+  if (mode) {
+    const docIds = mode === "id" && typeof actionCommand.args[0] === "string" ? [actionCommand.args[0]] : [];
+    reporting = { key, docIds, args: commandArgs(key, actionCommand), restore: interceptCommandFailure() };
+  }
+});
+program.hook("postAction", async () => {
+  if (!reporting) return;
+  const { key, docIds, args, restore } = reporting;
+  restore();
+  reporting = null;
   let sensitive = false;
   try {
     sensitive = docIds.some((id) => SENSITIVE_DOC_TYPES.has(getDocumentById(id)?.type ?? ""));
   } catch {
   }
-  await recordCliActivity(`cli:${key}`, docIds, sensitive);
+  await recordCliActivity(`cli:${key}`, docIds, { sensitive, args });
 });
 registerAuthCommands(program);
 registerUnlockCommands(program);
@@ -7740,8 +7967,16 @@ program.command("serve").description("Serve MCP over HTTP for Claude.ai / ChatGP
 program.command("rest").description("Start REST/OpenAPI server for Custom GPT Actions").action(async () => {
   await startRestServer();
 });
-program.parseAsync(process.argv).catch((err) => {
-  console.error(err.message);
-  process.exit(1);
+program.parseAsync(process.argv).catch(async (err) => {
+  const failed = reporting;
+  failed?.restore();
+  reporting = null;
+  const code = err instanceof CommandExit ? err.code : 1;
+  if (!(err instanceof CommandExit)) console.error(err.message);
+  if (failed) {
+    const error = err instanceof CommandExit ? lastCommandError() ?? `exited with ${code}` : err.message;
+    await recordCliActivity(`cli:${failed.key}`, failed.docIds, { args: failed.args, error });
+  }
+  process.exit(code);
 });
 //# sourceMappingURL=index.js.map

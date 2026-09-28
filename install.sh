@@ -7,6 +7,11 @@
 # Install + connect to your phone (what the app hands you):
 #   curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash -s -- --pair <code>
 #
+# For one agent only (the app adds this when you pick one under "Who is this for?"):
+#   … | bash -s -- --pair <code> --agent cursor
+# Only that agent gets a skill or MCP entry. For chatgpt / claude-web nothing is
+# installed for the agent, and the installer prints the `moivault serve` steps.
+#
 # The pairing code is single-use and expires in 10 minutes. This machine makes
 # its own key; the terminal prints a fingerprint, and you approve on your phone
 # after checking it matches. Nothing that unlocks your whole vault is ever
@@ -26,6 +31,7 @@ LOCAL_SOURCE="${MOIVAULT_LOCAL_SOURCE:-}"
 PAIR_TOKEN=""
 AUTH_PAYLOAD=""
 MASTER_PASSWORD=""
+AGENT=""
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -33,9 +39,24 @@ while [[ $# -gt 0 ]]; do
     --pair) PAIR_TOKEN="$2"; shift 2 ;;
     --payload) AUTH_PAYLOAD="$2"; shift 2 ;;
     --password) MASTER_PASSWORD="$2"; shift 2 ;;
+    --agent) AGENT="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
+
+# Agent keys are the contract's client keys (vault repo,
+# docs/superpowers/specs/2026-09-28-agent-connections.md). "any" is the default.
+# Checked before anything is downloaded, and again by `moivault auth pair`.
+AGENT="$(printf '%s' "$AGENT" | tr '[:upper:]' '[:lower:]')"
+[ "$AGENT" = "any" ] && AGENT=""
+case "$AGENT" in
+  ""|claude-desktop|claude-code|claude-web|chatgpt|codex|cursor|copilot|gemini|windsurf|terminal) ;;
+  *)
+    echo "  ✗ Unknown agent \"$AGENT\"."
+    echo "    Use one of: claude-desktop, claude-code, claude-web, chatgpt, codex, cursor, copilot, gemini, windsurf, terminal, any"
+    exit 1
+    ;;
+esac
 
 # ── Platform ──
 
@@ -132,11 +153,11 @@ install_skill() {
   SKILL_INSTALLED="$SKILL_INSTALLED $name"
 }
 
-# ── Agent detection & skill install ──
+# ── Per-agent installers ──
 # Paths sourced from skills.sh (vercel-labs/skills/src/agents.ts)
 
 # Claude Code (same path on macOS and Linux)
-if [ -d "$HOME/.claude" ]; then
+install_claude_code() {
   install_skill "$HOME/.claude/skills" "claude-code"
   # Auto-allow moivault bash commands (no permission prompts)
   CLAUDE_SETTINGS="$HOME/.claude/settings.json"
@@ -156,10 +177,10 @@ with open(sys.argv[1], 'w') as f:
 " "$CLAUDE_SETTINGS" 2>/dev/null || true
     fi
   fi
-fi
+}
 
 # Codex (OpenAI)
-if [ -d "$HOME/.codex" ] || command -v codex &> /dev/null; then
+install_codex() {
   install_skill "$HOME/.codex/skills" "codex"
   # Also add to AGENTS.md
   CODEX_AGENTS="$HOME/.codex/AGENTS.md"
@@ -170,57 +191,27 @@ if [ -d "$HOME/.codex" ] || command -v codex &> /dev/null; then
 Encrypted document vault CLI. See `~/.codex/skills/moivault/SKILL.md` for full reference.
 EOF
   fi
-fi
-
-# Cursor
-[ -d "$HOME/.cursor" ] && install_skill "$HOME/.cursor/skills" "cursor"
-
-# Windsurf / Codeium
-{ [ -d "$HOME/.windsurf" ] || [ -d "$HOME/.codeium" ]; } && install_skill "$HOME/.windsurf/skills" "windsurf"
-
-# Cline / Roo Code (shared .agents/skills)
-{ [ -d "$HOME/.cline" ] || [ -d "$HOME/.roo" ]; } && install_skill "$HOME/.agents/skills" "cline"
-
-# Amp
-[ -d "$CONFIG_HOME/amp" ] && install_skill "$CONFIG_HOME/agents/skills" "amp"
-
-# Gemini CLI / Antigravity
-[ -d "$HOME/.gemini" ] && install_skill "$HOME/.gemini/antigravity/skills" "gemini"
-
-# GitHub Copilot
-[ -d "$HOME/.github-copilot" ] && install_skill "$HOME/.github-copilot/skills" "copilot"
-
-# Goose (Block)
-[ -d "$CONFIG_HOME/goose" ] && install_skill "$CONFIG_HOME/goose/skills" "goose"
-
-# OpenCode
-[ -d "$CONFIG_HOME/opencode" ] && install_skill "$CONFIG_HOME/opencode/skills" "opencode"
-
-# Trae
-[ -d "$HOME/.trae" ] && install_skill "$HOME/.trae/skills" "trae"
-
-# Kilo
-[ -d "$HOME/.kilo" ] && install_skill "$HOME/.kilo/skills" "kilo"
-
-# Augment
-[ -d "$HOME/.augment" ] && install_skill "$HOME/.augment/skills" "augment"
-
-# Aider
-[ -d "$HOME/.aider" ] && install_skill "$HOME/.aider/skills" "aider"
+}
 
 # VSCode (GitHub Copilot Chat instructions)
-VSCODE_DIR=""
-if [ "$PLATFORM" = "macos" ]; then
-  [ -d "$HOME/.vscode" ] && VSCODE_DIR="$HOME/.vscode"
-  [ -d "$HOME/Library/Application Support/Code" ] && VSCODE_DIR="$HOME/Library/Application Support/Code/User"
-else
-  [ -d "$HOME/.vscode" ] && VSCODE_DIR="$HOME/.vscode"
-  [ -d "$CONFIG_HOME/Code" ] && VSCODE_DIR="$CONFIG_HOME/Code/User"
-fi
-[ -n "$VSCODE_DIR" ] && install_skill "$VSCODE_DIR/skills" "vscode"
+vscode_dir() {
+  local dir=""
+  if [ "$PLATFORM" = "macos" ]; then
+    [ -d "$HOME/.vscode" ] && dir="$HOME/.vscode"
+    [ -d "$HOME/Library/Application Support/Code" ] && dir="$HOME/Library/Application Support/Code/User"
+  else
+    [ -d "$HOME/.vscode" ] && dir="$HOME/.vscode"
+    [ -d "$CONFIG_HOME/Code" ] && dir="$CONFIG_HOME/Code/User"
+  fi
+  echo "$dir"
+}
 
-# ── Claude Desktop (MCP server auto-config) — macOS only; there is no Linux build ──
-if [ "$PLATFORM" = "macos" ] && [ -d "$HOME/Library/Application Support/Claude" ] && [ -n "$HAS_PYTHON" ]; then
+# Claude Desktop (MCP server auto-config) — macOS only; there is no Linux build.
+# Returns 1 when there is no Claude Desktop here to configure.
+install_claude_desktop() {
+  if [ "$PLATFORM" != "macos" ] || [ ! -d "$HOME/Library/Application Support/Claude" ] || [ -z "$HAS_PYTHON" ]; then
+    return 1
+  fi
   CLAUDE_DESKTOP_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
   # Ensure config file exists
   if [ ! -f "$CLAUDE_DESKTOP_CONFIG" ]; then
@@ -240,6 +231,85 @@ with open(config_path, 'w') as f:
   else
     SKILL_INSTALLED="$SKILL_INSTALLED claude-desktop(mcp)"
   fi
+}
+
+# ChatGPT and Claude.ai reach the machine through `moivault serve`.
+print_serve_steps() {
+  echo "  $1 reaches this machine through a connector URL, not a local skill:"
+  echo "    1. Run: moivault serve"
+  echo "    2. Copy the https://… URL it prints"
+  echo "    3. Add it in $1 as a custom connector (Settings → Connectors)"
+  echo "  Keep moivault serve running while you use it; --rotate issues a new URL."
+  echo ""
+}
+
+if [ -n "$AGENT" ]; then
+  # Tagged install: this machine is paired for one agent, so only that agent
+  # gets a skill or MCP entry. (Any agent here could still run moivault — they
+  # share this machine's keys — and the phone says so.)
+  case "$AGENT" in
+    claude-code) install_claude_code ;;
+    claude-desktop)
+      install_claude_desktop || echo "  ℹ Claude Desktop not found (it is macOS only). Open it once, then run this installer again."
+      ;;
+    codex) install_codex ;;
+    cursor) install_skill "$HOME/.cursor/skills" "cursor" ;;
+    windsurf) install_skill "$HOME/.windsurf/skills" "windsurf" ;;
+    gemini) install_skill "$HOME/.gemini/antigravity/skills" "gemini" ;;
+    copilot)
+      install_skill "$HOME/.github-copilot/skills" "copilot"
+      VSCODE_DIR="$(vscode_dir)"
+      if [ -n "$VSCODE_DIR" ]; then install_skill "$VSCODE_DIR/skills" "vscode"; fi
+      ;;
+    # chatgpt / claude-web: connector steps are printed at the end.
+    # terminal: nothing to set up beyond the command itself.
+    *) ;;
+  esac
+else
+  # ── Agent detection & skill install ──
+  if [ -d "$HOME/.claude" ]; then install_claude_code; fi
+  if [ -d "$HOME/.codex" ] || command -v codex &> /dev/null; then install_codex; fi
+
+  # Cursor
+  [ -d "$HOME/.cursor" ] && install_skill "$HOME/.cursor/skills" "cursor"
+
+  # Windsurf / Codeium
+  { [ -d "$HOME/.windsurf" ] || [ -d "$HOME/.codeium" ]; } && install_skill "$HOME/.windsurf/skills" "windsurf"
+
+  # Cline / Roo Code (shared .agents/skills)
+  { [ -d "$HOME/.cline" ] || [ -d "$HOME/.roo" ]; } && install_skill "$HOME/.agents/skills" "cline"
+
+  # Amp
+  [ -d "$CONFIG_HOME/amp" ] && install_skill "$CONFIG_HOME/agents/skills" "amp"
+
+  # Gemini CLI / Antigravity
+  [ -d "$HOME/.gemini" ] && install_skill "$HOME/.gemini/antigravity/skills" "gemini"
+
+  # GitHub Copilot
+  [ -d "$HOME/.github-copilot" ] && install_skill "$HOME/.github-copilot/skills" "copilot"
+
+  # Goose (Block)
+  [ -d "$CONFIG_HOME/goose" ] && install_skill "$CONFIG_HOME/goose/skills" "goose"
+
+  # OpenCode
+  [ -d "$CONFIG_HOME/opencode" ] && install_skill "$CONFIG_HOME/opencode/skills" "opencode"
+
+  # Trae
+  [ -d "$HOME/.trae" ] && install_skill "$HOME/.trae/skills" "trae"
+
+  # Kilo
+  [ -d "$HOME/.kilo" ] && install_skill "$HOME/.kilo/skills" "kilo"
+
+  # Augment
+  [ -d "$HOME/.augment" ] && install_skill "$HOME/.augment/skills" "augment"
+
+  # Aider
+  [ -d "$HOME/.aider" ] && install_skill "$HOME/.aider/skills" "aider"
+
+  VSCODE_DIR="$(vscode_dir)"
+  [ -n "$VSCODE_DIR" ] && install_skill "$VSCODE_DIR/skills" "vscode"
+
+  install_claude_desktop || true
 fi
 
 # Generic: copy to the XDG config dir for any agent to discover. On Linux this is
@@ -274,7 +344,9 @@ CONNECTED=""
 # Output is not hidden: the fingerprint has to reach the person approving.
 if [ -n "$PAIR_TOKEN" ]; then
   echo "  → Connecting to your phone..."
-  if "$BIN_DIR/moivault" auth pair "$PAIR_TOKEN"; then
+  AGENT_ARGS=()
+  [ -n "$AGENT" ] && AGENT_ARGS=(--agent "$AGENT")
+  if "$BIN_DIR/moivault" auth pair "$PAIR_TOKEN" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"}; then
     CONNECTED="1"
   else
     echo "  ✗ Not connected. Make a new code in the app and run: moivault auth pair <code>"
@@ -307,6 +379,10 @@ fi
 echo ""
 echo "  ✓ moivault installed!"
 echo ""
+case "$AGENT" in
+  chatgpt) print_serve_steps "ChatGPT" ;;
+  claude-web) print_serve_steps "Claude.ai" ;;
+esac
 if [ -n "$CONNECTED" ]; then
   echo "  Ready to use:"
   echo "    moivault search 'passport'"

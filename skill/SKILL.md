@@ -28,6 +28,7 @@ The vault contains personal and business documents: passports, visas, IDs, medic
 - `mode: "connection"` — this machine is paired with the user's phone and sees what its preset allows (see below). This is the normal case.
 - `mode: "legacy"` — linked with the older method; it reads every space. Suggest reconnecting from the app (Settings → AI agents) when it comes up, but don't nag.
 - `mode: "none"` — the user needs to connect: in the app, Settings → AI agents → Connect an agent, then run the `moivault auth pair <code>` command it shows
+- A connection can be **tagged** for one agent ("Who is this for?" in the app, `--agent <key>` on the command). `vault_permissions` shows it as `intendedAgent`. Nothing changes for you: if you are a different agent on the same machine you still work normally, and `vault_permissions` carries a `mismatch` note because the user's phone notices and may ask them to allow or block you. Don't try to work around it.
 
 ## What you can see — and how to ask for more
 
@@ -57,7 +58,7 @@ Ask for documents (`kind: "read"`), not whole spaces. Only use `kind: "space"` w
 
 **Pending writes.** `vault_doc_create`, `vault_doc_upload`, `vault_doc_edit`, `vault_doc_update_content`, `vault_doc_delete` and `vault_remember` may return `{ status: "pending_approval", requestId }`: the change is proposed on the phone and **nothing is saved yet** — the user also picks which space it lands in. Tell the user it's waiting for their approval; don't say it's done. Confirm later with `vault_request_status`. Pass a short `reason` so the user knows why. Under Full, expect deletes to be pending.
 
-Everything you read is logged in the user's activity feed, by agent. Act like it.
+Everything you do is logged in the user's history on their phone, by agent: the tool, the documents, and — sealed so only the phone can read it — your query, path or title. Failed calls are logged too. Act like it.
 
 ### MCP tools
 
@@ -87,6 +88,7 @@ moivault ls [vault/<space>/<person>] # Browse as folders; files show their id
 moivault spaces                      # Preset, spaces shared in full, and those that need asking
 moivault auth status                 # Mode (connection / legacy), machine, fingerprint
 moivault auth pair <code>            # Connect this machine (code from the app)
+moivault auth pair <code> --agent cursor   # …for one agent (the app adds this when you pick one)
 moivault serve                       # MCP over HTTP for Claude.ai / ChatGPT (via cloudflared)
 moivault search "<query>"            # Hybrid search (FTS + vector) — default, best results
 moivault search "<query>" --mode fts    # Full-text only — fast, exact keyword match

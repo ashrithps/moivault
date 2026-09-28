@@ -26,6 +26,21 @@ curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.s
 
 Or, with moivault already installed: `moivault auth pair <code>`.
 
+**For one agent.** Under *Who is this for?* the app can tag the connection for one agent,
+and the command gains `--agent <key>`:
+
+```bash
+… | bash -s -- --pair <code> --agent cursor
+```
+
+Keys: `claude-code`, `claude-desktop`, `cursor`, `codex`, `gemini`, `windsurf`, `copilot`,
+`chatgpt`, `claude-web`, `terminal`, or `any` (the default). A tagged install sets up only
+that agent: its skill, or for `claude-desktop` its MCP entry. For `chatgpt` and
+`claude-web` it installs nothing agent-specific and prints the `moivault serve` steps.
+`moivault auth status` and `moivault spaces` show who the machine is for. A tag is a
+label, not a lock: every agent on a machine shares its keys. If a different agent uses the
+connection, your phone tells you and offers to allow or block it.
+
 The terminal prints a fingerprint like `A1B2-C3D4-E5F6-0718`, and the phone shows one
 too. **Approve on the phone only if they match.** Then `moivault sync`.
 
@@ -55,9 +70,13 @@ Each machine you connect is its own, separately revocable principal.
 - **Writes are proposals unless you allow them.** An agent saving, changing or deleting a
   document without that permission creates a proposal — files included, staged encrypted
   until you decide; the phone picks which space it lands in, or rejects it.
-- **Activity log.** Every tool call is reported by agent ("Claude Code on work-laptop"),
-  and reads of Ask documents are logged by the server itself. Documents an agent saves
-  carry a *Saved by* mark.
+- **History on your phone.** Every tool call is reported by agent ("Claude Code on
+  work-laptop"), failures included, and reads of Ask documents are logged by the server
+  itself. Each report carries a detail sealed to your own key: the search query, path, or
+  title of a new note, never document contents or field values. The server stores it
+  but cannot read it. Only your phone can open it, so the history reads *Claude Code
+  searched "passport renewal" · 3 results*, and you can search and filter it there.
+  Documents an agent saves carry a *Saved by* mark.
 - **Revoke from your phone** (Settings → AI agents). The next call from this machine is
   refused, and moivault wipes its keys, its database and its config, then says
   *This machine was disconnected from your phone.* `moivault auth logout` only clears this
@@ -232,7 +251,7 @@ moivault search "that video about X"   # Search across transcripts
 - Zero-knowledge encryption — documents are decrypted locally, never sent in plaintext
 - AES-256-GCM with per-document keys, encrypted files stored in Cloudflare R2
 - Each connected machine holds its own X25519 key; the phone seals only granted keys to it
-- Reasons, proposed writes and granted document keys are sealed end to end; the server's activity log holds opaque ids
+- Reasons, proposed writes, granted document keys and each activity report's detail (query, path, title) are sealed end to end; the server's audit log holds only opaque ids, tool names and ok/error
 - Secrets in the macOS Keychain / Linux Secret Service, else `0600` files; data in `~/.vault-cli/` (`$XDG_CONFIG_HOME/moivault` on a fresh Linux install)
 
 ## Uninstall
