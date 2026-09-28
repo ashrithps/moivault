@@ -26,7 +26,8 @@ The vault contains personal and business documents: passports, visas, IDs, medic
 
 - `moivault` must be installed and connected (check with `moivault auth status`)
 - `mode: "connection"` — this machine is paired with the user's phone and sees what its preset allows (see below). This is the normal case.
-- `mode: "legacy"` — linked with the older method; it reads every space. Suggest reconnecting from the app (Settings → AI agents) when it comes up, but don't nag.
+- `mode: "legacy"` — linked with the older method; it reads every space. Suggest reconnecting from the app (Settings → AI agents) when it comes up, but don't nag. A legacy install holds only the space key it was linked with, so after a key rotation `doc edit` fails with `No key held for space … version N`. Prefer the paired CLI for writes.
+- **Check you are running the right binary.** `which -a moivault` — the installer puts the current CLI at `~/.local/bin/moivault` (→ `~/.moivault/moivault.js`), but an older global npm `vault-cli` can come first on PATH and shadow it. If `auth status` shows `legacy` right after the user paired, that's the cause: call `~/.local/bin/moivault` directly and suggest `npm uninstall -g vault-cli`.
 - `mode: "none"` — the user needs to connect: in the app, Settings → AI agents → Connect an agent, then run the `moivault auth pair <code>` command it shows
 - A connection can be **tagged** for one agent ("Who is this for?" in the app, `--agent <key>` on the command). `vault_permissions` shows it as `intendedAgent`. Nothing changes for you: if you are a different agent on the same machine you still work normally, and `vault_permissions` carries a `mismatch` note because the user's phone notices and may ask them to allow or block you. Don't try to work around it.
 
@@ -385,6 +386,14 @@ moivault doc download <id> --output /tmp/doc.pdf # saves to specific path
 - Only download when explicitly requested — for reading content, use `doc text` instead
 - Returns `{ status, path, size }` in JSON mode
 
+## Uploading Files
+
+- **Treat an upload as done only when it printed an `id`.** An upload can fail with no output at all. That happens reliably for files over roughly 23 MB (big phone or printer scans), and now and then for small ones. Loop over files, check each for an `id`, and retry a failure a couple of times.
+- **Shrink big scans before uploading.** Upload a compressed copy (`gs -q -sDEVICE=pdfwrite -dPDFSETTINGS=/ebook -dNOPAUSE -dBATCH -sOutputFile=out.pdf in.pdf` takes a 40 MB scan to about 5–7 MB, still readable), and tell the user the vault holds the compressed copy.
+- **The `id` is a hash of the file's contents.** Uploading the same bytes again updates the same document; it doesn't make a duplicate. Use this to repair a document that uploaded wrongly (for example, from a legacy install) instead of deleting it. A compressed copy has a different hash, so it becomes a new document.
+- **Auto-titles are a guess.** Gemini names each upload from its contents and does poorly on handwritten or non-English scans. It may even invent text. If you know what a document is, `doc edit <id> title "…"` and `doc edit <id> tags "a,b"` after uploading, and don't trust `doc text` on handwriting.
+- Before telling the user something is "in the vault", run `moivault sync` and confirm the documents come back. For a batch, give them a couple of titles to look for on their phone.
+
 ## Output Format
 
 - All commands output JSON by default (non-TTY)
@@ -432,6 +441,9 @@ For these commands, describe what you're about to do and wait for explicit user 
 - "This machine was disconnected from your phone." → the user revoked this machine. Everything local was wiped; they need to connect again if they want to. Don't try to work around it.
 - `NEEDS_APPROVAL` from a `moivault doc …` write command → the terminal can't propose writes; use the MCP write tools (they create a proposal on the phone) or ask the user to allow writes for that space
 - `AGENT_NOT_GRANTED` → that space is Ask for you; use `vault_request`
+- `No key held for space … version N` → you're on a legacy or stale binary without the space's current key (see Prerequisites). Switch to the paired CLI.
+- The user says uploads "aren't on my phone" → first check whether the phone is syncing at all. Compare the document count the app shows ("N kept") with `moivault stats`. If the phone is behind on documents you didn't upload too, it's a sync problem on the phone or server, not your upload. Don't re-upload or guess; tell the user what you found.
+- First `sync` after pairing is slow (it pulls the whole vault) and holds a lock. Uploads and reads can run alongside it but are slower.
 - Search returns 0 results → DON'T say "not found" immediately. Try alternative searches.
   Only report "not in vault" after exhausting search strategies.
 - Vector search fails → falls back gracefully to FTS results. May show a stderr warning.
