@@ -24,9 +24,56 @@ The vault contains personal and business documents: passports, visas, IDs, medic
 
 ## Prerequisites
 
-- `moivault` must be installed and authenticated (check with `moivault auth status`)
-- If `readyToUnlock` is false, the user needs to run `moivault auth login` first
-- Auto-unlock is configured — no password needed for commands
+- `moivault` must be installed and connected (check with `moivault auth status`)
+- `mode: "connection"` — this machine is paired with the user's phone and sees what its preset allows (see below). This is the normal case.
+- `mode: "legacy"` — linked with the older method; it reads every space. Suggest reconnecting from the app (Settings → AI agents) when it comes up, but don't nag.
+- `mode: "none"` — the user needs to connect: in the app, Settings → AI agents → Connect an agent, then run the `moivault auth pair <code>` command it shows
+
+## What you can see — and how to ask for more
+
+The user picks one of three presets for you when they connect you, and can change it any time. `vault_permissions` tells you which one you have, in plain words — check it at the start of a vault task.
+
+| Preset | What you see | Writes |
+|---|---|---|
+| **Full** (the default) | Every space the user shared, synced here — search and read freely | Creates and edits go through. **Deletes are proposed** to the user unless they allowed deletes |
+| **Standard** | The *context card*: every document's title, type, owner, dates and path — **no contents or field values** | Every write is proposed |
+| **Private** | Nothing until the user approves a request | Every write is proposed |
+
+**Full.** Work as normal. Opening a sensitive document (IDs, passports, medical, tax, bank, loans…) sends the user a notice that you did — it doesn't block you, but only open what the task needs.
+
+**Standard.** `vault_ls`, `vault_tree`, `vault_profile` and `vault_search` (title / type / owner matching) answer from the card. You can say *"your passport expires in 40 days"* from it. Entries marked `readable: false` (or `(ask)` in the tree, `source: "context"` in search) are listed only: to read one, ask for it **by id** — `vault_request({ reason, blobIds: ["<id>"] })` — so the phone preselects exactly that document.
+
+**Private.** Tools return a hint instead of results. Ask with `vault_request` and a `hint` ("passport") so the phone can suggest documents.
+
+**Asking — narrowly, with a reason the user will recognize:**
+
+1. `vault_request({ reason, hint?, blobIds? })` — `reason` is shown on their phone. Say what you are doing for them and what you need from the document: *"To fill in the visa form you asked for, I need your passport number and expiry date."* Pass `blobIds` when you saw the document listed; otherwise a short `hint`.
+2. Tell the user you've asked on their phone.
+3. `vault_request_status({ requestId, waitSeconds: 60 })` — waits for the answer. Call again if it is still `pending`.
+4. `approved` returns the documents' text and fields. They are held in memory only — use them for the task at hand; don't copy them into files or notes unless the user asks.
+5. `denied` — respect it. Don't re-ask for the same thing unless the user brings it up.
+
+Ask for documents (`kind: "read"`), not whole spaces. Only use `kind: "space"` with a `spaceId` when the task genuinely needs ongoing access to everything in it, and say why. Never ask "just in case", and never bundle unrelated documents into one request.
+
+**Pending writes.** `vault_doc_create`, `vault_doc_upload`, `vault_doc_edit`, `vault_doc_update_content`, `vault_doc_delete` and `vault_remember` may return `{ status: "pending_approval", requestId }`: the change is proposed on the phone and **nothing is saved yet** — the user also picks which space it lands in. Tell the user it's waiting for their approval; don't say it's done. Confirm later with `vault_request_status`. Pass a short `reason` so the user knows why. Under Full, expect deletes to be pending.
+
+Everything you read is logged in the user's activity feed, by agent. Act like it.
+
+### MCP tools
+
+| Tool | Use |
+|---|---|
+| `vault_search`, `vault_context`, `vault_doc_list` | Find documents (results include a `path`) |
+| `vault_doc_get` / `_text` / `_fields` / `_download` | Read one document — by `id` or `path` |
+| `vault_ls({path})`, `vault_tree({depth})` | Browse like a filesystem: `vault/<space>/<person>/<file>` |
+| `vault_profile` | People, counts by type, upcoming expiries — a quick orientation |
+| `vault_permissions` | Your preset, and what you can see, write and delete right now |
+| `vault_request`, `vault_request_status` | Ask for documents (by `blobIds` or `hint`) or a space; wait for the answer |
+| `vault_remember({fact})` | Save a short fact the user told you to remember (a note, marked as saved by you) |
+| `vault_doc_create` / `_edit` / `_update_content` / `_delete` / `_upload` | Write (may be `pending_approval`) |
+| `vault_places`, `vault_wishlist`, `vault_recipes`, `vault_apps`, `vault_hacks` | Lifestyle collections |
+
+Paths are derived from space, owner and title, so they can change; the `id` never does. Quote paths to the user, keep ids for follow-up calls.
 
 ## IMPORTANT: Always Sync First
 
@@ -36,6 +83,11 @@ The vault contains personal and business documents: passports, visas, IDs, medic
 
 ```bash
 moivault sync                        # Sync latest from server (run first if data seems stale)
+moivault ls [vault/<space>/<person>] # Browse as folders; files show their id
+moivault spaces                      # Preset, spaces shared in full, and those that need asking
+moivault auth status                 # Mode (connection / legacy), machine, fingerprint
+moivault auth pair <code>            # Connect this machine (code from the app)
+moivault serve                       # MCP over HTTP for Claude.ai / ChatGPT (via cloudflared)
 moivault search "<query>"            # Hybrid search (FTS + vector) — default, best results
 moivault search "<query>" --mode fts    # Full-text only — fast, exact keyword match
 moivault search "<query>" --mode vector # Vector only — semantic/concept matching via Gemini embeddings
@@ -360,7 +412,9 @@ moivault sync    # Pull latest from server
 ## IMPORTANT: Destructive Actions Require Confirmation
 
 Most moivault commands are safe to run without asking (search, list, get, text, fields, download,
-upload, sync, context, stats, chunk, people list/docs/aliases, usage, auth status). Run these freely.
+upload, sync, context, stats, chunk, people list/docs/aliases, usage, auth status, ls, spaces). Run these freely.
+
+`vault_request` puts a notification on the user's phone — only send one when the task needs it, and tell the user you did.
 
 **ALWAYS confirm with the user before running these destructive commands:**
 - `moivault doc delete <id>` — permanently deletes a document from the vault AND the server
@@ -372,8 +426,10 @@ For these commands, describe what you're about to do and wait for explicit user 
 
 ## Error Handling
 
-- "Vault is locked" → auto-unlock should handle this; if not, run `moivault unlock`
-- "Not authenticated" → run `moivault auth login`
+- "Vault is locked" / "not paired" → the user connects from the app: Settings → AI agents → Connect an agent
+- "This machine was disconnected from your phone." → the user revoked this machine. Everything local was wiped; they need to connect again if they want to. Don't try to work around it.
+- `NEEDS_APPROVAL` from a `moivault doc …` write command → the terminal can't propose writes; use the MCP write tools (they create a proposal on the phone) or ask the user to allow writes for that space
+- `AGENT_NOT_GRANTED` → that space is Ask for you; use `vault_request`
 - Search returns 0 results → DON'T say "not found" immediately. Try alternative searches.
   Only report "not in vault" after exhausting search strategies.
 - Vector search fails → falls back gracefully to FTS results. May show a stderr warning.

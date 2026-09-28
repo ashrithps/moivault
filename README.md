@@ -10,46 +10,95 @@ Search, retrieve, and correlate documents from your encrypted vault. Designed fo
 curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash
 ```
 
-### One-click install with auth (fully automated)
+macOS and Linux (x64 / arm64), Node.js 20+. Installs to `~/.moivault/` on macOS and
+`$XDG_DATA_HOME/moivault` (usually `~/.local/share/moivault`) on Linux, with a launcher
+at `~/.local/bin/moivault`. Auto-installs agent skills (Claude Code, Codex, Cursor, etc.),
+and on macOS the Claude Desktop MCP server.
 
-Open the Vault app → Settings → CLI & Agents → **Copy install command**, then paste
-it into a terminal. It looks like this, and needs no editing:
+### Connect to your phone
+
+Open the Vault app → Settings → **AI agents** → **Connect an agent**, choose what it may
+see, and paste the command it gives you:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash -s -- \
-  --payload '<json from app>'
+curl -fsSL https://raw.githubusercontent.com/ashrithps/moivault/master/install.sh | bash -s -- --pair <code>
 ```
 
-This installs, authenticates and syncs — ready to use immediately.
+Or, with moivault already installed: `moivault auth pair <code>`.
 
-The payload carries `muk`, the key your master password derives, so the CLI unlocks
-without ever holding the password itself. `--password 'your-master-password'` is still
-accepted, for payloads from older builds of the app.
+The terminal prints a fingerprint like `A1B2-C3D4-E5F6-0718`, and the phone shows one
+too. **Approve on the phone only if they match.** Then `moivault sync`.
 
-Requires Node.js 20+. Installs to `~/.moivault/` with a launcher at `~/.local/bin/moivault`.
+## How a connection works
 
-Auto-installs agent skills (Claude Code, Codex, Cursor, etc.) and Claude Desktop MCP server.
+Each machine you connect is its own, separately revocable principal.
+
+- **Nothing that unlocks your vault leaves the phone.** The pairing code is single-use
+  and lasts 10 minutes. This machine generates its own X25519 keypair and a credential;
+  only the public key and the credential's hash go to the server. No master password,
+  no secret key, no phone session.
+- **You pick a preset per agent,** and can change it any time:
+
+  | Preset | The agent sees | Its writes |
+  |---|---|---|
+  | **Full** (default) | Every space you hold, synced to this machine | Creates and edits go through; deletes are proposals unless you allow them |
+  | **Standard** | A *context card*: titles, types, owners, dates — no contents | All proposals |
+  | **Private** | Nothing until you approve a request | All proposals |
+
+  Under Full, an agent opening a sensitive document (IDs, medical, tax, bank…) sends you
+  a notice — not a prompt. Only what a preset grants is sealed to this machine's key.
+- **Ask = approve on your phone.** When an agent needs a private document — a passport
+  for a visa form — it asks with a reason. You get a notification, pick the documents,
+  and choose *once*, *always*, or *the whole space*. The document key is sealed to this
+  machine for that grant, and the document is served through a logged call and kept in
+  memory, never written to disk here.
+- **Writes are proposals unless you allow them.** An agent saving, changing or deleting a
+  document without that permission creates a proposal — files included, staged encrypted
+  until you decide; the phone picks which space it lands in, or rejects it.
+- **Activity log.** Every tool call is reported by agent ("Claude Code on work-laptop"),
+  and reads of Ask documents are logged by the server itself. Documents an agent saves
+  carry a *Saved by* mark.
+- **Revoke from your phone** (Settings → AI agents). The next call from this machine is
+  refused, and moivault wipes its keys, its database and its config, then says
+  *This machine was disconnected from your phone.* `moivault auth logout` only clears this
+  machine; it does not revoke anything server-side.
+
+Secrets live in the macOS Keychain, the Linux Secret Service (`secret-tool`, when
+installed), or else a `0600` file in the config directory. Machines linked with the older
+`--payload` method keep working but cannot be revoked individually — reconnect with
+`--pair` to fix that.
+
+## Use it from Claude.ai or ChatGPT
+
+```bash
+moivault serve
+```
+
+Serves the same MCP tools over HTTP on `127.0.0.1:8798`, at a path containing a random
+secret. If [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+is installed (`brew install cloudflared`), it opens a quick tunnel and prints a public
+connector URL:
+
+- **Claude.ai** — Settings → Connectors → *Add custom connector* → paste the URL.
+- **ChatGPT** — Settings → Connectors (turn on Developer mode under Advanced) → *Create* → paste the URL.
+
+Decryption stays on your machine, and the connector sees exactly what this machine's
+connection allows. The URL is the key: `moivault serve --rotate` issues a new one.
+`--no-tunnel` serves locally only; `--port` changes the port. Bearer auth
+(`Authorization: Bearer <secret>` at `/mcp`) works too.
 
 ## Quick Start
 
-1. **Login** — Open the Vault mobile app → Settings → CLI & Agents. Copy the install
-   command and run it. To authenticate an existing install instead:
-   ```bash
-   moivault auth login --payload '<json from app>'
-   ```
-   The payload carries the unlock key, so every later command unlocks on its own.
-   On a machine linked by an older app build, run
-   `moivault auth save-password 'your-master-password'` once instead.
-
-2. **Sync** documents from server:
+1. **Connect** — see above.
+2. **Sync** what you shared:
    ```bash
    moivault sync
    ```
-
-3. **Search** your vault:
+3. **Search** and browse:
    ```bash
    moivault search "passport"
    moivault search "medical report" --mode vector   # semantic search
+   moivault ls vault/family
    ```
 
 ## Commands
@@ -96,10 +145,16 @@ moivault context <query> --limit 5 --include-fields
 moivault chunk build                 # Build chunk index (splits docs + embeds)
 moivault chunk status                # Show chunk index status
 
+moivault ls [path]                   # Browse as folders: vault/<space>/<person>/<file>
+moivault spaces                      # Spaces shared in full, and those that need asking
+
 moivault usage                       # API usage and plan details
 moivault stats                       # Vault statistics
-moivault auth status                 # Check auth state
+moivault auth pair <code>            # Connect this machine (code from the app)
+moivault auth status                 # Mode, machine name, fingerprint
+moivault auth logout                 # Forget credentials on this machine (revoke from the phone)
 moivault mcp                         # Start MCP server (stdio) for Claude Desktop/Cursor
+moivault serve                       # MCP over HTTP for Claude.ai / ChatGPT
 ```
 
 ## For AI Agents
@@ -122,13 +177,18 @@ Works with any AI coding agent. The installer auto-detects and installs the skil
 
 ### MCP Server (Claude Desktop, Cursor)
 
-The installer auto-configures Claude Desktop with the moivault MCP server. After install, restart Claude Desktop and **21 vault tools** are available natively:
+The installer auto-configures Claude Desktop (macOS) with the moivault MCP server. After install, restart Claude Desktop and **30 vault tools** are available natively:
 
-`vault_search` · `vault_context` · `vault_doc_get` · `vault_doc_text` · `vault_doc_fields` · `vault_doc_list` · `vault_doc_types` · `vault_doc_edit` · `vault_doc_delete` · `vault_doc_download` · `vault_doc_upload` · `vault_sync` · `vault_stats` · `vault_people_list` · `vault_people_docs` · `vault_chunk_status` · `vault_places` · `vault_wishlist` · `vault_recipes` · `vault_apps` · `vault_hacks`
+`vault_search` · `vault_context` · `vault_doc_get` · `vault_doc_text` · `vault_doc_fields` · `vault_doc_list` · `vault_doc_types` · `vault_doc_edit` · `vault_doc_delete` · `vault_doc_download` · `vault_doc_upload` · `vault_doc_create` · `vault_doc_update_content` · `vault_sync` · `vault_stats` · `vault_people_list` · `vault_people_docs` · `vault_chunk_status` · `vault_places` · `vault_wishlist` · `vault_recipes` · `vault_apps` · `vault_hacks` · `vault_ls` · `vault_tree` · `vault_profile` · `vault_permissions` · `vault_request` · `vault_request_status` · `vault_remember`
+
+- `vault_ls` / `vault_tree` browse the vault as `vault/<space>/<person>/<file>`; tools that take a document `id` also take a `path`.
+- `vault_request` asks you on your phone for documents (by id from the context card, or a hint), with the agent's reason; `vault_request_status` waits for your answer.
+- `vault_permissions` tells the agent its preset and what it can see, write and delete right now.
+- `vault_remember` saves a short fact as a note marked as saved by that agent.
 
 Features:
 - JSON output by default (non-TTY). Pretty output with colors in interactive terminals.
-- Auto-unlock with saved password — no interactive prompts needed.
+- Unlocks on its own — a paired machine has no password to type.
 - Hybrid search combines keyword matching (FTS) with semantic vector search (Gemini embeddings).
 
 ## Search Modes
@@ -171,11 +231,15 @@ moivault search "that video about X"   # Search across transcripts
 
 - Zero-knowledge encryption — documents are decrypted locally, never sent in plaintext
 - AES-256-GCM with per-document keys, encrypted files stored in Cloudflare R2
-- Master password derived via PBKDF2 (600K iterations)
-- Credentials stored in `~/.vault-cli/` with 0600 permissions
+- Each connected machine holds its own X25519 key; the phone seals only granted keys to it
+- Reasons, proposed writes and granted document keys are sealed end to end; the server's activity log holds opaque ids
+- Secrets in the macOS Keychain / Linux Secret Service, else `0600` files; data in `~/.vault-cli/` (`$XDG_CONFIG_HOME/moivault` on a fresh Linux install)
 
 ## Uninstall
 
+Revoke the machine from your phone first (Settings → AI agents), then:
+
 ```bash
-rm -rf ~/.moivault ~/.local/bin/moivault ~/.vault-cli
+moivault auth logout
+rm -rf ~/.moivault ~/.local/share/moivault ~/.local/bin/moivault ~/.vault-cli ~/.config/moivault
 ```
