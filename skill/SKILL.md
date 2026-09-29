@@ -107,6 +107,8 @@ moivault doc fields <id>             # Structured extracted fields
 moivault doc download <id>           # Download original file to ~/Downloads/
 moivault doc download <id> --output <path>  # Download to specific path
 moivault doc upload <file>           # Upload a document (PDF, image) to the vault
+moivault doc preview <id...>         # Make the phone's thumbnail for a doc that has none
+moivault doc preview --missing       # ...for every doc with a file but no thumbnail
 moivault doc edit <id> <field> <val> # Edit a field (title, tags, type, owner, or custom)
 moivault doc delete <id>             # Delete a document (local + server)
 moivault doc delete <id> --force     # Delete without confirmation
@@ -388,6 +390,7 @@ moivault doc download <id> --output /tmp/doc.pdf # saves to specific path
 
 ## Uploading Files
 
+- **Check `preview` in the upload result.** `ready` means the phone shows a thumbnail. `skipped: <reason>` means it will show "tap to preview" instead. Tell the user, and run `moivault doc preview <id>` once the cause is fixed. `none` is normal for files that aren't PDFs or images.
 - **Treat an upload as done only when it printed an `id`.** An upload can fail with no output at all. That happens reliably for files over roughly 23 MB (big phone or printer scans), and now and then for small ones. Loop over files, check each for an `id`, and retry a failure a couple of times.
 - **Shrink big scans before uploading.** Upload a compressed copy (`gs -q -sDEVICE=pdfwrite -dPDFSETTINGS=/ebook -dNOPAUSE -dBATCH -sOutputFile=out.pdf in.pdf` takes a 40 MB scan to about 5–7 MB, still readable), and tell the user the vault holds the compressed copy.
 - **The `id` is a hash of the file's contents.** Uploading the same bytes again updates the same document; it doesn't make a duplicate. Use this to repair a document that uploaded wrongly (for example, from a legacy install) instead of deleting it. A compressed copy has a different hash, so it becomes a new document.

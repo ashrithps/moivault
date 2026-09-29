@@ -1,6 +1,6 @@
 {
   "name": "moivault",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "CLI for Vault — encrypted document management for agents and humans. Search, retrieve, and correlate documents from your encrypted vault.",
   "type": "module",
   "bin": {
@@ -17,9 +17,11 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@napi-rs/canvas": "^0.1.100",
     "better-sqlite3": "^11.7.0",
     "commander": "^13.1.0",
     "convex": "^1.21.0",
+    "pdfjs-dist": "^5.7.284",
     "zod": "^4.3.6"
   },
   "os": [

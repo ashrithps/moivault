@@ -2930,45 +2930,93 @@ init_crypto();
 
 // src/core/thumbnail.ts
 import { spawn } from "child_process";
+import { createRequire } from "module";
 import fs4 from "fs";
 import path4 from "path";
 import os3 from "os";
+var MAX_SIDE = 720;
+var JPEG_QUALITY = 82;
+function canHaveThumbnail(mimeType) {
+  return mimeType === "application/pdf" || mimeType.startsWith("image/");
+}
 async function generateThumbnail(filePath, mimeType) {
-  if (mimeType !== "application/pdf" && !mimeType.startsWith("image/")) {
-    return null;
+  if (!canHaveThumbnail(mimeType)) {
+    return { status: "skipped", reason: `no thumbnail for ${mimeType}` };
   }
+  const failures = [];
+  try {
+    const bytes = mimeType === "application/pdf" ? await renderPdfFirstPage(filePath) : await renderImage(filePath);
+    return { status: "ready", bytes, mimeType: "image/jpeg", renderer: "bundled" };
+  } catch (err) {
+    failures.push(`bundled renderer: ${err.message}`);
+  }
+  if (process.platform === "darwin") {
+    try {
+      const bytes = await renderWithMacTools(filePath, mimeType);
+      return { status: "ready", bytes, mimeType: "image/jpeg", renderer: "macos" };
+    } catch (err) {
+      failures.push(`macOS tools: ${err.message}`);
+    }
+  }
+  return { status: "skipped", reason: failures.join("; ") };
+}
+async function renderPdfFirstPage(filePath) {
+  const { createCanvas } = await import("@napi-rs/canvas");
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const assets = pdfjsAssetDir();
+  const data = new Uint8Array(await fs4.promises.readFile(filePath));
+  const pdf = await pdfjs.getDocument({
+    data,
+    disableFontFace: true,
+    verbosity: 0,
+    // Without these, a PDF that leans on the standard 14 fonts or on CJK
+    // character maps renders with missing text.
+    standardFontDataUrl: path4.join(assets, "standard_fonts") + path4.sep,
+    cMapUrl: path4.join(assets, "cmaps") + path4.sep,
+    cMapPacked: true
+  }).promise;
+  try {
+    const page = await pdf.getPage(1);
+    const natural = page.getViewport({ scale: 1 });
+    const viewport = page.getViewport({ scale: MAX_SIDE / Math.max(natural.width, natural.height) });
+    const canvas = createCanvas(Math.round(viewport.width), Math.round(viewport.height));
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+    return new Uint8Array(await canvas.encode("jpeg", JPEG_QUALITY));
+  } finally {
+    await pdf.destroy();
+  }
+}
+async function renderImage(filePath) {
+  const { createCanvas, loadImage } = await import("@napi-rs/canvas");
+  const image = await loadImage(await fs4.promises.readFile(filePath));
+  const scale = Math.min(1, MAX_SIDE / Math.max(image.width, image.height));
+  const canvas = createCanvas(Math.max(1, Math.round(image.width * scale)), Math.max(1, Math.round(image.height * scale)));
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  return new Uint8Array(await canvas.encode("jpeg", JPEG_QUALITY));
+}
+function pdfjsAssetDir() {
+  const require2 = createRequire(import.meta.url);
+  return path4.dirname(require2.resolve("pdfjs-dist/package.json"));
+}
+async function renderWithMacTools(filePath, mimeType) {
   const tmpDir = await fs4.promises.mkdtemp(path4.join(os3.tmpdir(), "vault-thumb-"));
   const destJpeg = path4.join(tmpDir, "thumb.jpg");
   try {
     if (mimeType === "application/pdf") {
-      await runCommand("qlmanage", ["-t", "-s", "720", "-o", tmpDir, filePath]);
-      const files = await fs4.promises.readdir(tmpDir);
-      const png = files.find((f) => f.endsWith(".png"));
-      if (!png) return null;
-      await runCommand("sips", [
-        "-s",
-        "format",
-        "jpeg",
-        path4.join(tmpDir, png),
-        "--out",
-        destJpeg
-      ]);
+      await runCommand("qlmanage", ["-t", "-s", String(MAX_SIDE), "-o", tmpDir, filePath]);
+      const png = (await fs4.promises.readdir(tmpDir)).find((f) => f.endsWith(".png"));
+      if (!png) throw new Error("qlmanage produced no image");
+      await runCommand("sips", ["-s", "format", "jpeg", path4.join(tmpDir, png), "--out", destJpeg]);
     } else {
-      await runCommand("sips", [
-        "-Z",
-        "720",
-        "-s",
-        "format",
-        "jpeg",
-        filePath,
-        "--out",
-        destJpeg
-      ]);
+      await runCommand("sips", ["-Z", String(MAX_SIDE), "-s", "format", "jpeg", filePath, "--out", destJpeg]);
     }
-    const bytes = new Uint8Array(await fs4.promises.readFile(destJpeg));
-    return { bytes, mimeType: "image/jpeg" };
-  } catch {
-    return null;
+    return new Uint8Array(await fs4.promises.readFile(destJpeg));
   } finally {
     await fs4.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {
     });
@@ -2980,6 +3028,51 @@ function runCommand(cmd, args) {
     proc.on("error", reject);
     proc.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`)));
   });
+}
+
+// src/core/preview.ts
+init_crypto();
+init_database();
+async function attachPreview(convex, args) {
+  const { docId, vaultId, docKey, localDoc, filePath, mimeType } = args;
+  if (!canHaveThumbnail(mimeType)) return "none";
+  const thumb = await generateThumbnail(filePath, mimeType);
+  if (thumb.status === "skipped") return `skipped: ${thumb.reason}`;
+  try {
+    const encryptedThumbBytes = encrypt(thumb.bytes, docKey);
+    const previewUploadInfo = await convex.action(api.r2Assets.requestPreviewUploadUrl, {
+      blobId: docId,
+      vaultId,
+      mimeType: "application/octet-stream",
+      size: encryptedThumbBytes.length
+    });
+    const previewResp = await fetch(previewUploadInfo.url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: encryptedThumbBytes
+    });
+    if (!previewResp.ok) throw new Error(`R2 preview upload failed: ${previewResp.status}`);
+    await convex.mutation(api.r2Assets.patchPreviewAssetRef, {
+      blobId: docId,
+      vaultId,
+      provider: "r2",
+      key: previewUploadInfo.key,
+      mimeType: thumb.mimeType,
+      size: encryptedThumbBytes.length,
+      version: 1,
+      status: "ready"
+    });
+    localDoc.previewAssetProvider = "r2";
+    localDoc.previewAssetKey = previewUploadInfo.key;
+    localDoc.previewAssetMimeType = thumb.mimeType;
+    localDoc.previewAssetSize = encryptedThumbBytes.length;
+    localDoc.previewAssetVersion = 1;
+    localDoc.previewAssetStatus = "ready";
+    upsertDocument(localDoc);
+    return "ready";
+  } catch (err) {
+    return `skipped: ${err.message}`;
+  }
 }
 
 // src/cli/commands/doc.ts
@@ -3441,6 +3534,94 @@ function registerDocCommands(program2) {
       }
       process.exit(1);
     }
+  });
+  doc.command("preview").description("Make the thumbnail the phone shows for a document that has none (or --force to redo it)").argument("[ids...]", "Document ID(s)").option("--missing", "Every document that has a file but no thumbnail").option("--force", "Regenerate even if a thumbnail already exists").action(async (ids, opts) => {
+    const isJson = shouldOutputJson(program2.opts());
+    requireUnlocked(isJson);
+    let targets;
+    if (opts.missing) {
+      targets = getAllDocuments().filter(
+        (d) => !!d.fileAssetKey && !d.previewAssetKey && !!d.mimeType && canHaveThumbnail(d.mimeType)
+      );
+    } else {
+      targets = [];
+      for (const id of ids) {
+        const found = getDocumentById(id);
+        if (!found) {
+          if (isJson) {
+            output({ error: "Document not found", id });
+          } else {
+            console.error(`Document not found: ${id}`);
+          }
+          process.exit(1);
+        }
+        targets.push(found);
+      }
+    }
+    if (targets.length === 0) {
+      const msg = opts.missing ? "Every document with a file already has a thumbnail." : "Give a document ID, or --missing.";
+      if (isJson) {
+        output({ status: "nothing_to_do", message: msg, results: [] });
+      } else {
+        console.log(msg);
+      }
+      return;
+    }
+    const convex = await authenticateConvexClient();
+    const config = loadConfig();
+    const results = [];
+    for (const document of targets) {
+      const report = (preview) => {
+        results.push({ id: document.id, title: document.title, preview });
+        if (!isJson) console.log(`${preview === "ready" ? "\x1B[32m\u2713\x1B[0m" : "\u2013"} ${document.title}: ${preview}`);
+      };
+      if (document.previewAssetKey && !opts.force) {
+        report("already has one");
+        continue;
+      }
+      if (!document.fileAssetKey || !document.encryptedDocKey) {
+        report("skipped: no file stored for this document");
+        continue;
+      }
+      if (!document.mimeType || !canHaveThumbnail(document.mimeType)) {
+        report("none");
+        continue;
+      }
+      if (isConnectionSession() && !writeGoesDirect(document.vaultId, false)) {
+        report("skipped: this machine cannot write to that space without approval");
+        continue;
+      }
+      const spaceId = document.vaultId ?? config.vaultId ?? void 0;
+      const ext = { "application/pdf": "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/heic": "heic" }[document.mimeType] ?? "bin";
+      const tmpDir = fs5.mkdtempSync(path5.join(os5.tmpdir(), "vault-preview-"));
+      const tmpFile = path5.join(tmpDir, `file.${ext}`);
+      let docKey = null;
+      try {
+        const downloadInfo = await convex.action(api.r2Assets.requestFileDownloadUrl, {
+          blobId: document.id,
+          vaultId: spaceId
+        });
+        const response = await fetch(downloadInfo.url);
+        if (!response.ok) throw new Error(`download failed: ${response.status}`);
+        docKey = unwrapDocumentKey(document.encryptedDocKey, document);
+        const fileBytes = decrypt(new Uint8Array(await response.arrayBuffer()), docKey);
+        fs5.writeFileSync(tmpFile, fileBytes);
+        report(await attachPreview(convex, {
+          docId: document.id,
+          vaultId: spaceId,
+          docKey,
+          localDoc: document,
+          filePath: tmpFile,
+          mimeType: document.mimeType
+        }));
+      } catch (err) {
+        report(`skipped: ${err.message}`);
+      } finally {
+        docKey?.fill(0);
+        fs5.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }
+    if (isJson) output({ status: "done", results });
   });
   doc.command("create").description("Create a text/markdown document in the vault").requiredOption("--title <title>", "Document title").option("--content <content>", "Inline markdown content").option("--file <path>", "Read content from .txt/.md file").option("--type <type>", "Force document type (default: auto-classify)").option("--tags <tags>", "Comma-separated tags").action(async (opts) => {
     const isJson = shouldOutputJson(program2.opts());
@@ -4007,48 +4188,18 @@ function registerDocCommands(program2) {
         localDoc.fileAssetVersion = 1;
         localDoc.fileAssetStatus = "ready";
         upsertDocument(localDoc);
-        if (mimeType === "application/pdf" || mimeType.startsWith("image/")) {
-          if (!isJson) process.stderr.write("Generating preview thumbnail...\n");
-          try {
-            const thumb = await generateThumbnail(resolvedPath, mimeType);
-            if (thumb) {
-              const encryptedThumbBytes = encrypt(thumb.bytes, docKey);
-              const previewUploadInfo = await convex.action(api.r2Assets.requestPreviewUploadUrl, {
-                blobId: docId,
-                vaultId: vaultId ?? void 0,
-                mimeType: "application/octet-stream",
-                size: encryptedThumbBytes.length
-              });
-              const previewResp = await fetch(previewUploadInfo.url, {
-                method: "PUT",
-                headers: { "Content-Type": "application/octet-stream" },
-                body: encryptedThumbBytes
-              });
-              if (!previewResp.ok) throw new Error(`R2 preview upload failed: ${previewResp.status}`);
-              await convex.mutation(api.r2Assets.patchPreviewAssetRef, {
-                blobId: docId,
-                vaultId: vaultId ?? void 0,
-                provider: "r2",
-                key: previewUploadInfo.key,
-                mimeType: thumb.mimeType,
-                size: encryptedThumbBytes.length,
-                version: 1,
-                status: "ready"
-              });
-              localDoc.previewAssetProvider = "r2";
-              localDoc.previewAssetKey = previewUploadInfo.key;
-              localDoc.previewAssetMimeType = thumb.mimeType;
-              localDoc.previewAssetSize = encryptedThumbBytes.length;
-              localDoc.previewAssetVersion = 1;
-              localDoc.previewAssetStatus = "ready";
-              upsertDocument(localDoc);
-            }
-          } catch (previewErr) {
-            if (!isJson) {
-              process.stderr.write(`Preview generation skipped: ${previewErr.message}
+        if (!isJson && canHaveThumbnail(mimeType)) process.stderr.write("Generating preview thumbnail...\n");
+        const preview = await attachPreview(convex, {
+          docId,
+          vaultId: vaultId ?? void 0,
+          docKey,
+          localDoc,
+          filePath: resolvedPath,
+          mimeType
+        });
+        if (!isJson && preview.startsWith("skipped")) {
+          process.stderr.write(`Preview ${preview}
 `);
-            }
-          }
         }
         docKey.fill(0);
         const result = {
@@ -4058,7 +4209,8 @@ function registerDocCommands(program2) {
           type: localDoc.type,
           tags: localDoc.tags,
           owner: localDoc.owner,
-          hasEmbedding: !!(extracted.embedding && extracted.embedding.length > 0)
+          hasEmbedding: !!(extracted.embedding && extracted.embedding.length > 0),
+          preview
         };
         if (isJson) {
           if (filePaths.length === 1) output(result);
@@ -5678,7 +5830,7 @@ function listGrantedDocs(client2) {
 }
 
 // src/mcp/server.ts
-var MCP_SERVER_VERSION = "0.3.1";
+var MCP_SERVER_VERSION = "0.3.2";
 var stagedDropFiles = /* @__PURE__ */ new Map();
 var hasSyncedThisSession = false;
 function errorMessage(error) {
@@ -6367,8 +6519,9 @@ function createMcpServer(options = {}) {
       localDoc.fileAssetVersion = 1;
       localDoc.fileAssetStatus = "ready";
       upsertDocument(localDoc);
+      const preview = await attachPreview(convex, { docId, vaultId, docKey, localDoc, filePath, mimeType });
       docKey.fill(0);
-      return json({ status: "uploaded", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags });
+      return json({ status: "uploaded", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags, preview });
     }
   );
   async function createTextDoc(args) {
@@ -7899,7 +8052,7 @@ function commandArgs(key, actionCommand) {
 }
 var reporting = null;
 var program = new Command();
-program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.1").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
+program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.2").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
   const commandName = actionCommand.name();
   const parentName = actionCommand.parent?.name();
   const skipAutoUnlock = parentName === "auth" || commandName === "unlock" || commandName === "lock";
