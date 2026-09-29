@@ -2396,7 +2396,8 @@ function registerAuthCommands(program2) {
     if (intended) say(`  For:           ${intended.display}`);
     say(`  Fingerprint:   ${pending2.fingerprint}`);
     say("");
-    say("  Approve on your phone. Check the code matches.");
+    say("  Keep the moi vault app open on your phone. If you copied this command,");
+    say("  it connects by itself; otherwise approve there when the codes match.");
     say("");
     const timeoutMs = Math.max(1, Number(opts.timeout) || 10) * 60 * 1e3;
     let dots = 0;
@@ -4232,6 +4233,11 @@ function registerDocCommands(program2) {
     }
     if (isJson && filePaths.length > 1) {
       output(results);
+    } else if (isJson && results.length > 0) {
+      output(results[0]);
+    }
+    if (results.some((r) => typeof r === "object" && r !== null && "error" in r)) {
+      process.exitCode = 1;
     }
   });
 }
@@ -5830,7 +5836,7 @@ function listGrantedDocs(client2) {
 }
 
 // src/mcp/server.ts
-var MCP_SERVER_VERSION = "0.3.2";
+var MCP_SERVER_VERSION = "0.3.3";
 var stagedDropFiles = /* @__PURE__ */ new Map();
 var hasSyncedThisSession = false;
 function errorMessage(error) {
@@ -8052,7 +8058,7 @@ function commandArgs(key, actionCommand) {
 }
 var reporting = null;
 var program = new Command();
-program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.2").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
+program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.3").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").hook("preAction", async (thisCommand, actionCommand) => {
   const commandName = actionCommand.name();
   const parentName = actionCommand.parent?.name();
   const skipAutoUnlock = parentName === "auth" || commandName === "unlock" || commandName === "lock";

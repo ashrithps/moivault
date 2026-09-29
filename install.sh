@@ -392,6 +392,6 @@ else
   echo "  Get started:"
   echo "    1. Open moi vault → Settings → AI agents → Connect an agent"
   echo "    2. Copy the command and paste it here"
-  echo "    3. Approve on your phone when the codes match"
+  echo "    3. Keep the app open: a copied command connects by itself"
 fi
 echo ""
