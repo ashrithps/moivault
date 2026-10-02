@@ -129,6 +129,20 @@ if ! (cd "$INSTALL_DIR" && npm install --omit=dev --no-audit --no-fund > "$INSTA
   exit 1
 fi
 
+# The Vault Browser drives the Google Chrome already on this machine (a real
+# Chrome is what sites expect to see). Without one it needs Patchright's
+# Chromium, a ~150 MB download, so ask rather than fetch it silently.
+HAS_CHROME=""
+if [ "$PLATFORM" = "macos" ]; then
+  [ -d "/Applications/Google Chrome.app" ] || [ -d "$HOME/Applications/Google Chrome.app" ] && HAS_CHROME="1"
+else
+  command -v google-chrome &> /dev/null || command -v google-chrome-stable &> /dev/null && HAS_CHROME="1"
+fi
+if [ -z "$HAS_CHROME" ]; then
+  echo "  ! Google Chrome not found. The Vault Browser (agents fill forms without seeing your secrets) needs it,"
+  echo "    or Patchright's Chromium: (cd $INSTALL_DIR && npx patchright install chromium)"
+fi
+
 # Create launcher script with absolute node path (fixes Claude Desktop / MCP PATH issues)
 NODE_PATH=$(command -v node)
 cat > "$BIN_DIR/moivault" << LAUNCHER
