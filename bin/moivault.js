@@ -5344,8 +5344,8 @@ function spaceForNewDoc() {
 async function commitDocWrite(w) {
   const keys = getVaultKeys();
   if (!w.isNew) {
-    let row = null;
-    try {
+    let row = w.before ?? null;
+    if (w.before === void 0) try {
       row = getDocumentById(w.blobId);
     } catch {
     }
@@ -5420,6 +5420,40 @@ async function commitDelete(args) {
   return { status: "pending_approval", requestId: result.requestId, dropId: result.dropId };
 }
 var PENDING_APPROVAL_MESSAGE = "Proposed on the user's phone. Nothing is saved until they approve it \u2014 check with vault_request_status.";
+function existingCopy(docId) {
+  let doc = null;
+  try {
+    doc = getDocumentById(docId);
+  } catch {
+  }
+  if (!doc?.encryptedDocKey?.length || !doc.fileAssetKey || doc.fileAssetStatus && doc.fileAssetStatus !== "ready") return null;
+  try {
+    return { doc, docKey: unwrapDocumentKey(doc.encryptedDocKey, doc) };
+  } catch {
+    return null;
+  }
+}
+function carryAssets(into, from) {
+  for (const k of [
+    "fileAssetProvider",
+    "fileAssetKey",
+    "fileAssetMimeType",
+    "fileAssetSize",
+    "fileAssetVersion",
+    "fileAssetStatus",
+    "previewAssetProvider",
+    "previewAssetKey",
+    "previewAssetMimeType",
+    "previewAssetSize",
+    "previewAssetVersion",
+    "previewAssetStatus"
+  ]) {
+    into[k] = from[k];
+  }
+}
+function hasPreview(doc) {
+  return !!doc.previewAssetKey && (!doc.previewAssetStatus || doc.previewAssetStatus === "ready");
+}
 
 // src/cli/commands/doc.ts
 init_client();
@@ -5578,7 +5612,7 @@ function registerDocCommands(program2) {
         blobId: id,
         vaultId: updatedDoc.vaultId,
         docKey,
-        row: updatedDoc,
+        row: document,
         payload: {
           title: updatedDoc.title,
           rawText: updatedDoc.rawText,
@@ -6105,7 +6139,7 @@ function registerDocCommands(program2) {
         blobId: id,
         vaultId: updatedDoc.vaultId,
         docKey,
-        row: updatedDoc,
+        row: localDoc,
         payload: {
           title: updatedDoc.title,
           rawText: updatedDoc.rawText,
@@ -6335,13 +6369,14 @@ function registerDocCommands(program2) {
         }
         if (!isJson) process.stderr.write("Encrypting...\n");
         const { vaultKey } = getVaultKeys();
-        const docKey = generateDocumentKey();
-        const encryptedFileBytes = encrypt(fileBytes, docKey);
+        const prior = existingCopy(docId);
+        const docKey = prior?.docKey ?? generateDocumentKey();
+        const encryptedFileBytes = prior ? new Uint8Array() : encrypt(fileBytes, docKey);
         try {
           await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
         } catch {
         }
-        const wrapped = wrapDocumentKey(docKey, spaceForNewDoc());
+        const wrapped = wrapDocumentKey(docKey, prior?.doc.vaultId ?? spaceForNewDoc());
         const wrappedDocKey = wrapped.encryptedDocKey;
         const now = Date.now();
         const config = loadConfig();
@@ -6408,38 +6443,43 @@ function registerDocCommands(program2) {
             keyVersion: wrapped.keyVersion
           });
         }
-        if (!isJson) process.stderr.write("Uploading encrypted file to R2...\n");
-        const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, {
-          blobId: docId,
-          vaultId: vaultId ?? void 0,
-          mimeType: "application/octet-stream",
-          size: encryptedFileBytes.length
-        });
-        const r2Resp = await fetch(fileUploadInfo.url, {
-          method: "PUT",
-          headers: { "Content-Type": "application/octet-stream" },
-          body: encryptedFileBytes
-        });
-        if (!r2Resp.ok) throw new Error(`R2 upload failed: ${r2Resp.status}`);
-        await convex.mutation(api.r2Assets.patchFileAssetRef, {
-          blobId: docId,
-          vaultId: vaultId ?? void 0,
-          provider: "r2",
-          key: fileUploadInfo.key,
-          mimeType,
-          size: encryptedFileBytes.length,
-          version: 1,
-          status: "ready"
-        });
-        localDoc.fileAssetProvider = "r2";
-        localDoc.fileAssetKey = fileUploadInfo.key;
-        localDoc.fileAssetMimeType = mimeType;
-        localDoc.fileAssetSize = encryptedFileBytes.length;
-        localDoc.fileAssetVersion = 1;
-        localDoc.fileAssetStatus = "ready";
-        upsertDocument2(localDoc);
-        if (!isJson && canHaveThumbnail(mimeType)) process.stderr.write("Generating preview thumbnail...\n");
-        const preview = await attachPreview(convex, {
+        if (prior) {
+          carryAssets(localDoc, prior.doc);
+          upsertDocument2(localDoc);
+        } else {
+          if (!isJson) process.stderr.write("Uploading encrypted file to R2...\n");
+          const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, {
+            blobId: docId,
+            vaultId: vaultId ?? void 0,
+            mimeType: "application/octet-stream",
+            size: encryptedFileBytes.length
+          });
+          const r2Resp = await fetch(fileUploadInfo.url, {
+            method: "PUT",
+            headers: { "Content-Type": "application/octet-stream" },
+            body: encryptedFileBytes
+          });
+          if (!r2Resp.ok) throw new Error(`R2 upload failed: ${r2Resp.status}`);
+          await convex.mutation(api.r2Assets.patchFileAssetRef, {
+            blobId: docId,
+            vaultId: vaultId ?? void 0,
+            provider: "r2",
+            key: fileUploadInfo.key,
+            mimeType,
+            size: encryptedFileBytes.length,
+            version: 1,
+            status: "ready"
+          });
+          localDoc.fileAssetProvider = "r2";
+          localDoc.fileAssetKey = fileUploadInfo.key;
+          localDoc.fileAssetMimeType = mimeType;
+          localDoc.fileAssetSize = encryptedFileBytes.length;
+          localDoc.fileAssetVersion = 1;
+          localDoc.fileAssetStatus = "ready";
+          upsertDocument2(localDoc);
+        }
+        if (!isJson && canHaveThumbnail(mimeType) && !hasPreview(localDoc)) process.stderr.write("Generating preview thumbnail...\n");
+        const preview = hasPreview(localDoc) ? "ready" : await attachPreview(convex, {
           docId,
           vaultId: vaultId ?? void 0,
           docKey,
@@ -8598,7 +8638,7 @@ function registerBrowserTools(server2, clientOf) {
 
 // src/mcp/server.ts
 init_secretSeal();
-var MCP_SERVER_VERSION = "0.3.4";
+var MCP_SERVER_VERSION = "0.3.5";
 var stagedDropFiles = /* @__PURE__ */ new Map();
 var hasSyncedThisSession = false;
 function errorMessage(error) {
@@ -9093,6 +9133,7 @@ function createMcpServer(options = {}) {
           // A new value for a secret field is a placeholder in the local row; the write carries the value.
           payload: isSecretField(field, value) ? { ...buildDocPayload(updatedDoc), fields: { ...updatedDoc.fields, [field]: value } } : buildDocPayload(updatedDoc),
           isNew: false,
+          before: doc,
           client: clientOf(),
           tool: "vault_doc_edit",
           summary: `Edit ${field} of "${doc.title}"`,
@@ -9251,8 +9292,9 @@ function createMcpServer(options = {}) {
         } catch {
         }
       }
-      const docKey = generateDocumentKey();
-      const encFileBytes = encrypt(fileBytes, docKey);
+      const prior = direct ? existingCopy(docId) : null;
+      const docKey = prior?.docKey ?? generateDocumentKey();
+      const encFileBytes = prior ? new Uint8Array() : encrypt(fileBytes, docKey);
       try {
         await convex.mutation(api.storage.deleteFile, { storageId: persistedStorageId });
       } catch {
@@ -9305,6 +9347,7 @@ function createMcpServer(options = {}) {
         blobId: docId,
         docKey,
         isNew: true,
+        spaceId: prior?.doc.vaultId,
         client: clientOf(),
         tool: "vault_doc_upload",
         payload,
@@ -9318,18 +9361,22 @@ function createMcpServer(options = {}) {
       localDoc.keyVersion = outcome.keyVersion;
       localDoc.vaultId = outcome.spaceId ?? void 0;
       const vaultId = outcome.spaceId ?? void 0;
-      const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, { blobId: docId, vaultId, mimeType: "application/octet-stream", size: encFileBytes.length });
-      const r2Resp = await fetch(fileUploadInfo.url, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: encFileBytes });
-      if (!r2Resp.ok) throw new Error(`R2 upload failed: ${r2Resp.status}`);
-      await convex.mutation(api.r2Assets.patchFileAssetRef, { blobId: docId, vaultId, provider: "r2", key: fileUploadInfo.key, mimeType, size: encFileBytes.length, version: 1, status: "ready" });
-      localDoc.fileAssetProvider = "r2";
-      localDoc.fileAssetKey = fileUploadInfo.key;
-      localDoc.fileAssetMimeType = mimeType;
-      localDoc.fileAssetSize = encFileBytes.length;
-      localDoc.fileAssetVersion = 1;
-      localDoc.fileAssetStatus = "ready";
+      if (prior) {
+        carryAssets(localDoc, prior.doc);
+      } else {
+        const fileUploadInfo = await convex.action(api.r2Assets.requestFileUploadUrl, { blobId: docId, vaultId, mimeType: "application/octet-stream", size: encFileBytes.length });
+        const r2Resp = await fetch(fileUploadInfo.url, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: encFileBytes });
+        if (!r2Resp.ok) throw new Error(`R2 upload failed: ${r2Resp.status}`);
+        await convex.mutation(api.r2Assets.patchFileAssetRef, { blobId: docId, vaultId, provider: "r2", key: fileUploadInfo.key, mimeType, size: encFileBytes.length, version: 1, status: "ready" });
+        localDoc.fileAssetProvider = "r2";
+        localDoc.fileAssetKey = fileUploadInfo.key;
+        localDoc.fileAssetMimeType = mimeType;
+        localDoc.fileAssetSize = encFileBytes.length;
+        localDoc.fileAssetVersion = 1;
+        localDoc.fileAssetStatus = "ready";
+      }
       upsertDocument2(localDoc);
-      const preview = await attachPreview(convex, { docId, vaultId, docKey, localDoc, filePath, mimeType });
+      const preview = hasPreview(localDoc) ? "ready" : await attachPreview(convex, { docId, vaultId, docKey, localDoc, filePath, mimeType });
       docKey.fill(0);
       return json({ status: "uploaded", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags, preview });
     }
@@ -9472,6 +9519,7 @@ ${args.content}` });
           payload: buildDocPayload(updatedDoc),
           spaceId: updatedDoc.vaultId,
           isNew: false,
+          before: localDoc,
           client: clientOf(),
           tool: "vault_doc_update_content",
           summary: `Replace the content of "${localDoc.title}"`,
@@ -10868,7 +10916,7 @@ function commandArgs(key, actionCommand) {
 }
 var reporting = null;
 var program = new Command();
-program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.4").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").option("--reveal", "Show secret values (ID, account, card numbers) unmasked \u2014 asks your phone first on a paired machine").hook("preAction", async (thisCommand, actionCommand) => {
+program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.5").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").option("--reveal", "Show secret values (ID, account, card numbers) unmasked \u2014 asks your phone first on a paired machine").hook("preAction", async (thisCommand, actionCommand) => {
   const commandName = actionCommand.name();
   const parentName = actionCommand.parent?.name();
   const skipAutoUnlock = parentName === "auth" || commandName === "unlock" || commandName === "lock";
