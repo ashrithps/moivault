@@ -71,6 +71,230 @@ var init_config = __esm({
   }
 });
 
+// src/core/keychain.ts
+import fs2 from "fs";
+import path2 from "path";
+import crypto from "crypto";
+import { spawnSync } from "child_process";
+function serviceName() {
+  const override = process.env.MOIVAULT_CONFIG_DIR;
+  if (!override) return "moivault";
+  const tag = crypto.createHash("sha256").update(path2.resolve(override)).digest("hex").slice(0, 8);
+  return `moivault-${tag}`;
+}
+function assertKeyName(key) {
+  if (!/^[a-z0-9_]+$/.test(key)) throw new Error(`Invalid keychain key: ${key}`);
+}
+function createMacBackend() {
+  const service = serviceName();
+  function run2(args, input) {
+    return spawnSync(SECURITY, args, { input, encoding: "utf-8", timeout: 1e4 });
+  }
+  function read(key) {
+    const r = run2(["find-generic-password", "-s", service, "-a", key, "-w"]);
+    if (r.status === 44) return null;
+    if (r.status !== 0) throw new Error(`security find-generic-password failed (${r.status})`);
+    const stored = r.stdout.replace(/\n$/, "");
+    return Buffer.from(stored, "base64").toString("utf-8");
+  }
+  return {
+    async get(key) {
+      assertKeyName(key);
+      return read(key);
+    },
+    async set(key, value) {
+      assertKeyName(key);
+      const encoded = Buffer.from(value, "utf-8").toString("base64");
+      const command = `add-generic-password -U -s "${service}" -a "${key}" -l "moivault ${key}" -w "${encoded}"
+`;
+      const r = run2(["-i"], command);
+      if (r.status !== 0) throw new Error(`security add-generic-password failed (${r.status})`);
+      if (read(key) !== value) throw new Error("Keychain write did not read back");
+    },
+    async delete(key) {
+      assertKeyName(key);
+      const r = run2(["delete-generic-password", "-s", service, "-a", key]);
+      if (r.status !== 0 && r.status !== 44) {
+        throw new Error(`security delete-generic-password failed (${r.status})`);
+      }
+    }
+  };
+}
+function hasSecretTool() {
+  const r = spawnSync("sh", ["-c", "command -v secret-tool"], { encoding: "utf-8" });
+  return r.status === 0 && r.stdout.trim().length > 0;
+}
+function createSecretToolBackend() {
+  const service = serviceName();
+  const attrs = (key) => ["service", service, "account", key];
+  return {
+    async get(key) {
+      assertKeyName(key);
+      const r = spawnSync("secret-tool", ["lookup", ...attrs(key)], { encoding: "utf-8", timeout: 1e4 });
+      if (r.status !== 0) {
+        if (r.error || r.stderr && r.stderr.trim()) throw new Error("secret-tool lookup failed");
+        return null;
+      }
+      return r.stdout.length > 0 ? r.stdout : null;
+    },
+    async set(key, value) {
+      assertKeyName(key);
+      const r = spawnSync("secret-tool", ["store", `--label=moivault ${key}`, ...attrs(key)], {
+        input: value,
+        encoding: "utf-8",
+        timeout: 1e4
+      });
+      if (r.status !== 0) throw new Error("secret-tool store failed");
+    },
+    async delete(key) {
+      assertKeyName(key);
+      spawnSync("secret-tool", ["clear", ...attrs(key)], { encoding: "utf-8", timeout: 1e4 });
+    }
+  };
+}
+function secretsFilePath() {
+  return path2.join(getConfigDir(), "secrets.json");
+}
+function readSecretsFile() {
+  const file = secretsFilePath();
+  if (!fs2.existsSync(file)) return {};
+  try {
+    return JSON.parse(fs2.readFileSync(file, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+function writeSecretsFile(secrets) {
+  const file = secretsFilePath();
+  if (Object.keys(secrets).length === 0) {
+    fs2.rmSync(file, { force: true });
+    return;
+  }
+  fs2.writeFileSync(file, JSON.stringify(secrets, null, 2), { mode: 384 });
+}
+function createFileBackend() {
+  return {
+    async get(key) {
+      return readSecretsFile()[key] ?? null;
+    },
+    async set(key, value) {
+      const secrets = readSecretsFile();
+      secrets[key] = value;
+      writeSecretsFile(secrets);
+    },
+    async delete(key) {
+      const secrets = readSecretsFile();
+      if (!(key in secrets)) return;
+      delete secrets[key];
+      writeSecretsFile(secrets);
+    }
+  };
+}
+function createLayeredBackend(primary, name) {
+  const file = createFileBackend();
+  let migrated = false;
+  async function migrate() {
+    if (migrated) return;
+    migrated = true;
+    const secrets = readSecretsFile();
+    const keys = Object.keys(secrets);
+    if (keys.length === 0) return;
+    const remaining = {};
+    for (const key of keys) {
+      try {
+        assertKeyName(key);
+        await primary.set(key, secrets[key]);
+        if (await primary.get(key) !== secrets[key]) throw new Error("mismatch");
+      } catch {
+        remaining[key] = secrets[key];
+      }
+    }
+    writeSecretsFile(remaining);
+  }
+  return {
+    name,
+    async get(key) {
+      await migrate();
+      try {
+        const value = await primary.get(key);
+        if (value !== null) return value;
+      } catch {
+      }
+      return file.get(key);
+    },
+    async set(key, value) {
+      assertKeyName(key);
+      await migrate();
+      try {
+        await primary.set(key, value);
+        await file.delete(key);
+      } catch {
+        await file.set(key, value);
+      }
+    },
+    async delete(key) {
+      try {
+        await primary.delete(key);
+      } catch {
+      }
+      await file.delete(key);
+    }
+  };
+}
+function getKeychain() {
+  return resolveBackend();
+}
+function getKeychainBackendName() {
+  return resolveBackend().name;
+}
+function resolveBackend() {
+  if (backend) return backend;
+  const forced = process.env.MOIVAULT_KEYCHAIN;
+  if (forced === "file") {
+    backend = { ...createFileBackend(), name: "file" };
+  } else if (process.platform === "darwin" && fs2.existsSync(SECURITY)) {
+    backend = createLayeredBackend(createMacBackend(), "macos-keychain");
+  } else if (process.platform === "linux" && hasSecretTool()) {
+    backend = createLayeredBackend(createSecretToolBackend(), "secret-service");
+  } else {
+    backend = { ...createFileBackend(), name: "file" };
+  }
+  return backend;
+}
+async function wipeAllSecrets() {
+  const kc = resolveBackend();
+  for (const key of ALL_SECRET_KEYS) {
+    try {
+      await kc.delete(key);
+    } catch {
+    }
+  }
+}
+var ALL_SECRET_KEYS, SECURITY, backend;
+var init_keychain = __esm({
+  "src/core/keychain.ts"() {
+    "use strict";
+    init_config();
+    ALL_SECRET_KEYS = [
+      // Agent connection (current)
+      "connection_id",
+      "credential",
+      "conn_private_key",
+      "conn_public_key",
+      "serve_secret",
+      // Legacy install (cookie + MUK)
+      "session_cookie",
+      "muk",
+      "secret_key",
+      "salt",
+      "wrapped_vault_key",
+      "master_password"
+    ];
+    SECURITY = "/usr/bin/security";
+    backend = null;
+  }
+});
+
 // src/shared/constants.ts
 var VAULT_KEY_BYTES, DOCUMENT_KEY_BYTES, MUK_BYTES, IV_BYTES, AUTH_TAG_BYTES, PBKDF2_ITERATIONS, PBKDF2_HASH, BLOB_VERSION;
 var init_constants = __esm({
@@ -181,6 +405,1510 @@ var init_crypto = __esm({
   }
 });
 
+// src/core/keyExchange.ts
+import crypto3 from "crypto";
+function publicKeyObject(raw) {
+  if (raw.length !== X25519_KEY_BYTES) {
+    throw new Error(`X25519 public key must be 32 bytes, got ${raw.length}`);
+  }
+  return crypto3.createPublicKey({
+    key: Buffer.concat([SPKI_PREFIX, Buffer.from(raw)]),
+    format: "der",
+    type: "spki"
+  });
+}
+function privateKeyObject(raw) {
+  if (raw.length !== X25519_KEY_BYTES) {
+    throw new Error(`X25519 private key must be 32 bytes, got ${raw.length}`);
+  }
+  return crypto3.createPrivateKey({
+    key: Buffer.concat([PKCS8_PREFIX, Buffer.from(raw)]),
+    format: "der",
+    type: "pkcs8"
+  });
+}
+function deriveWrappingKey(sharedSecret, ephemeralPublicKey, recipientPublicKey) {
+  const hash = crypto3.createHash("sha256");
+  hash.update(sharedSecret);
+  hash.update(ephemeralPublicKey);
+  hash.update(recipientPublicKey);
+  return new Uint8Array(hash.digest());
+}
+function rawPublicKey(key) {
+  return new Uint8Array(key.export({ format: "der", type: "spki" }).subarray(SPKI_PREFIX.length));
+}
+function rawPrivateKey(key) {
+  return new Uint8Array(key.export({ format: "der", type: "pkcs8" }).subarray(PKCS8_PREFIX.length));
+}
+function generateKeyPair() {
+  const kp = crypto3.generateKeyPairSync("x25519");
+  return { publicKey: rawPublicKey(kp.publicKey), privateKey: rawPrivateKey(kp.privateKey) };
+}
+function sealToPublicKey(plaintext, recipientPublicKey) {
+  const recipient = publicKeyObject(recipientPublicKey);
+  const ephemeral = crypto3.generateKeyPairSync("x25519");
+  const ephemeralPublicKey = rawPublicKey(ephemeral.publicKey);
+  const shared = new Uint8Array(
+    crypto3.diffieHellman({ privateKey: ephemeral.privateKey, publicKey: recipient })
+  );
+  const wrappingKey = deriveWrappingKey(shared, ephemeralPublicKey, recipientPublicKey);
+  const payload = encrypt(plaintext, wrappingKey);
+  shared.fill(0);
+  wrappingKey.fill(0);
+  const envelope = new Uint8Array(1 + X25519_KEY_BYTES + payload.length);
+  envelope[0] = ENVELOPE_VERSION;
+  envelope.set(ephemeralPublicKey, 1);
+  envelope.set(payload, 1 + X25519_KEY_BYTES);
+  return envelope;
+}
+function fingerprint(publicKey) {
+  const hex = crypto3.createHash("sha256").update(publicKey).digest("hex").slice(0, 16).toUpperCase();
+  return hex.match(/.{4}/g).join("-");
+}
+function openSealed(envelope, recipientPrivateKey, recipientPublicKey) {
+  if (envelope.length < 1 + X25519_KEY_BYTES + 1) {
+    throw new Error("Sealed envelope too short");
+  }
+  if (envelope[0] !== ENVELOPE_VERSION) {
+    throw new Error(`Unsupported envelope version: ${envelope[0]}`);
+  }
+  const ephemeralPublicKey = envelope.subarray(1, 1 + X25519_KEY_BYTES);
+  const payload = envelope.subarray(1 + X25519_KEY_BYTES);
+  const shared = new Uint8Array(
+    crypto3.diffieHellman({
+      privateKey: privateKeyObject(recipientPrivateKey),
+      publicKey: publicKeyObject(ephemeralPublicKey)
+    })
+  );
+  const wrappingKey = deriveWrappingKey(shared, ephemeralPublicKey, recipientPublicKey);
+  try {
+    return decrypt(payload, wrappingKey);
+  } finally {
+    shared.fill(0);
+    wrappingKey.fill(0);
+  }
+}
+var X25519_KEY_BYTES, ENVELOPE_VERSION, SPKI_PREFIX, PKCS8_PREFIX;
+var init_keyExchange = __esm({
+  "src/core/keyExchange.ts"() {
+    "use strict";
+    init_crypto();
+    X25519_KEY_BYTES = 32;
+    ENVELOPE_VERSION = 2;
+    SPKI_PREFIX = Buffer.from("302a300506032b656e032100", "hex");
+    PKCS8_PREFIX = Buffer.from("302e020100300506032b656e04220420", "hex");
+  }
+});
+
+// src/browser/secrets.ts
+import crypto4 from "crypto";
+function isSecretField(key, value) {
+  if (typeof value !== "string" && typeof value !== "number") return false;
+  if (String(value).trim().length < MIN_SECRET_LENGTH) return false;
+  return SECRET_FIELD_KEYS.has(key) || SECRET_FIELD_PATTERN.test(key);
+}
+function maskValue(value) {
+  const v = value.trim();
+  const tail = v.length >= 8 ? v.slice(-4) : "";
+  return "\u2022".repeat(Math.max(4, Math.min(8, v.length - tail.length))) + tail;
+}
+function secretVariants(value) {
+  const raw = value.trim();
+  const compact = raw.replace(/[\s\-./]/g, "");
+  const out = /* @__PURE__ */ new Set();
+  for (const v of [raw, compact]) {
+    if (v.length < MIN_SECRET_LENGTH) continue;
+    out.add(v);
+    out.add(v.toUpperCase());
+    out.add(v.toLowerCase());
+    out.add(encodeURIComponent(v));
+    out.add(encodeURIComponent(v).replace(/%20/g, "+"));
+    out.add(Buffer.from(v).toString("base64").replace(/=+$/, ""));
+    out.add(v.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`));
+  }
+  if (compact.length >= 8 && compact !== raw) out.add(compact.match(/.{1,4}/g).join(" "));
+  return [...out].filter((v) => v.length >= MIN_SECRET_LENGTH);
+}
+function looseRegex(value) {
+  const compact = value.replace(/[\s\-./]/g, "");
+  if (compact.length < 6) return null;
+  const body = [...compact].map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\s\\-./]{0,2}");
+  return new RegExp(body, "gi");
+}
+function presentFields(fields, doc, refs2) {
+  const walk = (value, key, pathKey) => {
+    if (value && typeof value === "object" && !Array.isArray(value) && typeof value.$secret === "string") {
+      const rec = refs2.mint({ docId: doc.id, docType: doc.type, docTitle: doc.title, field: pathKey, mask: value.$secret });
+      return { ref: rec.ref, mask: rec.mask };
+    }
+    if (isSecretField(key, value)) {
+      const rec = refs2.mint({ docId: doc.id, docType: doc.type, docTitle: doc.title, field: pathKey, value: String(value).trim() });
+      return { ref: rec.ref, mask: rec.mask };
+    }
+    if (Array.isArray(value)) return value.map((v, i) => walk(v, key, `${pathKey}.${i}`));
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v, k, `${pathKey}.${k}`)]));
+    }
+    return value;
+  };
+  return Object.fromEntries(Object.entries(fields ?? {}).map(([k, v]) => [k, walk(v, k, k)]));
+}
+var SECRET_FIELD_KEYS, SECRET_FIELD_PATTERN, MIN_SECRET_LENGTH, MRZ_LINE, MRZ_MASK, Scrubber, REF_TTL_MS, RefStore;
+var init_secrets = __esm({
+  "src/browser/secrets.ts"() {
+    "use strict";
+    SECRET_FIELD_KEYS = /* @__PURE__ */ new Set([
+      "idNumber",
+      "passportNumber",
+      "documentNumber",
+      "visaNumber",
+      "licenseNumber",
+      "vin",
+      "policyNumber",
+      "accountNumber",
+      "iban",
+      "cardNumber",
+      "pin",
+      "cvv",
+      "loanNumber",
+      "memberId",
+      "employeeId",
+      "taxIdNumber",
+      "taxNumber",
+      "panNumber",
+      "ssn",
+      "aadhaarNumber",
+      "nationalId",
+      "registrationNumber"
+    ]);
+    SECRET_FIELD_PATTERN = /(passport|account|card|policy|licen[cs]e|loan|tax|pan|aadhaar|ssn|social|national|document|member|employee|customer|iban|routing|sort.?code)[ _-]?(number|no|num|id)?$|^(pin|cvv|cvc|iban|ssn)$/i;
+    MIN_SECRET_LENGTH = 4;
+    MRZ_LINE = /(?<![A-Z0-9<])[A-Z0-9<]{28,44}(?![A-Z0-9<])/g;
+    MRZ_MASK = "[machine-readable zone hidden]";
+    Scrubber = class {
+      entries = /* @__PURE__ */ new Map();
+      /** Idempotent. Returns the mask shown in place of the value. */
+      add(value, mask = maskValue(value)) {
+        const key = value.trim();
+        if (key.length < MIN_SECRET_LENGTH) return mask;
+        if (!this.entries.has(key)) {
+          const variants = secretVariants(key).sort((a, b) => b.length - a.length);
+          this.entries.set(key, { mask, variants, loose: looseRegex(key) });
+        }
+        return this.entries.get(key).mask;
+      }
+      values() {
+        return [...this.entries.keys()];
+      }
+      /** Every variant of every secret, for code that must search a page for them itself. */
+      allVariants() {
+        return [...this.entries.values()].flatMap((e) => e.variants);
+      }
+      get size() {
+        return this.entries.size;
+      }
+      /** Masks every known secret (and every MRZ line) in `text`. */
+      scrub(text2, hits) {
+        let out = text2;
+        for (const { mask, variants, loose } of this.entries.values()) {
+          let count = 0;
+          for (const v of variants) {
+            if (!out.includes(v)) continue;
+            const parts = out.split(v);
+            count += parts.length - 1;
+            out = parts.join(mask);
+          }
+          if (loose) {
+            out = out.replace(loose, () => {
+              count++;
+              return mask;
+            });
+          }
+          if (count && hits) hits.push({ mask, count });
+        }
+        if (MRZ_LINE.test(out)) {
+          MRZ_LINE.lastIndex = 0;
+          out = out.replace(MRZ_LINE, (m) => /<</.test(m) || /</.test(m) && /\d/.test(m) ? MRZ_MASK : m);
+        }
+        MRZ_LINE.lastIndex = 0;
+        return out;
+      }
+      /** True when `text` still holds any known secret — the egress check that fails closed. */
+      leaks(text2) {
+        for (const { variants, loose } of this.entries.values()) {
+          if (variants.some((v) => text2.includes(v))) return true;
+          if (loose) {
+            loose.lastIndex = 0;
+            if (loose.test(text2)) return true;
+          }
+        }
+        return false;
+      }
+    };
+    REF_TTL_MS = 60 * 60 * 1e3;
+    RefStore = class {
+      constructor(scrubber3) {
+        this.scrubber = scrubber3;
+      }
+      byRef = /* @__PURE__ */ new Map();
+      byField = /* @__PURE__ */ new Map();
+      mint(input) {
+        const key = `${input.docId}\0${input.field}`;
+        const existing = this.byField.get(key);
+        if (existing) {
+          const rec2 = this.get(existing);
+          if (rec2 && rec2.value === input.value && (input.value !== void 0 || rec2.mask === input.mask)) return rec2;
+        }
+        const mask = input.value !== void 0 ? this.scrubber.add(input.value) : input.mask ?? "\u2022\u2022\u2022\u2022";
+        const rec = { ...input, ref: `vh_${crypto4.randomBytes(10).toString("hex")}`, mask, createdAt: Date.now() };
+        this.byRef.set(rec.ref, rec);
+        this.byField.set(key, rec.ref);
+        return rec;
+      }
+      get(ref) {
+        const rec = this.byRef.get(ref);
+        if (!rec) return null;
+        if (Date.now() - rec.createdAt > REF_TTL_MS) {
+          this.byRef.delete(ref);
+          this.byField.delete(`${rec.docId}\0${rec.field}`);
+          return null;
+        }
+        return rec;
+      }
+      all() {
+        return [...this.byRef.keys()].map((r) => this.get(r)).filter((r) => !!r);
+      }
+    };
+  }
+});
+
+// src/core/keyRing.ts
+var LEGACY_SPACE_ID, KeyRingMiss, KeyRing;
+var init_keyRing = __esm({
+  "src/core/keyRing.ts"() {
+    "use strict";
+    init_crypto();
+    init_keyExchange();
+    init_constants();
+    LEGACY_SPACE_ID = "__legacy__";
+    KeyRingMiss = class extends Error {
+      constructor(spaceId, version) {
+        super(`No key held for space ${spaceId ?? "(none)"} version ${version ?? "(current)"}`);
+        this.spaceId = spaceId;
+        this.version = version;
+        this.name = "KeyRingMiss";
+      }
+    };
+    KeyRing = class _KeyRing {
+      spaces = /* @__PURE__ */ new Map();
+      personalId = null;
+      familyId = null;
+      legacyMode = false;
+      constructor() {
+      }
+      get primaryId() {
+        return this.familyId ?? this.personalId;
+      }
+      get primaryKey() {
+        const id = this.primaryId;
+        return id ? this.spaces.get(id)?.key ?? null : null;
+      }
+      /** The primary space id as a document should record it; null for the sentinel. */
+      get primaryStorageId() {
+        const id = this.primaryId;
+        return id === null || id === LEGACY_SPACE_ID ? null : id;
+      }
+      get isLegacy() {
+        return this.legacyMode;
+      }
+      /**
+       * No keys at all: a paired machine before its first authenticated call, or
+       * one whose every space is Ask. Every lookup misses, which is the point.
+       */
+      static empty() {
+        return new _KeyRing();
+      }
+      /** The ring before the server has been asked: one key, standing in for everything. */
+      static legacy(vaultId, vaultKey) {
+        const ring = new _KeyRing();
+        const id = vaultId ?? LEGACY_SPACE_ID;
+        ring.legacyMode = true;
+        ring.personalId = id;
+        ring.spaces.set(id, {
+          spaceId: id,
+          kind: null,
+          name: null,
+          role: "owner",
+          isOwner: true,
+          key: vaultKey,
+          version: 1
+        });
+        return ring;
+      }
+      /** Build from the server's membership rows by opening each sealed envelope. */
+      static fromMemberships(rows, identity) {
+        const ring = new _KeyRing();
+        for (const row of rows) {
+          if (!row.wrappedSpaceKey) continue;
+          let key;
+          try {
+            key = openSealed(
+              new Uint8Array(row.wrappedSpaceKey),
+              identity.privateKey,
+              identity.publicKey
+            );
+          } catch {
+            continue;
+          }
+          if (key.length !== VAULT_KEY_BYTES) continue;
+          let prior;
+          if (row.priorWrappedSpaceKey && row.priorKeyVersion !== null) {
+            try {
+              const priorKey = openSealed(
+                new Uint8Array(row.priorWrappedSpaceKey),
+                identity.privateKey,
+                identity.publicKey
+              );
+              if (priorKey.length === VAULT_KEY_BYTES) {
+                prior = { version: row.priorKeyVersion, key: priorKey };
+              }
+            } catch {
+            }
+          }
+          ring.spaces.set(row.spaceId, {
+            spaceId: row.spaceId,
+            kind: row.kind,
+            name: row.name,
+            role: row.role,
+            isOwner: row.isOwner,
+            key,
+            version: row.keyVersion ?? row.spaceKeyVersion ?? 1,
+            prior
+          });
+          if (row.kind === "personal" && row.isOwner) ring.personalId = row.spaceId;
+          if (row.kind === "family") ring.familyId = row.spaceId;
+        }
+        return ring;
+      }
+      has(spaceId) {
+        return this.spaces.has(spaceId);
+      }
+      roleIn(spaceId) {
+        return this.spaces.get(spaceId)?.role ?? null;
+      }
+      /** Every space held, personal first, then family, then the rest. */
+      list() {
+        const rank = (e) => e.spaceId === this.personalId ? 0 : e.spaceId === this.familyId ? 1 : 2;
+        return [...this.spaces.values()].sort((a, b) => rank(a) - rank(b));
+      }
+      keyFor(spaceId, version) {
+        const id = spaceId ?? this.primaryId;
+        if (!id) throw new KeyRingMiss(spaceId ?? null, version ?? null);
+        const entry = this.spaces.get(id) ?? (this.legacyMode ? this.spaces.get(this.primaryId) : void 0);
+        if (!entry) throw new KeyRingMiss(id, version ?? null);
+        const wanted = version ?? entry.version;
+        if (wanted === entry.version) return entry.key;
+        if (entry.prior && wanted === entry.prior.version) return entry.prior.key;
+        throw new KeyRingMiss(id, wanted);
+      }
+      /**
+       * An absent `keyVersion` means 1 — written before rotation existed — and
+       * emphatically not "the current version". But the phone writes vault-wide
+       * blobs (the people registry) under the current key with no version, so
+       * after a rotation that guess is wrong. Like the phone's ring, try the named
+       * generation first, then every generation held for the space; the GCM tag
+       * says which one is right.
+       */
+      unwrapDocKey(doc) {
+        const id = doc.vaultId ?? this.primaryId;
+        const entry = id ? this.spaces.get(id) ?? (this.legacyMode ? this.spaces.get(this.primaryId) : void 0) : void 0;
+        if (!entry) throw new KeyRingMiss(doc.vaultId ?? null, doc.keyVersion ?? null);
+        const wanted = doc.keyVersion ?? 1;
+        const candidates = [];
+        if (wanted === entry.version) candidates.push(entry.key);
+        else if (entry.prior && wanted === entry.prior.version) candidates.push(entry.prior.key);
+        if (!candidates.includes(entry.key)) candidates.push(entry.key);
+        if (entry.prior && !candidates.includes(entry.prior.key)) candidates.push(entry.prior.key);
+        for (const key of candidates) {
+          try {
+            return decrypt(doc.encryptedDocKey, key);
+          } catch {
+          }
+        }
+        throw new KeyRingMiss(entry.spaceId, wanted);
+      }
+      wrapDocKey(docKey, spaceId) {
+        const id = spaceId ?? this.primaryId;
+        if (!id) throw new KeyRingMiss(spaceId ?? null, null);
+        const entry = this.spaces.get(id);
+        if (!entry) throw new KeyRingMiss(id, null);
+        return {
+          encryptedDocKey: encrypt(docKey, entry.key),
+          keyVersion: entry.version,
+          spaceId: entry.spaceId === LEGACY_SPACE_ID ? null : entry.spaceId
+        };
+      }
+      zero() {
+        for (const entry of this.spaces.values()) {
+          entry.key.fill(0);
+          entry.prior?.key.fill(0);
+        }
+        this.spaces.clear();
+        this.personalId = null;
+        this.familyId = null;
+      }
+    };
+  }
+});
+
+// src/core/vault.ts
+var vault_exports = {};
+__export(vault_exports, {
+  applyConnectionRing: () => applyConnectionRing,
+  applyKeyRing: () => applyKeyRing,
+  autoUnlock: () => autoUnlock,
+  generateDocumentKey: () => generateDocumentKey,
+  getVaultKeys: () => getVaultKeys,
+  importVaultCredentials: () => importVaultCredentials,
+  isConnectionSession: () => isConnectionSession,
+  isVaultUnlocked: () => isVaultUnlocked,
+  lockVault: () => lockVault,
+  unlockVault: () => unlockVault,
+  unlockVaultWithMUK: () => unlockVaultWithMUK,
+  unlockWithConnection: () => unlockWithConnection,
+  unwrapDocumentKey: () => unwrapDocumentKey,
+  wrapDocumentKey: () => wrapDocumentKey
+});
+import crypto5 from "crypto";
+function isVaultUnlocked() {
+  return currentKeys !== null;
+}
+function getVaultKeys() {
+  if (!currentKeys) {
+    throw new Error("Vault is locked \u2014 run `vault unlock` first");
+  }
+  return currentKeys;
+}
+async function unlockVault(masterPassword) {
+  const keychain = getKeychain();
+  const secretKeyB64 = await keychain.get("secret_key");
+  if (!secretKeyB64) {
+    throw new Error("Secret key not found \u2014 run `vault auth setup-key` first");
+  }
+  const saltB64 = await keychain.get("salt");
+  if (!saltB64) {
+    throw new Error("Salt not found \u2014 run `vault sync` to fetch vault metadata");
+  }
+  const secretKey = base64ToBytes(secretKeyB64);
+  const salt = base64ToBytes(saltB64);
+  const muk = await deriveMUK(masterPassword, secretKey, salt);
+  return unlockVaultWithMUK(muk);
+}
+async function unlockVaultWithMUK(muk) {
+  const keychain = getKeychain();
+  const wrappedVaultKeyB64 = await keychain.get("wrapped_vault_key");
+  if (!wrappedVaultKeyB64) {
+    throw new Error("Wrapped vault key not found \u2014 run `vault sync` to fetch vault metadata");
+  }
+  const vaultKey = decrypt(base64ToBytes(wrappedVaultKeyB64), muk);
+  currentKeys = {
+    mode: "legacy",
+    muk,
+    vaultKey,
+    identity: null,
+    keyRing: KeyRing.legacy(loadConfig().vaultId ?? null, vaultKey)
+  };
+  return currentKeys;
+}
+async function unlockWithConnection() {
+  const secrets = await loadConnectionSecrets();
+  if (!secrets) return null;
+  currentKeys = {
+    mode: "connection",
+    muk: new Uint8Array(0),
+    vaultKey: new Uint8Array(0),
+    identity: null,
+    keyRing: KeyRing.empty(),
+    connectionKeyPair: secrets.keyPair
+  };
+  return currentKeys;
+}
+async function autoUnlock() {
+  if (isVaultUnlocked()) return true;
+  if (await unlockWithConnection()) return true;
+  const envPassword = process.env.VAULT_MASTER_PASSWORD;
+  if (envPassword) {
+    await unlockVault(envPassword);
+    return true;
+  }
+  const keychain = getKeychain();
+  const mukB64 = await keychain.get("muk");
+  if (mukB64) {
+    await unlockVaultWithMUK(base64ToBytes(mukB64));
+    return true;
+  }
+  const savedPassword = await keychain.get("master_password");
+  if (savedPassword) {
+    await unlockVault(savedPassword);
+    return true;
+  }
+  return false;
+}
+function applyKeyRing(keys, ring, identity) {
+  keys.keyRing = ring;
+  keys.identity = identity;
+  const primary = ring.primaryKey;
+  if (primary) keys.vaultKey = primary;
+}
+function applyConnectionRing(keys, ring) {
+  keys.keyRing.zero();
+  keys.keyRing = ring;
+  keys.vaultKey = ring.primaryKey ?? new Uint8Array(0);
+}
+function isConnectionSession() {
+  return currentKeys?.mode === "connection";
+}
+function lockVault() {
+  if (currentKeys) {
+    currentKeys.muk.fill(0);
+    currentKeys.vaultKey.fill(0);
+    currentKeys.identity?.privateKey.fill(0);
+    currentKeys.connectionKeyPair?.privateKey.fill(0);
+    currentKeys.keyRing.zero();
+    currentKeys = null;
+  }
+}
+function unwrapDocumentKey(wrappedDocKey, doc) {
+  return getVaultKeys().keyRing.unwrapDocKey({
+    vaultId: doc.vaultId,
+    keyVersion: doc.keyVersion,
+    encryptedDocKey: wrappedDocKey
+  });
+}
+function wrapDocumentKey(documentKey, spaceId) {
+  return getVaultKeys().keyRing.wrapDocKey(documentKey, spaceId);
+}
+function generateDocumentKey() {
+  return new Uint8Array(crypto5.randomBytes(DOCUMENT_KEY_BYTES));
+}
+async function importVaultCredentials(params) {
+  const keychain = getKeychain();
+  await keychain.set("secret_key", params.secretKeyBase64);
+  await keychain.set("salt", params.saltBase64);
+  await keychain.set("wrapped_vault_key", params.wrappedVaultKeyBase64);
+}
+var currentKeys;
+var init_vault = __esm({
+  "src/core/vault.ts"() {
+    "use strict";
+    init_crypto();
+    init_keychain();
+    init_constants();
+    init_keyRing();
+    init_config();
+    init_connection();
+    currentKeys = null;
+  }
+});
+
+// src/shared/docPath.ts
+function normalizePersonLookupKey(name) {
+  return name.trim().toUpperCase();
+}
+function resolveCanonicalName(aliasMap, name) {
+  const trimmed = name.trim();
+  return aliasMap?.[normalizePersonLookupKey(trimmed)] || trimmed;
+}
+function buildAliasMap(registry) {
+  const aliasMap = {};
+  for (const person of registry?.people ?? []) {
+    aliasMap[normalizePersonLookupKey(person.canonicalName)] = person.canonicalName;
+    for (const alias of person.aliases ?? []) {
+      aliasMap[normalizePersonLookupKey(alias)] = person.canonicalName;
+    }
+  }
+  return aliasMap;
+}
+function slug(input) {
+  return String(input ?? "").normalize("NFKD").replace(new RegExp("\\p{M}", "gu"), "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, SLUG_MAX).replace(/^-+|-+$/g, "");
+}
+function extForMime(mimeType) {
+  if (!mimeType) return "";
+  return EXT_BY_MIME[mimeType.trim().toLowerCase()] ?? "";
+}
+function spaceSegment(space) {
+  if (!space) return "shared";
+  if (space.kind === "personal") return "personal";
+  if (space.kind === "family") return "family";
+  return slug(space.name) || "shared";
+}
+function ownerSegment(owner, aliasMap) {
+  const trimmed = (owner ?? "").trim();
+  if (!trimmed || trimmed.toLowerCase() === "unknown") return "unfiled";
+  return slug(resolveCanonicalName(aliasMap, trimmed)) || "unfiled";
+}
+function fileSegment(title, type) {
+  return slug(title) || slug(type) || "document";
+}
+function computeDocPaths(docs, ctx) {
+  const staged = [];
+  const counts = /* @__PURE__ */ new Map();
+  for (const doc of docs) {
+    if (doc.id === PEOPLE_REGISTRY_BLOB_ID) continue;
+    const space = doc.vaultId ? ctx.spaces[doc.vaultId] : void 0;
+    const dir = `${spaceSegment(space)}/${ownerSegment(doc.owner, ctx.aliasMap)}/`;
+    const file = fileSegment(doc.title, doc.type);
+    const ext = extForMime(doc.mimeType);
+    const key = dir + file + ext;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    staged.push({ id: doc.id, dir, file, ext });
+  }
+  const paths = /* @__PURE__ */ new Map();
+  for (const s of staged) {
+    const collides = (counts.get(s.dir + s.file + s.ext) ?? 0) > 1;
+    const suffix = collides ? `-${s.id.slice(0, 6)}` : "";
+    paths.set(s.id, `${s.dir}${s.file}${suffix}${s.ext}`);
+  }
+  return paths;
+}
+function displayPath(path12) {
+  return PATH_DISPLAY_PREFIX + path12;
+}
+function normalizePathQuery(input) {
+  let p = String(input ?? "").trim().replace(/\\/g, "/");
+  p = p.replace(/^\/+/, "");
+  if (p === "vault" || p.startsWith(PATH_DISPLAY_PREFIX)) p = p.slice("vault".length);
+  return p.replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
+}
+var PEOPLE_REGISTRY_BLOB_ID, PATH_DISPLAY_PREFIX, SLUG_MAX, EXT_BY_MIME;
+var init_docPath = __esm({
+  "src/shared/docPath.ts"() {
+    "use strict";
+    PEOPLE_REGISTRY_BLOB_ID = "__people_registry__";
+    PATH_DISPLAY_PREFIX = "vault/";
+    SLUG_MAX = 60;
+    EXT_BY_MIME = {
+      "application/pdf": ".pdf",
+      "image/jpeg": ".jpg",
+      "image/png": ".png",
+      "image/heic": ".heic",
+      "image/webp": ".webp",
+      "text/markdown": ".md",
+      "text/plain": ".txt"
+    };
+  }
+});
+
+// src/core/convexApi.ts
+var convexApi_exports = {};
+__export(convexApi_exports, {
+  api: () => api
+});
+import { anyApi } from "convex/server";
+var api;
+var init_convexApi = __esm({
+  "src/core/convexApi.ts"() {
+    "use strict";
+    api = anyApi;
+  }
+});
+
+// src/core/sync.ts
+var sync_exports = {};
+__export(sync_exports, {
+  authenticateConvexClient: () => authenticateConvexClient,
+  decryptPayloadWithDocKey: () => decryptPayloadWithDocKey,
+  fetchAndStoreVaultMeta: () => fetchAndStoreVaultMeta,
+  getConvexClient: () => getConvexClient,
+  invalidateKeyRing: () => invalidateKeyRing,
+  payloadToDocument: () => payloadToDocument,
+  refreshKeyRing: () => refreshKeyRing,
+  syncFull: () => syncFull,
+  syncIncremental: () => syncIncremental,
+  upsertEncryptedBlob: () => upsertEncryptedBlob
+});
+import { ConvexHttpClient } from "convex/browser";
+function getConvexClient() {
+  if (client) return client;
+  client = guardRevocation(new ConvexHttpClient(CONVEX_URL));
+  return client;
+}
+function guardRevocation(convex) {
+  for (const method of ["query", "mutation", "action"]) {
+    const original = convex[method].bind(convex);
+    convex[method] = async (...args) => {
+      try {
+        return await original(...args);
+      } catch (err) {
+        if (isRevocationError(err) && await isConnectionMode()) await disconnectMachine();
+        throw err;
+      }
+    };
+  }
+  return convex;
+}
+async function authenticateConvexClient() {
+  const convex = getConvexClient();
+  if (await isConnectionMode()) {
+    const token = await getAgentToken();
+    convex.setAuth(token);
+    if (isVaultUnlocked() && (!keyRingRefreshed || token !== ringToken)) {
+      await refreshKeyRing(convex, getVaultKeys());
+      keyRingRefreshed = true;
+      ringToken = token;
+    }
+    return convex;
+  }
+  const keychain = getKeychain();
+  const sessionCookie = await keychain.get("session_cookie");
+  if (!sessionCookie) {
+    throw new Error("Not authenticated \u2014 run `vault auth login` first");
+  }
+  const response = await fetch(`${CONVEX_SITE_URL}/api/auth/convex/token`, {
+    method: "GET",
+    headers: {
+      cookie: sessionCookie
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`Auth token exchange failed (${response.status}). Session may be expired \u2014 run \`vault auth login\` again.`);
+  }
+  const data = await response.json();
+  if (!data.token) {
+    throw new Error("No token returned from auth endpoint");
+  }
+  convex.setAuth(data.token);
+  if (!keyRingRefreshed) {
+    keyRingRefreshed = true;
+    if (isVaultUnlocked()) {
+      try {
+        await refreshKeyRing(convex, getVaultKeys());
+      } catch {
+      }
+    }
+  }
+  return convex;
+}
+function decryptBlobPayload(blob, keyRing) {
+  const docKey = keyRing.unwrapDocKey({
+    vaultId: blob.vaultId,
+    keyVersion: blob.keyVersion,
+    encryptedDocKey: new Uint8Array(blob.encryptedDocKey)
+  });
+  try {
+    return decryptPayloadWithDocKey(blob.encryptedBlob, docKey);
+  } finally {
+    docKey.fill(0);
+  }
+}
+function decryptPayloadWithDocKey(encryptedBlob, docKey) {
+  const bytes = encryptedBlob instanceof Uint8Array ? encryptedBlob : new Uint8Array(encryptedBlob);
+  return JSON.parse(new TextDecoder().decode(decrypt(bytes, docKey)));
+}
+function captureRegistry(blob, metadata) {
+  if (blob.blobId !== PEOPLE_REGISTRY_BLOB_ID) return;
+  if (!metadata || !Array.isArray(metadata.people)) return;
+  try {
+    setLocalMeta("people_registry", { people: metadata.people });
+  } catch {
+  }
+}
+function payloadToDocument(blob, metadata) {
+  const encryptedDocKey = new Uint8Array(blob.encryptedDocKey ?? new ArrayBuffer(0));
+  return {
+    id: blob.blobId,
+    title: metadata.title ?? "Untitled",
+    rawText: metadata.rawText,
+    markdownContent: metadata.markdownContent,
+    type: metadata.type ?? "generic",
+    tags: metadata.tags ?? [],
+    fields: metadata.fields ?? {},
+    organizations: metadata.organizations,
+    mentions: metadata.mentions,
+    overview: metadata.overview,
+    embedding: metadata.embedding,
+    encryptedDocKey,
+    mimeType: metadata.mimeType,
+    storageId: metadata.storageId,
+    encryptedStorageId: metadata.encryptedStorageId,
+    fileEncrypted: metadata.encryptedStorageId ? 1 : 0,
+    // R2 asset refs come from top-level blob columns (not encrypted payload)
+    fileAssetProvider: blob.fileAssetProvider,
+    fileAssetKey: blob.fileAssetKey,
+    fileAssetMimeType: blob.fileAssetMimeType,
+    fileAssetSize: blob.fileAssetSize,
+    fileAssetVersion: blob.fileAssetVersion,
+    fileAssetStatus: blob.fileAssetStatus,
+    previewAssetProvider: blob.previewAssetProvider,
+    previewAssetKey: blob.previewAssetKey,
+    previewAssetMimeType: blob.previewAssetMimeType,
+    previewAssetSize: blob.previewAssetSize,
+    previewAssetVersion: blob.previewAssetVersion,
+    previewAssetStatus: blob.previewAssetStatus,
+    owner: metadata.owner,
+    originalOwner: metadata.originalOwner,
+    addedBy: blob.addedBy,
+    imageUrl: metadata.imageUrl,
+    dateAdded: metadata.dateAdded,
+    status: "ready",
+    // The blob column, not the encrypted payload: a document that has been
+    // moved between spaces carries the old id inside its own ciphertext.
+    vaultId: blob.vaultId ?? metadata.vaultId,
+    keyVersion: blob.keyVersion,
+    savedBy: metadata.savedBy && typeof metadata.savedBy === "object" ? metadata.savedBy : void 0,
+    createdAt: metadata.createdAt ?? blob.updatedAt,
+    updatedAt: blob.updatedAt,
+    syncStatus: "synced"
+  };
+}
+async function upsertEncryptedBlob(convex, args) {
+  const keys = getVaultKeys();
+  const wrapped = keys.keyRing.wrapDocKey(args.docKey, args.spaceId);
+  const blobBuffer = new ArrayBuffer(args.encryptedBlob.byteLength);
+  new Uint8Array(blobBuffer).set(args.encryptedBlob);
+  const keyBuffer = new ArrayBuffer(wrapped.encryptedDocKey.byteLength);
+  new Uint8Array(keyBuffer).set(wrapped.encryptedDocKey);
+  const common = {
+    blobId: args.blobId,
+    encryptedBlob: blobBuffer,
+    encryptedDocKey: keyBuffer,
+    blobSize: args.encryptedBlob.length,
+    keyVersion: wrapped.keyVersion,
+    ...args.addedBy ? { addedBy: args.addedBy } : {}
+  };
+  if (!wrapped.spaceId && keys.mode === "connection") {
+    throw new Error("No space to write to \u2014 this connection has no write access");
+  }
+  const result = wrapped.spaceId ? await convex.mutation(api.encryptedSync.upsertBlobByVault, {
+    vaultId: wrapped.spaceId,
+    ...common
+  }) : await convex.mutation(api.encryptedSync.upsertBlob, common);
+  return { ...wrapped, updatedAt: result?.updatedAt };
+}
+async function refreshKeyRing(convex, keys) {
+  if (keys.mode === "connection") return refreshConnectionRing(convex, keys);
+  const meta = await convex.query(api.vaultMeta.getIdentity, {});
+  if (!meta?.wrappedPrivateKey || !meta.publicKey) return false;
+  let identity;
+  try {
+    identity = {
+      privateKey: decrypt(new Uint8Array(meta.wrappedPrivateKey), keys.muk),
+      publicKey: new Uint8Array(meta.publicKey)
+    };
+  } catch {
+    return false;
+  }
+  keys.identity = identity;
+  const rows = await convex.query(api.vaults.getMyMemberships, {});
+  const ring = KeyRing.fromMemberships(rows, identity);
+  if (ring.spaces.size === 0) return false;
+  applyKeyRing(keys, ring, identity);
+  if (ring.primaryStorageId) updateConfig({ vaultId: ring.primaryStorageId });
+  saveSpaceDirectory(ring.list().map((e) => ({ spaceId: e.spaceId, kind: e.kind, name: e.name })));
+  return true;
+}
+async function refreshConnectionRing(convex, keys) {
+  const keyPair = keys.connectionKeyPair;
+  if (!keyPair) return false;
+  const res = await convex.query(api.agentConnections.getMyEnvelopes, {});
+  let manifest = null;
+  if (res.sealedManifest) {
+    try {
+      manifest = openSealedJson(res.sealedManifest, keyPair);
+    } catch {
+      manifest = null;
+    }
+  }
+  let context2 = null;
+  if (res.sealedContext) {
+    try {
+      context2 = openSealedJson(res.sealedContext, keyPair);
+    } catch {
+      context2 = null;
+    }
+  }
+  setConnectionState({
+    connectionId: res.connectionId,
+    preset: res.preset ?? ((res.grants ?? []).length > 0 ? "full" : context2 ? "standard" : "private"),
+    manifest,
+    context: context2,
+    grants: res.grants ?? []
+  });
+  if (res.intendedClient !== void 0) adoptIntendedClient(res.intendedClient);
+  const ring = KeyRing.fromMemberships(res.rows ?? [], keyPair);
+  applyConnectionRing(keys, ring);
+  const directory = /* @__PURE__ */ new Map();
+  for (const space of manifest?.spaces ?? []) {
+    directory.set(space.spaceId, { spaceId: space.spaceId, kind: space.kind, name: space.name });
+  }
+  for (const entry of ring.list()) {
+    directory.set(entry.spaceId, { spaceId: entry.spaceId, kind: entry.kind, name: entry.name });
+  }
+  saveSpaceDirectory([...directory.values()]);
+  try {
+    deleteDocumentsOutsideSpaces(ring.list().map((e) => e.spaceId));
+  } catch {
+  }
+  return true;
+}
+function saveSpaceDirectory(spaces) {
+  try {
+    setLocalMeta("spaces", spaces);
+  } catch {
+  }
+}
+function invalidateKeyRing() {
+  keyRingRefreshed = false;
+}
+function spaceTargets(keys) {
+  const keyRing = keys.keyRing;
+  if (keys.mode === "connection") return keyRing.list().map((entry) => entry.spaceId);
+  if (keyRing.isLegacy) return [keyRing.primaryStorageId ?? void 0];
+  const ids = keyRing.list().map((entry) => entry.spaceId);
+  return ids.length > 0 ? ids : [void 0];
+}
+async function fetchBlobs(convex, spaceId, since, onPage) {
+  const blobs = [];
+  let cursor = null;
+  for (; ; ) {
+    const paginationOpts = { numItems: SYNC_PAGE_SIZE, cursor };
+    const result = spaceId ? since === null ? await convex.query(api.encryptedSync.getBlobPageByVault, {
+      vaultId: spaceId,
+      paginationOpts
+    }) : await convex.query(api.encryptedSync.getUpdatedSincePageByVault, {
+      vaultId: spaceId,
+      since,
+      paginationOpts
+    }) : since === null ? await convex.query(api.encryptedSync.getBlobPage, { paginationOpts }) : await convex.query(api.encryptedSync.getUpdatedSincePage, {
+      since,
+      paginationOpts
+    });
+    blobs.push(...result.page);
+    onPage?.(blobs.length);
+    if (result.isDone) break;
+    cursor = result.continueCursor;
+  }
+  return blobs;
+}
+async function syncFull(keys, onProgress) {
+  const convex = await authenticateConvexClient();
+  onProgress?.({ total: 0, current: 0, phase: "downloading" });
+  const blobs = [];
+  for (const spaceId of spaceTargets(keys)) {
+    blobs.push(
+      ...await fetchBlobs(
+        convex,
+        spaceId,
+        null,
+        (soFar) => onProgress?.({ total: soFar, current: soFar, phase: "downloading" })
+      )
+    );
+  }
+  const total = blobs.length;
+  let count = 0;
+  const failures = [];
+  const database = getDatabase();
+  await prepareSecretIndex();
+  await sealExistingDatabase();
+  const indexSizeBefore = secretIndexSize();
+  const decrypted = [];
+  const transaction = database.transaction(() => {
+    for (const blob of blobs) {
+      try {
+        onProgress?.({ total, current: count, phase: "decrypting" });
+        const metadata = decryptBlobPayload(blob, keys.keyRing);
+        captureRegistry(blob, metadata);
+        decrypted.push(payloadToDocument(blob, metadata));
+        count++;
+        onProgress?.({ total, current: count, phase: "saving" });
+      } catch (err) {
+        failures.push({ blobId: blob.blobId, error: err.message });
+      }
+    }
+  });
+  transaction();
+  writeSealedBatch(decrypted, indexSizeBefore);
+  if (failures.length > 0) {
+    const jsonFails = failures.filter((f) => f.error.includes("not valid JSON"));
+    const missing = failures.filter((f) => f.error.startsWith("No key held"));
+    const authFails = failures.filter((f) => f.error.includes("authenticate data") || f.error.includes("Unsupported state"));
+    const otherFails = failures.length - jsonFails.length - missing.length - authFails.length;
+    process.stderr.write(`[sync] Skipped ${failures.length} blobs: ${jsonFails.length} non-JSON (avatars), ${missing.length} no key held, ${authFails.length} auth failures, ${otherFails} other
+`);
+  }
+  const latestTimestamp = blobs.reduce((max, b) => Math.max(max, b.updatedAt), 0);
+  if (latestTimestamp > 0) {
+    updateConfig({ lastSyncTimestamp: latestTimestamp });
+  }
+  if (keys.mode === "connection") markSpacesSynced(spaceTargets(keys));
+  return count;
+}
+function getLocalMetaSafe(key) {
+  try {
+    return getLocalMeta(key);
+  } catch {
+    return null;
+  }
+}
+function markSpacesSynced(spaceIds) {
+  try {
+    setLocalMeta("synced_spaces", spaceIds.filter((id) => !!id));
+  } catch {
+  }
+}
+async function syncIncremental(keys, onProgress) {
+  const convex = await authenticateConvexClient();
+  const config = loadConfig();
+  const since = config.lastSyncTimestamp ?? 0;
+  onProgress?.({ total: 0, current: 0, phase: "downloading" });
+  const syncedSpaces = new Set(keys.mode === "connection" ? getLocalMetaSafe("synced_spaces") ?? [] : []);
+  const blobs = [];
+  const targets = spaceTargets(keys);
+  for (const spaceId of targets) {
+    const spaceSince = keys.mode === "connection" && spaceId && !syncedSpaces.has(spaceId) ? null : since;
+    blobs.push(
+      ...await fetchBlobs(
+        convex,
+        spaceId,
+        spaceSince,
+        (soFar) => onProgress?.({ total: soFar, current: soFar, phase: "downloading" })
+      )
+    );
+  }
+  if (keys.mode === "connection") markSpacesSynced(targets);
+  if (blobs.length === 0) {
+    return { count: 0, deleted: 0 };
+  }
+  const total = blobs.length;
+  let count = 0;
+  let deleted = 0;
+  const database = getDatabase();
+  await prepareSecretIndex();
+  await sealExistingDatabase();
+  const indexSizeBefore = secretIndexSize();
+  const decrypted = [];
+  const transaction = database.transaction(() => {
+    for (const blob of blobs) {
+      if (blob.deleted) {
+        deleteDocument(blob.blobId);
+        deleted++;
+        continue;
+      }
+      try {
+        onProgress?.({ total, current: count, phase: "decrypting" });
+        const metadata = decryptBlobPayload(blob, keys.keyRing);
+        captureRegistry(blob, metadata);
+        decrypted.push(payloadToDocument(blob, metadata));
+        count++;
+        onProgress?.({ total, current: count, phase: "saving" });
+      } catch {
+      }
+    }
+  });
+  transaction();
+  writeSealedBatch(decrypted, indexSizeBefore);
+  const latestTimestamp = blobs.reduce((max, b) => Math.max(max, b.updatedAt), 0);
+  if (latestTimestamp > 0) {
+    updateConfig({ lastSyncTimestamp: latestTimestamp });
+  }
+  return { count, deleted };
+}
+async function fetchAndStoreVaultMeta(vaultId) {
+  if (await isConnectionMode()) return;
+  const convex = await authenticateConvexClient();
+  const keychain = getKeychain();
+  let meta;
+  if (vaultId) {
+    meta = await convex.query(api.vaultMeta.getForVault, { vaultId });
+  } else {
+    meta = await convex.query(api.vaultMeta.get, {});
+  }
+  if (!meta) {
+    throw new Error("Vault metadata not found on server");
+  }
+  const { bytesToBase64: bytesToBase644 } = await Promise.resolve().then(() => (init_crypto(), crypto_exports));
+  await keychain.set("salt", bytesToBase644(new Uint8Array(meta.salt)));
+  await keychain.set("wrapped_vault_key", bytesToBase644(new Uint8Array(meta.wrappedVaultKey)));
+  if (meta.vaultId) {
+    updateConfig({ vaultId: meta.vaultId });
+  }
+}
+var client, keyRingRefreshed, ringToken, SYNC_PAGE_SIZE;
+var init_sync = __esm({
+  "src/core/sync.ts"() {
+    "use strict";
+    init_crypto();
+    init_vault();
+    init_keyRing();
+    init_secretSeal();
+    init_database();
+    init_connection();
+    init_docPath();
+    init_config();
+    init_keychain();
+    init_convexApi();
+    client = null;
+    keyRingRefreshed = false;
+    ringToken = null;
+    SYNC_PAGE_SIZE = 20;
+  }
+});
+
+// src/core/granted.ts
+var granted_exports = {};
+__export(granted_exports, {
+  fetchGrantedDocs: () => fetchGrantedDocs,
+  getGrantedDoc: () => getGrantedDoc,
+  getGrantedOriginal: () => getGrantedOriginal,
+  listGrantedDocs: () => listGrantedDocs,
+  openGrantedDocKey: () => openGrantedDocKey
+});
+function clientCache(client2) {
+  let c = cache.get(client2);
+  if (!c) {
+    c = /* @__PURE__ */ new Map();
+    cache.set(client2, c);
+  }
+  return c;
+}
+function connectionKeyPair() {
+  const kp = getVaultKeys().connectionKeyPair;
+  if (!kp) throw new Error("Granted documents need a paired machine \u2014 run `moivault auth pair <code>`");
+  return kp;
+}
+async function fetchGrantedDocs(convex, client2, blobIds, requestId) {
+  if (blobIds.length === 0) return [];
+  const kp = connectionKeyPair();
+  await prepareSecretIndex().catch(() => {
+  });
+  const out = [];
+  for (let i = 0; i < blobIds.length; i += 50) {
+    const rows = await convex.mutation(api.agentRequests.fetchGranted, {
+      blobIds: blobIds.slice(i, i + 50),
+      client: client2,
+      ...requestId ? { requestId } : {}
+    });
+    for (const row of rows) {
+      const sealedDocKey = new Uint8Array(row.sealedDocKey);
+      const docKey = openSealed(sealedDocKey, kp.privateKey, kp.publicKey);
+      let metadata;
+      try {
+        metadata = decryptPayloadWithDocKey(row.encryptedBlob, docKey);
+      } finally {
+        docKey.fill(0);
+      }
+      const doc = payloadToDocument(
+        {
+          _id: row.blobId,
+          blobId: row.blobId,
+          vaultId: row.vaultId,
+          keyVersion: row.keyVersion ?? void 0,
+          encryptedBlob: row.encryptedBlob,
+          encryptedDocKey: new ArrayBuffer(0),
+          updatedAt: Date.now(),
+          fileAssetProvider: row.fileRef ? "r2" : void 0,
+          fileAssetMimeType: row.fileRef?.mimeType ?? void 0,
+          fileAssetSize: row.fileRef?.size ?? void 0,
+          fileAssetStatus: row.fileRef?.status ?? void 0
+        },
+        metadata
+      );
+      const sealed = sealDocument(doc);
+      clientCache(client2).set(row.blobId, { doc: sealed, original: metadata, sealedDocKey, fetchedAt: Date.now() });
+      out.push(sealed);
+    }
+  }
+  try {
+    flushSecretIndex();
+  } catch {
+  }
+  return out;
+}
+function getGrantedOriginal(blobId) {
+  let best = null;
+  for (const c of cache.values()) {
+    const e = c.get(blobId);
+    if (e && (!best || e.fetchedAt > best.fetchedAt) && Date.now() - e.fetchedAt <= GRANTED_TTL_MS) best = e;
+  }
+  return best?.original ?? null;
+}
+function getGrantedDoc(client2, blobId) {
+  const entry = cache.get(client2)?.get(blobId);
+  if (!entry) return null;
+  if (Date.now() - entry.fetchedAt > GRANTED_TTL_MS) {
+    cache.get(client2).delete(blobId);
+    return null;
+  }
+  return entry.doc;
+}
+function openGrantedDocKey(client2, blobId) {
+  const entry = cache.get(client2)?.get(blobId);
+  if (!entry) return null;
+  const kp = connectionKeyPair();
+  return openSealed(entry.sealedDocKey, kp.privateKey, kp.publicKey);
+}
+function listGrantedDocs(client2) {
+  const c = cache.get(client2);
+  if (!c) return [];
+  const now = Date.now();
+  return [...c.values()].filter((e) => now - e.fetchedAt <= GRANTED_TTL_MS).map((e) => e.doc);
+}
+var GRANTED_TTL_MS, cache;
+var init_granted = __esm({
+  "src/core/granted.ts"() {
+    "use strict";
+    init_keyExchange();
+    init_vault();
+    init_sync();
+    init_convexApi();
+    init_secretSeal();
+    GRANTED_TTL_MS = 60 * 60 * 1e3;
+    cache = /* @__PURE__ */ new Map();
+  }
+});
+
+// src/core/secretSeal.ts
+import crypto6 from "crypto";
+function isSealedField(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v) && typeof v[SECRET_MARK] === "string";
+}
+function hashOf(compact) {
+  return crypto6.createHmac("sha256", hmacKey).update(compact).digest("base64url").slice(0, 22);
+}
+async function prepareSecretIndex() {
+  if (!hmacKey) {
+    const kc = getKeychain();
+    let k = await kc.get("secret_index_key");
+    if (!k) {
+      k = crypto6.randomBytes(32).toString("base64");
+      await kc.set("secret_index_key", k);
+    }
+    hmacKey = Buffer.from(k, "base64");
+  }
+  if (!index) {
+    let stored = null;
+    try {
+      stored = getLocalMeta("secret_index");
+    } catch {
+    }
+    index = new Map(Object.entries(stored ?? {}));
+  }
+}
+function remember(value) {
+  const mask = maskValue(value);
+  if (!index || !hmacKey) return mask;
+  const h = hashOf(normalize(value));
+  if (!index.has(h)) {
+    index.set(h, mask);
+    dirty = true;
+  }
+  return mask;
+}
+function persistIndex() {
+  if (!dirty) return;
+  setLocalMeta("secret_index", Object.fromEntries(index));
+  dirty = false;
+}
+function sealText(text2) {
+  if (typeof text2 !== "string" || !text2) return text2 ?? void 0;
+  let out = text2.replace(MRZ_LINE2, (m) => /<</.test(m) || /</.test(m) && /\d/.test(m) ? MRZ_MASK2 : m);
+  if (!index || index.size === 0) return out;
+  out = out.replace(RUN, (run2) => {
+    const words = [];
+    const wordRe = /[A-Za-z0-9]+/g;
+    let m;
+    while (m = wordRe.exec(run2)) words.push({ w: m[0], start: m.index, end: m.index + m[0].length });
+    const hits = [];
+    for (let i = 0; i < words.length; i++) {
+      let compact = "";
+      for (let j = i; j < Math.min(words.length, i + 10); j++) {
+        compact += words[j].w.toUpperCase();
+        if (compact.length > 40) break;
+        if (compact.length < 4) continue;
+        const mask = index.get(hashOf(compact));
+        if (mask) hits.push({ start: words[i].start, end: words[j].end, mask });
+      }
+    }
+    if (hits.length === 0) return run2;
+    hits.sort((a, b) => b.end - b.start - (a.end - a.start));
+    const taken = [];
+    for (const h of hits) if (!taken.some((t) => h.start < t.end && t.start < h.end)) taken.push(h);
+    taken.sort((a, b) => b.start - a.start);
+    let r = run2;
+    for (const t of taken) r = r.slice(0, t.start) + t.mask + r.slice(t.end);
+    return r;
+  });
+  return out;
+}
+function sealDocument(doc) {
+  const walkLearn = (value, key) => {
+    if (isSecretField(key, value)) remember(String(value).trim());
+    else if (Array.isArray(value)) value.forEach((v) => walkLearn(v, key));
+    else if (value && typeof value === "object" && !isSealedField(value)) for (const [k, v] of Object.entries(value)) walkLearn(v, k);
+  };
+  for (const [k, v] of Object.entries(doc.fields ?? {})) walkLearn(v, k);
+  const walkSeal = (value, key) => {
+    if (isSealedField(value)) return value;
+    if (isSecretField(key, value)) return { [SECRET_MARK]: maskValue(String(value).trim()) };
+    if (typeof value === "string") return sealText(value);
+    if (Array.isArray(value)) return value.map((v) => walkSeal(v, key));
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walkSeal(v, k)]));
+    return value;
+  };
+  return {
+    ...doc,
+    title: sealText(doc.title) ?? doc.title,
+    fields: Object.fromEntries(Object.entries(doc.fields ?? {}).map(([k, v]) => [k, walkSeal(v, k)])),
+    rawText: sealText(doc.rawText),
+    markdownContent: sealText(doc.markdownContent),
+    overview: sealText(doc.overview)
+  };
+}
+function sealDocuments(docs) {
+  for (const d of docs) sealDocument(d);
+  const out = docs.map(sealDocument);
+  persistIndex();
+  return out;
+}
+function secretIndexSize() {
+  return index?.size ?? 0;
+}
+function writeSealedBatch(docs, indexSizeBefore) {
+  if (docs.length === 0) return;
+  const db2 = getDatabase();
+  const fresh = new Set(docs.map((d) => d.id));
+  const sealed = sealDocuments(docs);
+  db2.transaction(() => {
+    for (const d of sealed) upsertDocument2(d);
+    if (secretIndexSize() > indexSizeBefore) {
+      for (const d of getAllDocuments()) {
+        if (fresh.has(d.id)) continue;
+        const again = sealDocument(d);
+        if (JSON.stringify(again) !== JSON.stringify(d)) upsertDocument2(again);
+      }
+      const chunks = db2.prepare("SELECT id, chunkText FROM doc_chunks").all();
+      const upd = db2.prepare("UPDATE doc_chunks SET chunkText = ? WHERE id = ?");
+      for (const c of chunks) {
+        const t = sealText(c.chunkText);
+        if (t !== c.chunkText) upd.run(t, c.id);
+      }
+    }
+  })();
+  persistIndex();
+}
+function flushSecretIndex() {
+  persistIndex();
+}
+async function sealExistingDatabase() {
+  await prepareSecretIndex();
+  const db2 = getDatabase();
+  if (getLocalMeta("secrets_sealed") === 1) return 0;
+  const docs = getAllDocuments();
+  const sealed = sealDocuments(docs);
+  db2.transaction(() => {
+    for (const d of sealed) upsertDocument2(d);
+    const chunks = db2.prepare("SELECT id, chunkText FROM doc_chunks").all();
+    const upd = db2.prepare("UPDATE doc_chunks SET chunkText = ? WHERE id = ?");
+    for (const c of chunks) {
+      const t = sealText(c.chunkText);
+      if (t !== c.chunkText) upd.run(t, c.id);
+    }
+  })();
+  try {
+    db2.exec("INSERT INTO documents_fts(documents_fts) VALUES('rebuild')");
+  } catch {
+  }
+  setLocalMeta("secrets_sealed", 1);
+  db2.exec("VACUUM");
+  return docs.length;
+}
+function sealChunkText(text2) {
+  return sealText(text2) ?? text2;
+}
+function restoreSecrets(payload, original, row) {
+  const out = { ...payload };
+  const at = (obj, path12) => path12.reduce((o, k) => o == null ? void 0 : o[k], obj);
+  const walk = (value, path12) => {
+    if (isSealedField(value)) return at(original.fields, path12);
+    if (Array.isArray(value)) return value.map((v, i) => walk(v, [...path12, i]));
+    if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v, [...path12, k])]));
+    return value;
+  };
+  out.fields = Object.fromEntries(
+    Object.entries(payload.fields ?? {}).map(([k, v]) => [k, walk(v, [k])]).filter(([, v]) => v !== void 0)
+  );
+  const unmask = /* @__PURE__ */ new Map();
+  const collect = (value, key) => {
+    if (isSecretField(key, value)) unmask.set(maskValue(String(value).trim()), String(value).trim());
+    else if (Array.isArray(value)) value.forEach((v) => collect(v, key));
+    else if (value && typeof value === "object") for (const [k, v] of Object.entries(value)) collect(v, k);
+  };
+  for (const [k, v] of Object.entries(original.fields ?? {})) collect(v, k);
+  for (const key of ["rawText", "markdownContent", "overview", "title"]) {
+    const now = payload[key];
+    const was = original[key];
+    if (typeof now !== "string" || typeof was !== "string") continue;
+    if (row && now === row[key] || now === sealText(was)) {
+      out[key] = was;
+      continue;
+    }
+    let restored = now;
+    for (const [mask, value] of unmask) restored = restored.split(mask).join(value);
+    const mrz = was.match(MRZ_LINE2) ?? [];
+    let i = 0;
+    restored = restored.replace(/\[machine-readable zone hidden\]/g, (m) => mrz[i++] ?? m);
+    out[key] = restored;
+  }
+  return out;
+}
+function hasSealedPlaceholders(payload) {
+  return JSON.stringify(payload ?? null).includes(`"${SECRET_MARK}"`);
+}
+async function restoreForWrite(args) {
+  await prepareSecretIndex().catch(() => {
+  });
+  let original = null;
+  try {
+    const { getGrantedOriginal: getGrantedOriginal2 } = await Promise.resolve().then(() => (init_granted(), granted_exports));
+    original = getGrantedOriginal2(args.blobId);
+  } catch {
+  }
+  if (!original) {
+    try {
+      const { api: api2 } = await Promise.resolve().then(() => (init_convexApi(), convexApi_exports));
+      const { decryptPayloadWithDocKey: decryptPayloadWithDocKey2 } = await Promise.resolve().then(() => (init_sync(), sync_exports));
+      const blob = await args.convex.query(api2.encryptedSync.getBlobById, { blobId: args.blobId, ...args.vaultId ? { vaultId: args.vaultId } : {} });
+      if (blob?.encryptedBlob) original = decryptPayloadWithDocKey2(blob.encryptedBlob, args.docKey);
+    } catch {
+    }
+  }
+  if (original) {
+    const restored = restoreSecrets(args.payload, original, args.row);
+    if (!hasSealedPlaceholders(restored)) return restored;
+  }
+  if (hasSealedPlaceholders(args.payload) || /••••|\[machine-readable zone hidden\]/.test(JSON.stringify(args.payload))) {
+    throw new Error("Couldn't load this document's protected values from the server, so the edit was not saved (it would have replaced them with masks). Check the connection and try again.");
+  }
+  return args.payload;
+}
+var SECRET_MARK, MRZ_LINE2, MRZ_MASK2, hmacKey, index, normalize, dirty, RUN;
+var init_secretSeal = __esm({
+  "src/core/secretSeal.ts"() {
+    "use strict";
+    init_keychain();
+    init_database();
+    init_secrets();
+    SECRET_MARK = "$secret";
+    MRZ_LINE2 = /(?<![A-Z0-9<])[A-Z0-9<]{28,44}(?![A-Z0-9<])/g;
+    MRZ_MASK2 = "[machine-readable zone hidden]";
+    hmacKey = null;
+    index = null;
+    normalize = (s) => s.replace(/[\s\-./]/g, "").toUpperCase();
+    dirty = false;
+    RUN = /[A-Za-z0-9]+(?:[ \-./][A-Za-z0-9]+)*/g;
+  }
+});
+
 // src/core/database.ts
 var database_exports = {};
 __export(database_exports, {
@@ -208,7 +1936,7 @@ __export(database_exports, {
   setLocalMeta: () => setLocalMeta,
   updateDocumentField: () => updateDocumentField,
   upsertChunks: () => upsertChunks,
-  upsertDocument: () => upsertDocument,
+  upsertDocument: () => upsertDocument2,
   upsertDocuments: () => upsertDocuments
 });
 import Database from "better-sqlite3";
@@ -447,7 +2175,8 @@ function deserializeRow(row) {
     syncStatus: row.syncStatus ?? "synced"
   };
 }
-function upsertDocument(doc) {
+function upsertDocument2(input) {
+  const doc = sealDocument(input);
   const database = getDatabase();
   const stmt = database.prepare(`
     INSERT OR REPLACE INTO documents
@@ -524,7 +2253,7 @@ function upsertDocuments(docs) {
   const database = getDatabase();
   const transaction = database.transaction(() => {
     for (const doc of docs) {
-      upsertDocument(doc);
+      upsertDocument2(doc);
     }
   });
   transaction();
@@ -600,44 +2329,12 @@ function setLocalMeta(key, value) {
 function updateDocumentField(id, key, value) {
   const doc = getDocumentById(id);
   if (!doc) throw new Error(`Document not found: ${id}`);
-  if (key === "title" || key === "rawText" || key === "type" || key === "owner" || key === "originalOwner" || key === "mimeType" || key === "dateAdded") {
-    const database2 = getDatabase();
-    database2.prepare(`UPDATE documents SET ${key} = ?, updatedAt = ? WHERE id = ?`).run(value, Date.now(), id);
-  } else if (key === "tags") {
-    const database2 = getDatabase();
-    const tags = Array.isArray(value) ? value : value.split(",").map((t) => t.trim());
-    database2.prepare("UPDATE documents SET tags = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(tags), Date.now(), id);
-  } else {
-    const fields = { ...doc.fields, [key]: value };
-    const database2 = getDatabase();
-    database2.prepare("UPDATE documents SET fields = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(fields), Date.now(), id);
-  }
-  const database = getDatabase();
-  const updatedDoc = getDocumentById(id);
-  if (updatedDoc) {
-    const rowInfo = database.prepare("SELECT rowid FROM documents WHERE id = ?").get(id);
-    if (rowInfo) {
-      try {
-        database.prepare("DELETE FROM documents_fts WHERE rowid = ?").run(rowInfo.rowid);
-        database.prepare(`
-          INSERT INTO documents_fts (rowid, title, rawText, tags, type, owner, originalOwner, mentions, organizations, fieldsText)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          rowInfo.rowid,
-          updatedDoc.title ?? "",
-          updatedDoc.rawText ?? "",
-          JSON.stringify(updatedDoc.tags ?? []),
-          updatedDoc.type ?? "",
-          updatedDoc.owner ?? "",
-          updatedDoc.originalOwner ?? "",
-          updatedDoc.mentions ? JSON.stringify(updatedDoc.mentions) : "",
-          updatedDoc.organizations ? JSON.stringify(updatedDoc.organizations) : "",
-          Object.values(updatedDoc.fields).filter(Boolean).join(" ")
-        );
-      } catch {
-      }
-    }
-  }
+  const COLUMNS = ["title", "rawText", "markdownContent", "type", "owner", "originalOwner", "mimeType", "dateAdded"];
+  let next;
+  if (COLUMNS.includes(key)) next = { ...doc, [key]: value };
+  else if (key === "tags") next = { ...doc, tags: Array.isArray(value) ? value : String(value).split(",").map((t) => t.trim()) };
+  else next = { ...doc, fields: { ...doc.fields, [key]: value } };
+  upsertDocument2({ ...next, updatedAt: Date.now() });
 }
 function searchDocumentsFTS(query, limit = 50) {
   const database = getDatabase();
@@ -697,7 +2394,7 @@ function upsertChunks(chunks) {
   const transaction = database.transaction(() => {
     for (const chunk of chunks) {
       const embBlob = chunk.embedding ? Buffer.from(new Float64Array(chunk.embedding).buffer) : null;
-      stmt.run(chunk.id, chunk.docId, chunk.chunkText, embBlob, chunk.chunkIndex);
+      stmt.run(chunk.id, chunk.docId, sealChunkText(chunk.chunkText), embBlob, chunk.chunkIndex);
     }
   });
   transaction();
@@ -764,7 +2461,384 @@ var init_database = __esm({
   "src/core/database.ts"() {
     "use strict";
     init_config();
+    init_secretSeal();
     db = null;
+  }
+});
+
+// src/core/client.ts
+function parseIntendedClient(value) {
+  const key = (value ?? "").trim().toLowerCase();
+  if (!key || key === "any") return null;
+  if (!(key in KNOWN)) {
+    throw new Error(`Unknown agent "${value}". Use one of: ${CLIENT_KEYS.join(", ")} (or "any").`);
+  }
+  return known(key);
+}
+function clientDisplay(key) {
+  return KNOWN[key] ?? OTHER[key] ?? key;
+}
+function slugify(name) {
+  return name.normalize("NFKD").replace(new RegExp("\\p{M}", "gu"), "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+}
+function known(key) {
+  return { key, display: KNOWN[key] };
+}
+function normalizeClientName(name, remote = false) {
+  const raw = (name ?? "").trim();
+  if (!raw) return null;
+  const n = raw.toLowerCase();
+  if (n.includes("claude-code") || n.includes("claude code")) return known("claude-code");
+  if (n.includes("claude")) {
+    if (remote) return known("claude-web");
+    return known("claude-desktop");
+  }
+  if (n.includes("codex")) return known("codex");
+  if (n.includes("openai") || n.includes("chatgpt")) return known("chatgpt");
+  if (n.includes("cursor")) return known("cursor");
+  if (n.includes("copilot") || n.includes("vscode") || n.includes("visual studio code")) return known("copilot");
+  if (n.includes("gemini")) return known("gemini");
+  if (n.includes("windsurf")) return known("windsurf");
+  const key = slugify(raw);
+  if (!key) return null;
+  return { key, display: raw };
+}
+function detectClientFromEnv(env = process.env) {
+  const has = (prefix) => Object.keys(env).some((k) => k.startsWith(prefix));
+  if (env.CLAUDECODE) return known("claude-code");
+  if (has("CURSOR_")) return known("cursor");
+  if (has("CODEX_")) return known("codex");
+  if (env.GEMINI_CLI) return known("gemini");
+  return known("terminal");
+}
+function resolveClient(clientInfoName, remote = false) {
+  return normalizeClientName(clientInfoName, remote) ?? (remote ? { key: "remote", display: "Remote agent" } : detectClientFromEnv());
+}
+var KNOWN, OTHER, CLIENT_KEYS;
+var init_client = __esm({
+  "src/core/client.ts"() {
+    "use strict";
+    KNOWN = {
+      "claude-desktop": "Claude Desktop",
+      "claude-code": "Claude Code",
+      "claude-web": "Claude.ai",
+      chatgpt: "ChatGPT",
+      codex: "Codex",
+      cursor: "Cursor",
+      copilot: "Copilot",
+      gemini: "Gemini",
+      windsurf: "Windsurf",
+      terminal: "Terminal"
+    };
+    OTHER = {
+      mac: "moi vault for Mac"
+    };
+    CLIENT_KEYS = Object.keys(KNOWN);
+  }
+});
+
+// src/core/connection.ts
+import fs3 from "fs";
+import os2 from "os";
+import path3 from "path";
+import crypto7 from "crypto";
+async function loadConnectionSecrets() {
+  if (secretsCache !== void 0) return secretsCache;
+  const kc = getKeychain();
+  const [connectionId, credential, priv, pub] = await Promise.all([
+    kc.get("connection_id"),
+    kc.get("credential"),
+    kc.get("conn_private_key"),
+    kc.get("conn_public_key")
+  ]);
+  secretsCache = connectionId && credential && priv && pub ? { connectionId, credential, keyPair: { privateKey: base64ToBytes(priv), publicKey: base64ToBytes(pub) } } : null;
+  return secretsCache;
+}
+async function isConnectionMode() {
+  return await loadConnectionSecrets() !== null;
+}
+function connectionModeKnown() {
+  return !!secretsCache;
+}
+function setConnectionState(next) {
+  state = next;
+}
+function getConnectionState() {
+  return state;
+}
+function getManifest() {
+  return state?.manifest ?? null;
+}
+function canWriteSpace(spaceId) {
+  if (!spaceId || !state) return false;
+  return state.grants.some((g) => g.spaceId === spaceId && g.canWrite);
+}
+function canDeleteSpace(spaceId) {
+  if (!spaceId || !state) return false;
+  return state.grants.some((g) => g.spaceId === spaceId && g.canDelete === true);
+}
+function intendedClient() {
+  const key = loadConfig().connection?.intendedClient;
+  return key ? { key, display: clientDisplay(key) } : null;
+}
+function adoptIntendedClient(key) {
+  const config = loadConfig();
+  if (!config.connection || (config.connection.intendedClient ?? null) === key) return;
+  const { intendedClient: _previous, ...rest } = config.connection;
+  saveConfig({ ...config, connection: key ? { ...rest, intendedClient: key } : rest });
+}
+function getPreset() {
+  return state?.preset ?? null;
+}
+function getContextCard() {
+  return state?.context ?? null;
+}
+function writableSpaceForNewDoc(preferred) {
+  if (!state) return null;
+  if (preferred && canWriteSpace(preferred)) return preferred;
+  const writable = state.grants.filter((g) => g.canWrite).map((g) => g.spaceId);
+  if (writable.length === 0) return null;
+  const family = state.manifest?.spaces.find((s) => s.kind === "family" && writable.includes(s.spaceId));
+  return family?.spaceId ?? writable[0];
+}
+function userPublicKey() {
+  const manifest = getManifest();
+  if (!manifest?.userPublicKey) {
+    throw new Error("No manifest from the phone yet \u2014 run `moivault sync` once the pairing is approved");
+  }
+  const key = base64ToBytes(manifest.userPublicKey);
+  if (key.length !== 32) throw new Error("Manifest carries a malformed user public key");
+  return key;
+}
+function openSealedJson(sealed, keyPair) {
+  const bytes = sealed instanceof Uint8Array ? sealed : new Uint8Array(sealed);
+  const plain = openSealed(bytes, keyPair.privateKey, keyPair.publicKey);
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+function sealJsonToUser(obj) {
+  return toArrayBuffer(sealToPublicKey(new TextEncoder().encode(JSON.stringify(obj)), userPublicKey()));
+}
+function sealBytesToUser(bytes) {
+  return toArrayBuffer(sealToPublicKey(bytes, userPublicKey()));
+}
+function toArrayBuffer(bytes) {
+  const buf = new ArrayBuffer(bytes.byteLength);
+  new Uint8Array(buf).set(bytes);
+  return buf;
+}
+async function postJson(route, body) {
+  let response;
+  try {
+    response = await fetch(`${CONVEX_SITE_URL}${route}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  } catch (err) {
+    throw new Error(`Could not reach the vault server (${err.message}). Check your connection and try again.`);
+  }
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+  }
+  return { status: response.status, data };
+}
+function randomBase64Url(bytes) {
+  return crypto7.randomBytes(bytes).toString("base64url");
+}
+function sha256Hex(s) {
+  return crypto7.createHash("sha256").update(s, "utf-8").digest("hex");
+}
+function machineLabel() {
+  return os2.hostname().replace(/\.local$/, "");
+}
+function machinePlatform() {
+  return process.platform === "linux" ? "linux" : "darwin";
+}
+async function claimPairing(pairToken, generateKeyPair2) {
+  const keyPair = generateKeyPair2();
+  const credential = randomBase64Url(32);
+  const label = machineLabel();
+  const localFingerprint = fingerprint(keyPair.publicKey);
+  const { status, data } = await postJson("/api/agent/claim", {
+    pairToken: pairToken.trim(),
+    publicKey: bytesToBase64(keyPair.publicKey),
+    credentialHash: sha256Hex(credential),
+    label,
+    hostname: os2.hostname(),
+    platform: machinePlatform()
+  });
+  if (status === 410) {
+    const code = data?.code ?? "PAIR_EXPIRED";
+    throw new AgentHttpError(410, code, code === "PAIR_USED" ? "This pairing code was already used. Make a new one on your phone." : "This pairing code expired. Make a new one on your phone.");
+  }
+  if (status !== 200 || !data?.connectionId) {
+    throw new AgentHttpError(status, data?.code ?? null, `Pairing failed (${status})${data?.code ? `: ${data.code}` : ""}`);
+  }
+  if (data.fingerprint && data.fingerprint !== localFingerprint) {
+    throw new Error("The server reported a different key fingerprint than this machine generated. Not continuing.");
+  }
+  return { connectionId: data.connectionId, fingerprint: localFingerprint, credential, keyPair, label };
+}
+async function waitForApproval(pending3, opts = {}) {
+  const interval = opts.intervalMs ?? 2e3;
+  const deadline = Date.now() + (opts.timeoutMs ?? 10 * 60 * 1e3);
+  for (; ; ) {
+    const { status, data } = await postJson("/api/agent/token", {
+      connectionId: pending3.connectionId,
+      credential: pending3.credential
+    });
+    if (status === 200 && data?.token) return { token: data.token, expiresAt: normalizeExpiry(data.expiresAt) };
+    if (status === 410) throw new AgentHttpError(410, "DENIED", "The pairing was declined on your phone.");
+    if (status === 401) throw new AgentHttpError(401, data?.code ?? null, `The pairing is no longer valid (${data?.code ?? 401}).`);
+    if (status !== 202) throw new AgentHttpError(status, data?.code ?? null, `Unexpected response while waiting (${status}).`);
+    if (Date.now() > deadline) throw new Error("Timed out waiting for approval on your phone.");
+    opts.onTick?.();
+    await new Promise((r) => setTimeout(r, interval));
+  }
+}
+async function storePairing(pending3, intendedClient2) {
+  const kc = getKeychain();
+  await kc.set("connection_id", pending3.connectionId);
+  await kc.set("credential", pending3.credential);
+  await kc.set("conn_private_key", bytesToBase64(pending3.keyPair.privateKey));
+  await kc.set("conn_public_key", bytesToBase64(pending3.keyPair.publicKey));
+  for (const key of LEGACY_SECRET_KEYS) {
+    await kc.delete(key);
+  }
+  removeLocalLibrary();
+  const { lastSyncTimestamp: _cursor, vaultId: _vault, ...rest } = loadConfig();
+  saveConfig({
+    ...rest,
+    connection: {
+      label: pending3.label,
+      hostname: os2.hostname(),
+      fingerprint: pending3.fingerprint,
+      pairedAt: Date.now(),
+      ...intendedClient2 ? { intendedClient: intendedClient2 } : {}
+    }
+  });
+  secretsCache = void 0;
+  cachedToken = null;
+}
+function normalizeExpiry(expiresAt) {
+  const n = Number(expiresAt);
+  if (!Number.isFinite(n) || n <= 0) return Date.now() + 14 * 60 * 1e3;
+  return n < 1e12 ? n * 1e3 : n;
+}
+async function getAgentToken() {
+  if (cachedToken && Date.now() < cachedToken.expiresAt - 6e4) return cachedToken.token;
+  const secrets = await loadConnectionSecrets();
+  if (!secrets) throw new Error("This machine is not paired \u2014 run `moivault auth pair <code>`");
+  const { status, data } = await postJson("/api/agent/token", {
+    connectionId: secrets.connectionId,
+    credential: secrets.credential
+  });
+  if (status === 200 && data?.token) {
+    cachedToken = { token: data.token, expiresAt: normalizeExpiry(data.expiresAt) };
+    updateConfig({ lastSeenAt: Date.now() });
+    return data.token;
+  }
+  if (status === 202) {
+    throw new AgentHttpError(202, null, "Still waiting for approval on your phone.");
+  }
+  if (status === 401 && (data?.code === "REVOKED" || data?.code === "EXPIRED")) {
+    return disconnectMachine();
+  }
+  if (status === 410) {
+    return disconnectMachine("The pairing was declined on your phone.");
+  }
+  if (status === 401) {
+    throw new AgentHttpError(401, data?.code ?? "INVALID", "This machine's credential was not accepted. Pair again with `moivault auth pair <code>`.");
+  }
+  throw new AgentHttpError(status, data?.code ?? null, `Agent token exchange failed (${status}).`);
+}
+function isRevocationError(err) {
+  return agentErrorCode(err) === "AGENT_REVOKED";
+}
+function agentErrorCode(err) {
+  const data = err?.data;
+  if (data && typeof data.code === "string") return data.code;
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.match(/\b(AGENT_[A-Z_]+)\b/)?.[1] ?? null;
+}
+function removeLocalLibrary() {
+  closeDatabase();
+  const dir = getConfigDir();
+  const dbPath = loadConfig().dbPath ?? path3.join(dir, "vault.db");
+  for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    fs3.rmSync(file, { force: true });
+  }
+}
+async function disconnectMachine(message = DISCONNECTED_MESSAGE) {
+  try {
+    await wipeAllSecrets();
+    removeLocalLibrary();
+    const dir = getConfigDir();
+    for (const file of ["config.json", "secrets.json"]) {
+      fs3.rmSync(path3.join(dir, file), { force: true });
+    }
+    try {
+      fs3.rmdirSync(dir);
+    } catch {
+    }
+  } finally {
+    secretsCache = null;
+    cachedToken = null;
+    state = null;
+    process.stderr.write(`${message}
+`);
+    process.exit(1);
+  }
+}
+var LEGACY_SECRET_KEYS, secretsCache, state, SENSITIVE_DOC_TYPES, AgentHttpError, cachedToken, DISCONNECTED_MESSAGE;
+var init_connection = __esm({
+  "src/core/connection.ts"() {
+    "use strict";
+    init_keychain();
+    init_config();
+    init_keyExchange();
+    init_database();
+    init_crypto();
+    init_client();
+    LEGACY_SECRET_KEYS = [
+      "session_cookie",
+      "muk",
+      "secret_key",
+      "salt",
+      "wrapped_vault_key",
+      "master_password"
+    ];
+    state = null;
+    SENSITIVE_DOC_TYPES = /* @__PURE__ */ new Set([
+      "id",
+      "drivers_license",
+      "birth_certificate",
+      "marriage_certificate",
+      "visa",
+      "bank_statement",
+      "salary_slip",
+      "tax_id",
+      "tax_return",
+      "tax_form",
+      "tax_notice",
+      "medical",
+      "prescription",
+      "vaccination",
+      "investment",
+      "loan"
+    ]);
+    AgentHttpError = class extends Error {
+      constructor(status, code, message) {
+        super(message);
+        this.status = status;
+        this.code = code;
+        this.name = "AgentHttpError";
+      }
+    };
+    cachedToken = null;
+    DISCONNECTED_MESSAGE = "This machine was disconnected from your phone.";
   }
 });
 
@@ -772,7 +2846,7 @@ var init_database = __esm({
 import fs6 from "fs";
 import net from "net";
 import path6 from "path";
-import crypto8 from "crypto";
+import crypto10 from "crypto";
 import { spawn as spawn2 } from "child_process";
 function browserDir() {
   const dir = path6.join(getConfigDir(), "browser");
@@ -794,7 +2868,7 @@ function sendToDaemon(cmd, args = {}, timeoutMs = 33e4) {
       return;
     }
     const sock = net.createConnection(socketPath());
-    const id = crypto8.randomBytes(6).toString("hex");
+    const id = crypto10.randomBytes(6).toString("hex");
     let buf = "";
     const timer = setTimeout(() => {
       sock.destroy();
@@ -961,184 +3035,6 @@ var init_site = __esm({
       "herokuapp.com",
       "appspot.com"
     ]);
-  }
-});
-
-// src/browser/secrets.ts
-import crypto9 from "crypto";
-function isSecretField(key, value) {
-  if (typeof value !== "string" && typeof value !== "number") return false;
-  if (String(value).trim().length < MIN_SECRET_LENGTH) return false;
-  return SECRET_FIELD_KEYS.has(key) || SECRET_FIELD_PATTERN.test(key);
-}
-function maskValue(value) {
-  const v = value.trim();
-  const tail = v.length >= 8 ? v.slice(-4) : "";
-  return "\u2022".repeat(Math.max(4, Math.min(8, v.length - tail.length))) + tail;
-}
-function secretVariants(value) {
-  const raw = value.trim();
-  const compact = raw.replace(/[\s\-./]/g, "");
-  const out = /* @__PURE__ */ new Set();
-  for (const v of [raw, compact]) {
-    if (v.length < MIN_SECRET_LENGTH) continue;
-    out.add(v);
-    out.add(v.toUpperCase());
-    out.add(v.toLowerCase());
-    out.add(encodeURIComponent(v));
-    out.add(encodeURIComponent(v).replace(/%20/g, "+"));
-    out.add(Buffer.from(v).toString("base64").replace(/=+$/, ""));
-    out.add(v.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`));
-  }
-  if (compact.length >= 8 && compact !== raw) out.add(compact.match(/.{1,4}/g).join(" "));
-  return [...out].filter((v) => v.length >= MIN_SECRET_LENGTH);
-}
-function looseRegex(value) {
-  const compact = value.replace(/[\s\-./]/g, "");
-  if (compact.length < 6) return null;
-  const body = [...compact].map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\s\\-./]{0,2}");
-  return new RegExp(body, "gi");
-}
-function presentFields(fields, doc, refs2) {
-  const walk = (value, key, pathKey) => {
-    if (isSecretField(key, value)) {
-      const rec = refs2.mint({ docId: doc.id, docType: doc.type, docTitle: doc.title, field: pathKey, value: String(value).trim() });
-      return { ref: rec.ref, mask: rec.mask };
-    }
-    if (Array.isArray(value)) return value.map((v, i) => walk(v, key, `${pathKey}.${i}`));
-    if (value && typeof value === "object") {
-      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v, k, `${pathKey}.${k}`)]));
-    }
-    return value;
-  };
-  return Object.fromEntries(Object.entries(fields ?? {}).map(([k, v]) => [k, walk(v, k, k)]));
-}
-var SECRET_FIELD_KEYS, SECRET_FIELD_PATTERN, MIN_SECRET_LENGTH, MRZ_LINE, MRZ_MASK, Scrubber, REF_TTL_MS, RefStore;
-var init_secrets = __esm({
-  "src/browser/secrets.ts"() {
-    "use strict";
-    SECRET_FIELD_KEYS = /* @__PURE__ */ new Set([
-      "idNumber",
-      "passportNumber",
-      "documentNumber",
-      "visaNumber",
-      "licenseNumber",
-      "vin",
-      "policyNumber",
-      "accountNumber",
-      "iban",
-      "cardNumber",
-      "pin",
-      "cvv",
-      "loanNumber",
-      "memberId",
-      "employeeId",
-      "taxIdNumber",
-      "taxNumber",
-      "panNumber",
-      "ssn",
-      "aadhaarNumber",
-      "nationalId",
-      "registrationNumber"
-    ]);
-    SECRET_FIELD_PATTERN = /(passport|account|card|policy|licen[cs]e|loan|tax|pan|aadhaar|ssn|social|national|document|member|employee|customer|iban|routing|sort.?code)[ _-]?(number|no|num|id)?$|^(pin|cvv|cvc|iban|ssn)$/i;
-    MIN_SECRET_LENGTH = 4;
-    MRZ_LINE = /(?<![A-Z0-9<])[A-Z0-9<]{28,44}(?![A-Z0-9<])/g;
-    MRZ_MASK = "[machine-readable zone hidden]";
-    Scrubber = class {
-      entries = /* @__PURE__ */ new Map();
-      /** Idempotent. Returns the mask shown in place of the value. */
-      add(value, mask = maskValue(value)) {
-        const key = value.trim();
-        if (key.length < MIN_SECRET_LENGTH) return mask;
-        if (!this.entries.has(key)) {
-          const variants = secretVariants(key).sort((a, b) => b.length - a.length);
-          this.entries.set(key, { mask, variants, loose: looseRegex(key) });
-        }
-        return this.entries.get(key).mask;
-      }
-      values() {
-        return [...this.entries.keys()];
-      }
-      /** Every variant of every secret, for code that must search a page for them itself. */
-      allVariants() {
-        return [...this.entries.values()].flatMap((e) => e.variants);
-      }
-      get size() {
-        return this.entries.size;
-      }
-      /** Masks every known secret (and every MRZ line) in `text`. */
-      scrub(text2, hits) {
-        let out = text2;
-        for (const { mask, variants, loose } of this.entries.values()) {
-          let count = 0;
-          for (const v of variants) {
-            if (!out.includes(v)) continue;
-            const parts = out.split(v);
-            count += parts.length - 1;
-            out = parts.join(mask);
-          }
-          if (loose) {
-            out = out.replace(loose, () => {
-              count++;
-              return mask;
-            });
-          }
-          if (count && hits) hits.push({ mask, count });
-        }
-        if (MRZ_LINE.test(out)) {
-          MRZ_LINE.lastIndex = 0;
-          out = out.replace(MRZ_LINE, (m) => /<</.test(m) || /</.test(m) && /\d/.test(m) ? MRZ_MASK : m);
-        }
-        MRZ_LINE.lastIndex = 0;
-        return out;
-      }
-      /** True when `text` still holds any known secret — the egress check that fails closed. */
-      leaks(text2) {
-        for (const { variants, loose } of this.entries.values()) {
-          if (variants.some((v) => text2.includes(v))) return true;
-          if (loose) {
-            loose.lastIndex = 0;
-            if (loose.test(text2)) return true;
-          }
-        }
-        return false;
-      }
-    };
-    REF_TTL_MS = 60 * 60 * 1e3;
-    RefStore = class {
-      constructor(scrubber3) {
-        this.scrubber = scrubber3;
-      }
-      byRef = /* @__PURE__ */ new Map();
-      byField = /* @__PURE__ */ new Map();
-      mint(input) {
-        const key = `${input.docId}\0${input.field}`;
-        const existing = this.byField.get(key);
-        if (existing) {
-          const rec2 = this.get(existing);
-          if (rec2 && rec2.value === input.value) return rec2;
-        }
-        const mask = this.scrubber.add(input.value);
-        const rec = { ...input, ref: `vh_${crypto9.randomBytes(10).toString("hex")}`, mask, createdAt: Date.now() };
-        this.byRef.set(rec.ref, rec);
-        this.byField.set(key, rec.ref);
-        return rec;
-      }
-      get(ref) {
-        const rec = this.byRef.get(ref);
-        if (!rec) return null;
-        if (Date.now() - rec.createdAt > REF_TTL_MS) {
-          this.byRef.delete(ref);
-          this.byField.delete(`${rec.docId}\0${rec.field}`);
-          return null;
-        }
-        return rec;
-      }
-      all() {
-        return [...this.byRef.keys()].map((r) => this.get(r)).filter((r) => !!r);
-      }
-    };
   }
 });
 
@@ -1541,9 +3437,9 @@ var init_engine = __esm({
 
 // src/browser/liveview.ts
 import http2 from "http";
-import crypto10 from "crypto";
+import crypto11 from "crypto";
 async function startLiveView(hooks) {
-  const token = crypto10.randomBytes(18).toString("base64url");
+  const token = crypto11.randomBytes(18).toString("base64url");
   const clients = /* @__PURE__ */ new Set();
   let session = null;
   let sessionPage = null;
@@ -1759,7 +3655,33 @@ __export(daemon_exports, {
 });
 import fs8 from "fs";
 import net2 from "net";
-import crypto11 from "crypto";
+import crypto12 from "crypto";
+function resolveSecret(spec) {
+  const key = `${spec.taskId}|${spec.docId}|${spec.field}`;
+  if (spec.sealed) {
+    const entry = fillKeys.get(spec.sealed.keyId);
+    if (!entry) throw coded("The one-time key for this fill expired; ask again", "NEED_VALUE");
+    fillKeys.delete(spec.sealed.keyId);
+    let body;
+    try {
+      body = JSON.parse(Buffer.from(openSealed(Buffer.from(spec.sealed.data, "base64"), entry.kp.privateKey, entry.kp.publicKey)).toString("utf-8"));
+    } finally {
+      entry.kp.privateKey.fill(0);
+    }
+    if (body.docId !== spec.docId || body.field !== spec.field || typeof body.value !== "string") {
+      throw coded("The phone sealed a different value than the one asked for", "VALUE_MISMATCH");
+    }
+    taskValues.set(key, body.value);
+    return body.value;
+  }
+  if (typeof spec.value === "string") {
+    taskValues.set(key, spec.value);
+    return spec.value;
+  }
+  const cached = taskValues.get(key);
+  if (cached === void 0) throw coded("This browser no longer holds that value; ask again", "NEED_VALUE");
+  return cached;
+}
 function adoptPage(page) {
   const existing = tabOfPage.get(page);
   if (existing) return existing;
@@ -2064,7 +3986,7 @@ async function shutdown(code) {
 }
 async function runDaemon(opts = {}) {
   browserDir();
-  const token = crypto11.randomBytes(32).toString("hex");
+  const token = crypto12.randomBytes(32).toString("hex");
   const headless = opts.headless || process.env.MOIVAULT_BROWSER_HEADLESS === "1";
   const launched = await launchBrowser({ headless });
   context = launched.context;
@@ -2120,7 +4042,7 @@ async function runDaemon(opts = {}) {
         return;
       }
       const reply = (body) => sock.end(JSON.stringify({ id: msg.id, ...body }) + "\n");
-      if (typeof msg.token !== "string" || msg.token.length !== token.length || !crypto11.timingSafeEqual(Buffer.from(msg.token), Buffer.from(token))) {
+      if (typeof msg.token !== "string" || msg.token.length !== token.length || !crypto12.timingSafeEqual(Buffer.from(msg.token), Buffer.from(token))) {
         reply({ ok: false, error: "unauthorized", code: "UNAUTHORIZED" });
         return;
       }
@@ -2149,7 +4071,7 @@ async function runDaemon(opts = {}) {
   process.on("SIGTERM", () => void shutdown(0));
   process.on("SIGINT", () => void shutdown(0));
 }
-var scrubber, tabs, tabOfPage, activeTabId, context, live, handoff, tabSeq, log, commands, unqueued, queue, server;
+var fillKeys, FILL_KEY_TTL_MS, taskValues, scrubber, tabs, tabOfPage, activeTabId, context, live, handoff, tabSeq, log, commands, unqueued, queue, server;
 var init_daemon = __esm({
   "src/browser/daemon.ts"() {
     "use strict";
@@ -2159,6 +4081,10 @@ var init_daemon = __esm({
     init_engine();
     init_ipc();
     init_liveview();
+    init_keyExchange();
+    fillKeys = /* @__PURE__ */ new Map();
+    FILL_KEY_TTL_MS = 15 * 60 * 1e3;
+    taskValues = /* @__PURE__ */ new Map();
     scrubber = new Scrubber();
     tabs = /* @__PURE__ */ new Map();
     tabOfPage = /* @__PURE__ */ new WeakMap();
@@ -2289,7 +4215,7 @@ ${r.text}${more}`, tab) };
             const site = siteOf(d.url);
             if (!site || !f.secret.sites.includes(site)) throw coded(`${f.ref} is on ${site ?? "a page with no site"}, which is not approved for ${f.secret.mask}`, "NOT_GRANTED");
             if (d.type === "hidden") throw coded("Secrets are never written into hidden fields", "NOT_EDITABLE");
-            value = f.secret.value;
+            value = resolveSecret(f.secret);
             const mask = scrubber.add(value, f.secret.mask);
             const check = new Scrubber();
             check.add(value, mask);
@@ -2300,6 +4226,7 @@ ${r.text}${more}`, tab) };
             secretRefs.push({ ref: f.ref, frame, id });
           } else {
             value = String(f.text ?? "");
+            if (scrubber.leaks(value)) throw coded(`${f.ref}: that text is a vault secret \u2014 pass its ref as secret instead`, "SECRET_AS_TEXT");
           }
           if (d.tag === "select") {
             const ok = await el.selectOption({ label: value }).catch(() => null);
@@ -2426,6 +4353,40 @@ ${await fullSnapshot(tab)}`, tab) };
         handoff.done();
         return { done: true };
       },
+      async fillKey() {
+        const now = Date.now();
+        for (const [id, e] of fillKeys) if (now - e.createdAt > FILL_KEY_TTL_MS) {
+          e.kp.privateKey.fill(0);
+          fillKeys.delete(id);
+        }
+        const kp = generateKeyPair();
+        const keyId = crypto12.randomBytes(8).toString("hex");
+        fillKeys.set(keyId, { kp, createdAt: now });
+        return { keyId, publicKey: Buffer.from(kp.publicKey).toString("base64") };
+      },
+      async hasValue({ taskId, docId, field }) {
+        return { has: taskValues.has(`${taskId}|${docId}|${field}`) };
+      },
+      async forgetTask({ taskId }) {
+        for (const k of [...taskValues.keys()]) if (k.startsWith(`${taskId}|`)) taskValues.delete(k);
+        return { forgotten: true };
+      },
+      /** Start waiting on the person without blocking; the MCP process polls `handoffState`. */
+      async handoffStart({ reason }) {
+        try {
+          await activeTab().page.bringToFront();
+        } catch {
+        }
+        if (handoff) handoff.done();
+        handoff = { reason: String(reason ?? ""), since: Date.now(), done: () => {
+          handoff = null;
+        } };
+        log(`handoff: ${reason}`);
+        return { waiting: true };
+      },
+      async handoffState() {
+        return { waiting: !!handoff, reason: handoff?.reason ?? null };
+      },
       async liveUrl() {
         return { url: live?.url ?? null };
       },
@@ -2442,228 +4403,9 @@ ${await fullSnapshot(tab)}`, tab) };
 import { Command } from "commander";
 
 // src/cli/commands/auth.ts
+init_keychain();
+init_config();
 import http from "http";
-
-// src/core/keychain.ts
-init_config();
-import fs2 from "fs";
-import path2 from "path";
-import crypto from "crypto";
-import { spawnSync } from "child_process";
-var ALL_SECRET_KEYS = [
-  // Agent connection (current)
-  "connection_id",
-  "credential",
-  "conn_private_key",
-  "conn_public_key",
-  "serve_secret",
-  // Legacy install (cookie + MUK)
-  "session_cookie",
-  "muk",
-  "secret_key",
-  "salt",
-  "wrapped_vault_key",
-  "master_password"
-];
-var SECURITY = "/usr/bin/security";
-function serviceName() {
-  const override = process.env.MOIVAULT_CONFIG_DIR;
-  if (!override) return "moivault";
-  const tag = crypto.createHash("sha256").update(path2.resolve(override)).digest("hex").slice(0, 8);
-  return `moivault-${tag}`;
-}
-function assertKeyName(key) {
-  if (!/^[a-z0-9_]+$/.test(key)) throw new Error(`Invalid keychain key: ${key}`);
-}
-function createMacBackend() {
-  const service = serviceName();
-  function run2(args, input) {
-    return spawnSync(SECURITY, args, { input, encoding: "utf-8", timeout: 1e4 });
-  }
-  function read(key) {
-    const r = run2(["find-generic-password", "-s", service, "-a", key, "-w"]);
-    if (r.status === 44) return null;
-    if (r.status !== 0) throw new Error(`security find-generic-password failed (${r.status})`);
-    const stored = r.stdout.replace(/\n$/, "");
-    return Buffer.from(stored, "base64").toString("utf-8");
-  }
-  return {
-    async get(key) {
-      assertKeyName(key);
-      return read(key);
-    },
-    async set(key, value) {
-      assertKeyName(key);
-      const encoded = Buffer.from(value, "utf-8").toString("base64");
-      const command = `add-generic-password -U -s "${service}" -a "${key}" -l "moivault ${key}" -w "${encoded}"
-`;
-      const r = run2(["-i"], command);
-      if (r.status !== 0) throw new Error(`security add-generic-password failed (${r.status})`);
-      if (read(key) !== value) throw new Error("Keychain write did not read back");
-    },
-    async delete(key) {
-      assertKeyName(key);
-      const r = run2(["delete-generic-password", "-s", service, "-a", key]);
-      if (r.status !== 0 && r.status !== 44) {
-        throw new Error(`security delete-generic-password failed (${r.status})`);
-      }
-    }
-  };
-}
-function hasSecretTool() {
-  const r = spawnSync("sh", ["-c", "command -v secret-tool"], { encoding: "utf-8" });
-  return r.status === 0 && r.stdout.trim().length > 0;
-}
-function createSecretToolBackend() {
-  const service = serviceName();
-  const attrs = (key) => ["service", service, "account", key];
-  return {
-    async get(key) {
-      assertKeyName(key);
-      const r = spawnSync("secret-tool", ["lookup", ...attrs(key)], { encoding: "utf-8", timeout: 1e4 });
-      if (r.status !== 0) {
-        if (r.error || r.stderr && r.stderr.trim()) throw new Error("secret-tool lookup failed");
-        return null;
-      }
-      return r.stdout.length > 0 ? r.stdout : null;
-    },
-    async set(key, value) {
-      assertKeyName(key);
-      const r = spawnSync("secret-tool", ["store", `--label=moivault ${key}`, ...attrs(key)], {
-        input: value,
-        encoding: "utf-8",
-        timeout: 1e4
-      });
-      if (r.status !== 0) throw new Error("secret-tool store failed");
-    },
-    async delete(key) {
-      assertKeyName(key);
-      spawnSync("secret-tool", ["clear", ...attrs(key)], { encoding: "utf-8", timeout: 1e4 });
-    }
-  };
-}
-function secretsFilePath() {
-  return path2.join(getConfigDir(), "secrets.json");
-}
-function readSecretsFile() {
-  const file = secretsFilePath();
-  if (!fs2.existsSync(file)) return {};
-  try {
-    return JSON.parse(fs2.readFileSync(file, "utf-8"));
-  } catch {
-    return {};
-  }
-}
-function writeSecretsFile(secrets) {
-  const file = secretsFilePath();
-  if (Object.keys(secrets).length === 0) {
-    fs2.rmSync(file, { force: true });
-    return;
-  }
-  fs2.writeFileSync(file, JSON.stringify(secrets, null, 2), { mode: 384 });
-}
-function createFileBackend() {
-  return {
-    async get(key) {
-      return readSecretsFile()[key] ?? null;
-    },
-    async set(key, value) {
-      const secrets = readSecretsFile();
-      secrets[key] = value;
-      writeSecretsFile(secrets);
-    },
-    async delete(key) {
-      const secrets = readSecretsFile();
-      if (!(key in secrets)) return;
-      delete secrets[key];
-      writeSecretsFile(secrets);
-    }
-  };
-}
-function createLayeredBackend(primary, name) {
-  const file = createFileBackend();
-  let migrated = false;
-  async function migrate() {
-    if (migrated) return;
-    migrated = true;
-    const secrets = readSecretsFile();
-    const keys = Object.keys(secrets);
-    if (keys.length === 0) return;
-    const remaining = {};
-    for (const key of keys) {
-      try {
-        assertKeyName(key);
-        await primary.set(key, secrets[key]);
-        if (await primary.get(key) !== secrets[key]) throw new Error("mismatch");
-      } catch {
-        remaining[key] = secrets[key];
-      }
-    }
-    writeSecretsFile(remaining);
-  }
-  return {
-    name,
-    async get(key) {
-      await migrate();
-      try {
-        const value = await primary.get(key);
-        if (value !== null) return value;
-      } catch {
-      }
-      return file.get(key);
-    },
-    async set(key, value) {
-      assertKeyName(key);
-      await migrate();
-      try {
-        await primary.set(key, value);
-        await file.delete(key);
-      } catch {
-        await file.set(key, value);
-      }
-    },
-    async delete(key) {
-      try {
-        await primary.delete(key);
-      } catch {
-      }
-      await file.delete(key);
-    }
-  };
-}
-var backend = null;
-function getKeychain() {
-  return resolveBackend();
-}
-function getKeychainBackendName() {
-  return resolveBackend().name;
-}
-function resolveBackend() {
-  if (backend) return backend;
-  const forced = process.env.MOIVAULT_KEYCHAIN;
-  if (forced === "file") {
-    backend = { ...createFileBackend(), name: "file" };
-  } else if (process.platform === "darwin" && fs2.existsSync(SECURITY)) {
-    backend = createLayeredBackend(createMacBackend(), "macos-keychain");
-  } else if (process.platform === "linux" && hasSecretTool()) {
-    backend = createLayeredBackend(createSecretToolBackend(), "secret-service");
-  } else {
-    backend = { ...createFileBackend(), name: "file" };
-  }
-  return backend;
-}
-async function wipeAllSecrets() {
-  const kc = resolveBackend();
-  for (const key of ALL_SECRET_KEYS) {
-    try {
-      await kc.delete(key);
-    } catch {
-    }
-  }
-}
-
-// src/cli/commands/auth.ts
-init_config();
 
 // src/core/output.ts
 function shouldOutputJson(opts) {
@@ -2738,1225 +4480,12 @@ function prettySearchResults(results) {
   }).join("\n\n");
 }
 
-// src/core/keyExchange.ts
-init_crypto();
-import crypto3 from "crypto";
-var X25519_KEY_BYTES = 32;
-var ENVELOPE_VERSION = 2;
-var SPKI_PREFIX = Buffer.from("302a300506032b656e032100", "hex");
-var PKCS8_PREFIX = Buffer.from("302e020100300506032b656e04220420", "hex");
-function publicKeyObject(raw) {
-  if (raw.length !== X25519_KEY_BYTES) {
-    throw new Error(`X25519 public key must be 32 bytes, got ${raw.length}`);
-  }
-  return crypto3.createPublicKey({
-    key: Buffer.concat([SPKI_PREFIX, Buffer.from(raw)]),
-    format: "der",
-    type: "spki"
-  });
-}
-function privateKeyObject(raw) {
-  if (raw.length !== X25519_KEY_BYTES) {
-    throw new Error(`X25519 private key must be 32 bytes, got ${raw.length}`);
-  }
-  return crypto3.createPrivateKey({
-    key: Buffer.concat([PKCS8_PREFIX, Buffer.from(raw)]),
-    format: "der",
-    type: "pkcs8"
-  });
-}
-function deriveWrappingKey(sharedSecret, ephemeralPublicKey, recipientPublicKey) {
-  const hash = crypto3.createHash("sha256");
-  hash.update(sharedSecret);
-  hash.update(ephemeralPublicKey);
-  hash.update(recipientPublicKey);
-  return new Uint8Array(hash.digest());
-}
-function rawPublicKey(key) {
-  return new Uint8Array(key.export({ format: "der", type: "spki" }).subarray(SPKI_PREFIX.length));
-}
-function rawPrivateKey(key) {
-  return new Uint8Array(key.export({ format: "der", type: "pkcs8" }).subarray(PKCS8_PREFIX.length));
-}
-function generateKeyPair() {
-  const kp = crypto3.generateKeyPairSync("x25519");
-  return { publicKey: rawPublicKey(kp.publicKey), privateKey: rawPrivateKey(kp.privateKey) };
-}
-function sealToPublicKey(plaintext, recipientPublicKey) {
-  const recipient = publicKeyObject(recipientPublicKey);
-  const ephemeral = crypto3.generateKeyPairSync("x25519");
-  const ephemeralPublicKey = rawPublicKey(ephemeral.publicKey);
-  const shared = new Uint8Array(
-    crypto3.diffieHellman({ privateKey: ephemeral.privateKey, publicKey: recipient })
-  );
-  const wrappingKey = deriveWrappingKey(shared, ephemeralPublicKey, recipientPublicKey);
-  const payload = encrypt(plaintext, wrappingKey);
-  shared.fill(0);
-  wrappingKey.fill(0);
-  const envelope = new Uint8Array(1 + X25519_KEY_BYTES + payload.length);
-  envelope[0] = ENVELOPE_VERSION;
-  envelope.set(ephemeralPublicKey, 1);
-  envelope.set(payload, 1 + X25519_KEY_BYTES);
-  return envelope;
-}
-function fingerprint(publicKey) {
-  const hex = crypto3.createHash("sha256").update(publicKey).digest("hex").slice(0, 16).toUpperCase();
-  return hex.match(/.{4}/g).join("-");
-}
-function openSealed(envelope, recipientPrivateKey, recipientPublicKey) {
-  if (envelope.length < 1 + X25519_KEY_BYTES + 1) {
-    throw new Error("Sealed envelope too short");
-  }
-  if (envelope[0] !== ENVELOPE_VERSION) {
-    throw new Error(`Unsupported envelope version: ${envelope[0]}`);
-  }
-  const ephemeralPublicKey = envelope.subarray(1, 1 + X25519_KEY_BYTES);
-  const payload = envelope.subarray(1 + X25519_KEY_BYTES);
-  const shared = new Uint8Array(
-    crypto3.diffieHellman({
-      privateKey: privateKeyObject(recipientPrivateKey),
-      publicKey: publicKeyObject(ephemeralPublicKey)
-    })
-  );
-  const wrappingKey = deriveWrappingKey(shared, ephemeralPublicKey, recipientPublicKey);
-  try {
-    return decrypt(payload, wrappingKey);
-  } finally {
-    shared.fill(0);
-    wrappingKey.fill(0);
-  }
-}
-
-// src/core/connection.ts
-import fs3 from "fs";
-import os2 from "os";
-import path3 from "path";
-import crypto4 from "crypto";
-init_config();
-init_database();
-init_crypto();
-
-// src/core/client.ts
-var KNOWN = {
-  "claude-desktop": "Claude Desktop",
-  "claude-code": "Claude Code",
-  "claude-web": "Claude.ai",
-  chatgpt: "ChatGPT",
-  codex: "Codex",
-  cursor: "Cursor",
-  copilot: "Copilot",
-  gemini: "Gemini",
-  windsurf: "Windsurf",
-  terminal: "Terminal"
-};
-var CLIENT_KEYS = Object.keys(KNOWN);
-function parseIntendedClient(value) {
-  const key = (value ?? "").trim().toLowerCase();
-  if (!key || key === "any") return null;
-  if (!(key in KNOWN)) {
-    throw new Error(`Unknown agent "${value}". Use one of: ${CLIENT_KEYS.join(", ")} (or "any").`);
-  }
-  return known(key);
-}
-function clientDisplay(key) {
-  return KNOWN[key] ?? key;
-}
-function slugify(name) {
-  return name.normalize("NFKD").replace(new RegExp("\\p{M}", "gu"), "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-}
-function known(key) {
-  return { key, display: KNOWN[key] };
-}
-function normalizeClientName(name, remote = false) {
-  const raw = (name ?? "").trim();
-  if (!raw) return null;
-  const n = raw.toLowerCase();
-  if (n.includes("claude-code") || n.includes("claude code")) return known("claude-code");
-  if (n.includes("claude")) {
-    if (remote) return known("claude-web");
-    return known("claude-desktop");
-  }
-  if (n.includes("codex")) return known("codex");
-  if (n.includes("openai") || n.includes("chatgpt")) return known("chatgpt");
-  if (n.includes("cursor")) return known("cursor");
-  if (n.includes("copilot") || n.includes("vscode") || n.includes("visual studio code")) return known("copilot");
-  if (n.includes("gemini")) return known("gemini");
-  if (n.includes("windsurf")) return known("windsurf");
-  const key = slugify(raw);
-  if (!key) return null;
-  return { key, display: raw };
-}
-function detectClientFromEnv(env = process.env) {
-  const has = (prefix) => Object.keys(env).some((k) => k.startsWith(prefix));
-  if (env.CLAUDECODE) return known("claude-code");
-  if (has("CURSOR_")) return known("cursor");
-  if (has("CODEX_")) return known("codex");
-  if (env.GEMINI_CLI) return known("gemini");
-  return known("terminal");
-}
-function resolveClient(clientInfoName, remote = false) {
-  return normalizeClientName(clientInfoName, remote) ?? (remote ? { key: "remote", display: "Remote agent" } : detectClientFromEnv());
-}
-
-// src/core/connection.ts
-var LEGACY_SECRET_KEYS = [
-  "session_cookie",
-  "muk",
-  "secret_key",
-  "salt",
-  "wrapped_vault_key",
-  "master_password"
-];
-var secretsCache;
-async function loadConnectionSecrets() {
-  if (secretsCache !== void 0) return secretsCache;
-  const kc = getKeychain();
-  const [connectionId, credential, priv, pub] = await Promise.all([
-    kc.get("connection_id"),
-    kc.get("credential"),
-    kc.get("conn_private_key"),
-    kc.get("conn_public_key")
-  ]);
-  secretsCache = connectionId && credential && priv && pub ? { connectionId, credential, keyPair: { privateKey: base64ToBytes(priv), publicKey: base64ToBytes(pub) } } : null;
-  return secretsCache;
-}
-async function isConnectionMode() {
-  return await loadConnectionSecrets() !== null;
-}
-function connectionModeKnown() {
-  return !!secretsCache;
-}
-var state = null;
-function setConnectionState(next) {
-  state = next;
-}
-function getConnectionState() {
-  return state;
-}
-function getManifest() {
-  return state?.manifest ?? null;
-}
-function canWriteSpace(spaceId) {
-  if (!spaceId || !state) return false;
-  return state.grants.some((g) => g.spaceId === spaceId && g.canWrite);
-}
-function canDeleteSpace(spaceId) {
-  if (!spaceId || !state) return false;
-  return state.grants.some((g) => g.spaceId === spaceId && g.canDelete === true);
-}
-function intendedClient() {
-  const key = loadConfig().connection?.intendedClient;
-  return key ? { key, display: clientDisplay(key) } : null;
-}
-function adoptIntendedClient(key) {
-  const config = loadConfig();
-  if (!config.connection || (config.connection.intendedClient ?? null) === key) return;
-  const { intendedClient: _previous, ...rest } = config.connection;
-  saveConfig({ ...config, connection: key ? { ...rest, intendedClient: key } : rest });
-}
-function getPreset() {
-  return state?.preset ?? null;
-}
-function getContextCard() {
-  return state?.context ?? null;
-}
-var SENSITIVE_DOC_TYPES = /* @__PURE__ */ new Set([
-  "id",
-  "drivers_license",
-  "birth_certificate",
-  "marriage_certificate",
-  "visa",
-  "bank_statement",
-  "salary_slip",
-  "tax_id",
-  "tax_return",
-  "tax_form",
-  "tax_notice",
-  "medical",
-  "prescription",
-  "vaccination",
-  "investment",
-  "loan"
-]);
-function writableSpaceForNewDoc(preferred) {
-  if (!state) return null;
-  if (preferred && canWriteSpace(preferred)) return preferred;
-  const writable = state.grants.filter((g) => g.canWrite).map((g) => g.spaceId);
-  if (writable.length === 0) return null;
-  const family = state.manifest?.spaces.find((s) => s.kind === "family" && writable.includes(s.spaceId));
-  return family?.spaceId ?? writable[0];
-}
-function userPublicKey() {
-  const manifest = getManifest();
-  if (!manifest?.userPublicKey) {
-    throw new Error("No manifest from the phone yet \u2014 run `moivault sync` once the pairing is approved");
-  }
-  const key = base64ToBytes(manifest.userPublicKey);
-  if (key.length !== 32) throw new Error("Manifest carries a malformed user public key");
-  return key;
-}
-function openSealedJson(sealed, keyPair) {
-  const bytes = sealed instanceof Uint8Array ? sealed : new Uint8Array(sealed);
-  const plain = openSealed(bytes, keyPair.privateKey, keyPair.publicKey);
-  return JSON.parse(new TextDecoder().decode(plain));
-}
-function sealJsonToUser(obj) {
-  return toArrayBuffer(sealToPublicKey(new TextEncoder().encode(JSON.stringify(obj)), userPublicKey()));
-}
-function sealBytesToUser(bytes) {
-  return toArrayBuffer(sealToPublicKey(bytes, userPublicKey()));
-}
-function toArrayBuffer(bytes) {
-  const buf = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(buf).set(bytes);
-  return buf;
-}
-var AgentHttpError = class extends Error {
-  constructor(status, code, message) {
-    super(message);
-    this.status = status;
-    this.code = code;
-    this.name = "AgentHttpError";
-  }
-};
-async function postJson(route, body) {
-  let response;
-  try {
-    response = await fetch(`${CONVEX_SITE_URL}${route}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body)
-    });
-  } catch (err) {
-    throw new Error(`Could not reach the vault server (${err.message}). Check your connection and try again.`);
-  }
-  let data = null;
-  try {
-    data = await response.json();
-  } catch {
-  }
-  return { status: response.status, data };
-}
-function randomBase64Url(bytes) {
-  return crypto4.randomBytes(bytes).toString("base64url");
-}
-function sha256Hex(s) {
-  return crypto4.createHash("sha256").update(s, "utf-8").digest("hex");
-}
-function machineLabel() {
-  return os2.hostname().replace(/\.local$/, "");
-}
-function machinePlatform() {
-  return process.platform === "linux" ? "linux" : "darwin";
-}
-async function claimPairing(pairToken, generateKeyPair2) {
-  const keyPair = generateKeyPair2();
-  const credential = randomBase64Url(32);
-  const label = machineLabel();
-  const localFingerprint = fingerprint(keyPair.publicKey);
-  const { status, data } = await postJson("/api/agent/claim", {
-    pairToken: pairToken.trim(),
-    publicKey: bytesToBase64(keyPair.publicKey),
-    credentialHash: sha256Hex(credential),
-    label,
-    hostname: os2.hostname(),
-    platform: machinePlatform()
-  });
-  if (status === 410) {
-    const code = data?.code ?? "PAIR_EXPIRED";
-    throw new AgentHttpError(410, code, code === "PAIR_USED" ? "This pairing code was already used. Make a new one on your phone." : "This pairing code expired. Make a new one on your phone.");
-  }
-  if (status !== 200 || !data?.connectionId) {
-    throw new AgentHttpError(status, data?.code ?? null, `Pairing failed (${status})${data?.code ? `: ${data.code}` : ""}`);
-  }
-  if (data.fingerprint && data.fingerprint !== localFingerprint) {
-    throw new Error("The server reported a different key fingerprint than this machine generated. Not continuing.");
-  }
-  return { connectionId: data.connectionId, fingerprint: localFingerprint, credential, keyPair, label };
-}
-async function waitForApproval(pending3, opts = {}) {
-  const interval = opts.intervalMs ?? 2e3;
-  const deadline = Date.now() + (opts.timeoutMs ?? 10 * 60 * 1e3);
-  for (; ; ) {
-    const { status, data } = await postJson("/api/agent/token", {
-      connectionId: pending3.connectionId,
-      credential: pending3.credential
-    });
-    if (status === 200 && data?.token) return { token: data.token, expiresAt: normalizeExpiry(data.expiresAt) };
-    if (status === 410) throw new AgentHttpError(410, "DENIED", "The pairing was declined on your phone.");
-    if (status === 401) throw new AgentHttpError(401, data?.code ?? null, `The pairing is no longer valid (${data?.code ?? 401}).`);
-    if (status !== 202) throw new AgentHttpError(status, data?.code ?? null, `Unexpected response while waiting (${status}).`);
-    if (Date.now() > deadline) throw new Error("Timed out waiting for approval on your phone.");
-    opts.onTick?.();
-    await new Promise((r) => setTimeout(r, interval));
-  }
-}
-async function storePairing(pending3, intendedClient2) {
-  const kc = getKeychain();
-  await kc.set("connection_id", pending3.connectionId);
-  await kc.set("credential", pending3.credential);
-  await kc.set("conn_private_key", bytesToBase64(pending3.keyPair.privateKey));
-  await kc.set("conn_public_key", bytesToBase64(pending3.keyPair.publicKey));
-  for (const key of LEGACY_SECRET_KEYS) {
-    await kc.delete(key);
-  }
-  removeLocalLibrary();
-  const { lastSyncTimestamp: _cursor, vaultId: _vault, ...rest } = loadConfig();
-  saveConfig({
-    ...rest,
-    connection: {
-      label: pending3.label,
-      hostname: os2.hostname(),
-      fingerprint: pending3.fingerprint,
-      pairedAt: Date.now(),
-      ...intendedClient2 ? { intendedClient: intendedClient2 } : {}
-    }
-  });
-  secretsCache = void 0;
-  cachedToken = null;
-}
-var cachedToken = null;
-function normalizeExpiry(expiresAt) {
-  const n = Number(expiresAt);
-  if (!Number.isFinite(n) || n <= 0) return Date.now() + 14 * 60 * 1e3;
-  return n < 1e12 ? n * 1e3 : n;
-}
-async function getAgentToken() {
-  if (cachedToken && Date.now() < cachedToken.expiresAt - 6e4) return cachedToken.token;
-  const secrets = await loadConnectionSecrets();
-  if (!secrets) throw new Error("This machine is not paired \u2014 run `moivault auth pair <code>`");
-  const { status, data } = await postJson("/api/agent/token", {
-    connectionId: secrets.connectionId,
-    credential: secrets.credential
-  });
-  if (status === 200 && data?.token) {
-    cachedToken = { token: data.token, expiresAt: normalizeExpiry(data.expiresAt) };
-    updateConfig({ lastSeenAt: Date.now() });
-    return data.token;
-  }
-  if (status === 202) {
-    throw new AgentHttpError(202, null, "Still waiting for approval on your phone.");
-  }
-  if (status === 401 && (data?.code === "REVOKED" || data?.code === "EXPIRED")) {
-    return disconnectMachine();
-  }
-  if (status === 410) {
-    return disconnectMachine("The pairing was declined on your phone.");
-  }
-  if (status === 401) {
-    throw new AgentHttpError(401, data?.code ?? "INVALID", "This machine's credential was not accepted. Pair again with `moivault auth pair <code>`.");
-  }
-  throw new AgentHttpError(status, data?.code ?? null, `Agent token exchange failed (${status}).`);
-}
-function isRevocationError(err) {
-  return agentErrorCode(err) === "AGENT_REVOKED";
-}
-function agentErrorCode(err) {
-  const data = err?.data;
-  if (data && typeof data.code === "string") return data.code;
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.match(/\b(AGENT_[A-Z_]+)\b/)?.[1] ?? null;
-}
-var DISCONNECTED_MESSAGE = "This machine was disconnected from your phone.";
-function removeLocalLibrary() {
-  closeDatabase();
-  const dir = getConfigDir();
-  const dbPath = loadConfig().dbPath ?? path3.join(dir, "vault.db");
-  for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
-    fs3.rmSync(file, { force: true });
-  }
-}
-async function disconnectMachine(message = DISCONNECTED_MESSAGE) {
-  try {
-    await wipeAllSecrets();
-    removeLocalLibrary();
-    const dir = getConfigDir();
-    for (const file of ["config.json", "secrets.json"]) {
-      fs3.rmSync(path3.join(dir, file), { force: true });
-    }
-    try {
-      fs3.rmdirSync(dir);
-    } catch {
-    }
-  } finally {
-    secretsCache = null;
-    cachedToken = null;
-    state = null;
-    process.stderr.write(`${message}
-`);
-    process.exit(1);
-  }
-}
-
-// src/core/vault.ts
-init_crypto();
-init_constants();
-
-// src/core/keyRing.ts
-init_crypto();
-init_constants();
-var LEGACY_SPACE_ID = "__legacy__";
-var KeyRingMiss = class extends Error {
-  constructor(spaceId, version) {
-    super(`No key held for space ${spaceId ?? "(none)"} version ${version ?? "(current)"}`);
-    this.spaceId = spaceId;
-    this.version = version;
-    this.name = "KeyRingMiss";
-  }
-};
-var KeyRing = class _KeyRing {
-  spaces = /* @__PURE__ */ new Map();
-  personalId = null;
-  familyId = null;
-  legacyMode = false;
-  constructor() {
-  }
-  get primaryId() {
-    return this.familyId ?? this.personalId;
-  }
-  get primaryKey() {
-    const id = this.primaryId;
-    return id ? this.spaces.get(id)?.key ?? null : null;
-  }
-  /** The primary space id as a document should record it; null for the sentinel. */
-  get primaryStorageId() {
-    const id = this.primaryId;
-    return id === null || id === LEGACY_SPACE_ID ? null : id;
-  }
-  get isLegacy() {
-    return this.legacyMode;
-  }
-  /**
-   * No keys at all: a paired machine before its first authenticated call, or
-   * one whose every space is Ask. Every lookup misses, which is the point.
-   */
-  static empty() {
-    return new _KeyRing();
-  }
-  /** The ring before the server has been asked: one key, standing in for everything. */
-  static legacy(vaultId, vaultKey) {
-    const ring = new _KeyRing();
-    const id = vaultId ?? LEGACY_SPACE_ID;
-    ring.legacyMode = true;
-    ring.personalId = id;
-    ring.spaces.set(id, {
-      spaceId: id,
-      kind: null,
-      name: null,
-      role: "owner",
-      isOwner: true,
-      key: vaultKey,
-      version: 1
-    });
-    return ring;
-  }
-  /** Build from the server's membership rows by opening each sealed envelope. */
-  static fromMemberships(rows, identity) {
-    const ring = new _KeyRing();
-    for (const row of rows) {
-      if (!row.wrappedSpaceKey) continue;
-      let key;
-      try {
-        key = openSealed(
-          new Uint8Array(row.wrappedSpaceKey),
-          identity.privateKey,
-          identity.publicKey
-        );
-      } catch {
-        continue;
-      }
-      if (key.length !== VAULT_KEY_BYTES) continue;
-      let prior;
-      if (row.priorWrappedSpaceKey && row.priorKeyVersion !== null) {
-        try {
-          const priorKey = openSealed(
-            new Uint8Array(row.priorWrappedSpaceKey),
-            identity.privateKey,
-            identity.publicKey
-          );
-          if (priorKey.length === VAULT_KEY_BYTES) {
-            prior = { version: row.priorKeyVersion, key: priorKey };
-          }
-        } catch {
-        }
-      }
-      ring.spaces.set(row.spaceId, {
-        spaceId: row.spaceId,
-        kind: row.kind,
-        name: row.name,
-        role: row.role,
-        isOwner: row.isOwner,
-        key,
-        version: row.keyVersion ?? row.spaceKeyVersion ?? 1,
-        prior
-      });
-      if (row.kind === "personal" && row.isOwner) ring.personalId = row.spaceId;
-      if (row.kind === "family") ring.familyId = row.spaceId;
-    }
-    return ring;
-  }
-  has(spaceId) {
-    return this.spaces.has(spaceId);
-  }
-  roleIn(spaceId) {
-    return this.spaces.get(spaceId)?.role ?? null;
-  }
-  /** Every space held, personal first, then family, then the rest. */
-  list() {
-    const rank = (e) => e.spaceId === this.personalId ? 0 : e.spaceId === this.familyId ? 1 : 2;
-    return [...this.spaces.values()].sort((a, b) => rank(a) - rank(b));
-  }
-  keyFor(spaceId, version) {
-    const id = spaceId ?? this.primaryId;
-    if (!id) throw new KeyRingMiss(spaceId ?? null, version ?? null);
-    const entry = this.spaces.get(id) ?? (this.legacyMode ? this.spaces.get(this.primaryId) : void 0);
-    if (!entry) throw new KeyRingMiss(id, version ?? null);
-    const wanted = version ?? entry.version;
-    if (wanted === entry.version) return entry.key;
-    if (entry.prior && wanted === entry.prior.version) return entry.prior.key;
-    throw new KeyRingMiss(id, wanted);
-  }
-  /**
-   * An absent `keyVersion` means 1 — written before rotation existed — and
-   * emphatically not "the current version".
-   */
-  unwrapDocKey(doc) {
-    return decrypt(doc.encryptedDocKey, this.keyFor(doc.vaultId, doc.keyVersion ?? 1));
-  }
-  wrapDocKey(docKey, spaceId) {
-    const id = spaceId ?? this.primaryId;
-    if (!id) throw new KeyRingMiss(spaceId ?? null, null);
-    const entry = this.spaces.get(id);
-    if (!entry) throw new KeyRingMiss(id, null);
-    return {
-      encryptedDocKey: encrypt(docKey, entry.key),
-      keyVersion: entry.version,
-      spaceId: entry.spaceId === LEGACY_SPACE_ID ? null : entry.spaceId
-    };
-  }
-  zero() {
-    for (const entry of this.spaces.values()) {
-      entry.key.fill(0);
-      entry.prior?.key.fill(0);
-    }
-    this.spaces.clear();
-    this.personalId = null;
-    this.familyId = null;
-  }
-};
-
-// src/core/vault.ts
-init_config();
-import crypto5 from "crypto";
-var currentKeys = null;
-function isVaultUnlocked() {
-  return currentKeys !== null;
-}
-function getVaultKeys() {
-  if (!currentKeys) {
-    throw new Error("Vault is locked \u2014 run `vault unlock` first");
-  }
-  return currentKeys;
-}
-async function unlockVault(masterPassword) {
-  const keychain = getKeychain();
-  const secretKeyB64 = await keychain.get("secret_key");
-  if (!secretKeyB64) {
-    throw new Error("Secret key not found \u2014 run `vault auth setup-key` first");
-  }
-  const saltB64 = await keychain.get("salt");
-  if (!saltB64) {
-    throw new Error("Salt not found \u2014 run `vault sync` to fetch vault metadata");
-  }
-  const secretKey = base64ToBytes(secretKeyB64);
-  const salt = base64ToBytes(saltB64);
-  const muk = await deriveMUK(masterPassword, secretKey, salt);
-  return unlockVaultWithMUK(muk);
-}
-async function unlockVaultWithMUK(muk) {
-  const keychain = getKeychain();
-  const wrappedVaultKeyB64 = await keychain.get("wrapped_vault_key");
-  if (!wrappedVaultKeyB64) {
-    throw new Error("Wrapped vault key not found \u2014 run `vault sync` to fetch vault metadata");
-  }
-  const vaultKey = decrypt(base64ToBytes(wrappedVaultKeyB64), muk);
-  currentKeys = {
-    mode: "legacy",
-    muk,
-    vaultKey,
-    identity: null,
-    keyRing: KeyRing.legacy(loadConfig().vaultId ?? null, vaultKey)
-  };
-  return currentKeys;
-}
-async function unlockWithConnection() {
-  const secrets = await loadConnectionSecrets();
-  if (!secrets) return null;
-  currentKeys = {
-    mode: "connection",
-    muk: new Uint8Array(0),
-    vaultKey: new Uint8Array(0),
-    identity: null,
-    keyRing: KeyRing.empty(),
-    connectionKeyPair: secrets.keyPair
-  };
-  return currentKeys;
-}
-async function autoUnlock() {
-  if (isVaultUnlocked()) return true;
-  if (await unlockWithConnection()) return true;
-  const envPassword = process.env.VAULT_MASTER_PASSWORD;
-  if (envPassword) {
-    await unlockVault(envPassword);
-    return true;
-  }
-  const keychain = getKeychain();
-  const mukB64 = await keychain.get("muk");
-  if (mukB64) {
-    await unlockVaultWithMUK(base64ToBytes(mukB64));
-    return true;
-  }
-  const savedPassword = await keychain.get("master_password");
-  if (savedPassword) {
-    await unlockVault(savedPassword);
-    return true;
-  }
-  return false;
-}
-function applyKeyRing(keys, ring, identity) {
-  keys.keyRing = ring;
-  keys.identity = identity;
-  const primary = ring.primaryKey;
-  if (primary) keys.vaultKey = primary;
-}
-function applyConnectionRing(keys, ring) {
-  keys.keyRing.zero();
-  keys.keyRing = ring;
-  keys.vaultKey = ring.primaryKey ?? new Uint8Array(0);
-}
-function isConnectionSession() {
-  return currentKeys?.mode === "connection";
-}
-function lockVault() {
-  if (currentKeys) {
-    currentKeys.muk.fill(0);
-    currentKeys.vaultKey.fill(0);
-    currentKeys.identity?.privateKey.fill(0);
-    currentKeys.connectionKeyPair?.privateKey.fill(0);
-    currentKeys.keyRing.zero();
-    currentKeys = null;
-  }
-}
-function unwrapDocumentKey(wrappedDocKey, doc) {
-  return getVaultKeys().keyRing.unwrapDocKey({
-    vaultId: doc.vaultId,
-    keyVersion: doc.keyVersion,
-    encryptedDocKey: wrappedDocKey
-  });
-}
-function wrapDocumentKey(documentKey, spaceId) {
-  return getVaultKeys().keyRing.wrapDocKey(documentKey, spaceId);
-}
-function generateDocumentKey() {
-  return new Uint8Array(crypto5.randomBytes(DOCUMENT_KEY_BYTES));
-}
-
-// src/core/sync.ts
-init_crypto();
-import { ConvexHttpClient } from "convex/browser";
-init_database();
-
-// src/shared/docPath.ts
-var PEOPLE_REGISTRY_BLOB_ID = "__people_registry__";
-var PATH_DISPLAY_PREFIX = "vault/";
-function normalizePersonLookupKey(name) {
-  return name.trim().toUpperCase();
-}
-function resolveCanonicalName(aliasMap, name) {
-  const trimmed = name.trim();
-  return aliasMap?.[normalizePersonLookupKey(trimmed)] || trimmed;
-}
-function buildAliasMap(registry) {
-  const aliasMap = {};
-  for (const person of registry?.people ?? []) {
-    aliasMap[normalizePersonLookupKey(person.canonicalName)] = person.canonicalName;
-    for (const alias of person.aliases ?? []) {
-      aliasMap[normalizePersonLookupKey(alias)] = person.canonicalName;
-    }
-  }
-  return aliasMap;
-}
-var SLUG_MAX = 60;
-function slug(input) {
-  return String(input ?? "").normalize("NFKD").replace(new RegExp("\\p{M}", "gu"), "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, SLUG_MAX).replace(/^-+|-+$/g, "");
-}
-var EXT_BY_MIME = {
-  "application/pdf": ".pdf",
-  "image/jpeg": ".jpg",
-  "image/png": ".png",
-  "image/heic": ".heic",
-  "image/webp": ".webp",
-  "text/markdown": ".md",
-  "text/plain": ".txt"
-};
-function extForMime(mimeType) {
-  if (!mimeType) return "";
-  return EXT_BY_MIME[mimeType.trim().toLowerCase()] ?? "";
-}
-function spaceSegment(space) {
-  if (!space) return "shared";
-  if (space.kind === "personal") return "personal";
-  if (space.kind === "family") return "family";
-  return slug(space.name) || "shared";
-}
-function ownerSegment(owner, aliasMap) {
-  const trimmed = (owner ?? "").trim();
-  if (!trimmed || trimmed.toLowerCase() === "unknown") return "unfiled";
-  return slug(resolveCanonicalName(aliasMap, trimmed)) || "unfiled";
-}
-function fileSegment(title, type) {
-  return slug(title) || slug(type) || "document";
-}
-function computeDocPaths(docs, ctx) {
-  const staged = [];
-  const counts = /* @__PURE__ */ new Map();
-  for (const doc of docs) {
-    if (doc.id === PEOPLE_REGISTRY_BLOB_ID) continue;
-    const space = doc.vaultId ? ctx.spaces[doc.vaultId] : void 0;
-    const dir = `${spaceSegment(space)}/${ownerSegment(doc.owner, ctx.aliasMap)}/`;
-    const file = fileSegment(doc.title, doc.type);
-    const ext = extForMime(doc.mimeType);
-    const key = dir + file + ext;
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-    staged.push({ id: doc.id, dir, file, ext });
-  }
-  const paths = /* @__PURE__ */ new Map();
-  for (const s of staged) {
-    const collides = (counts.get(s.dir + s.file + s.ext) ?? 0) > 1;
-    const suffix = collides ? `-${s.id.slice(0, 6)}` : "";
-    paths.set(s.id, `${s.dir}${s.file}${suffix}${s.ext}`);
-  }
-  return paths;
-}
-function displayPath(path12) {
-  return PATH_DISPLAY_PREFIX + path12;
-}
-function normalizePathQuery(input) {
-  let p = String(input ?? "").trim().replace(/\\/g, "/");
-  p = p.replace(/^\/+/, "");
-  if (p === "vault" || p.startsWith(PATH_DISPLAY_PREFIX)) p = p.slice("vault".length);
-  return p.replace(/^\/+|\/+$/g, "").replace(/\/{2,}/g, "/");
-}
-
-// src/core/sync.ts
-init_config();
-
-// src/core/convexApi.ts
-import { anyApi } from "convex/server";
-var api = anyApi;
-
-// src/core/sync.ts
-var client = null;
-var keyRingRefreshed = false;
-var ringToken = null;
-function getConvexClient() {
-  if (client) return client;
-  client = guardRevocation(new ConvexHttpClient(CONVEX_URL));
-  return client;
-}
-function guardRevocation(convex) {
-  for (const method of ["query", "mutation", "action"]) {
-    const original = convex[method].bind(convex);
-    convex[method] = async (...args) => {
-      try {
-        return await original(...args);
-      } catch (err) {
-        if (isRevocationError(err) && await isConnectionMode()) await disconnectMachine();
-        throw err;
-      }
-    };
-  }
-  return convex;
-}
-async function authenticateConvexClient() {
-  const convex = getConvexClient();
-  if (await isConnectionMode()) {
-    const token = await getAgentToken();
-    convex.setAuth(token);
-    if (isVaultUnlocked() && (!keyRingRefreshed || token !== ringToken)) {
-      await refreshKeyRing(convex, getVaultKeys());
-      keyRingRefreshed = true;
-      ringToken = token;
-    }
-    return convex;
-  }
-  const keychain = getKeychain();
-  const sessionCookie = await keychain.get("session_cookie");
-  if (!sessionCookie) {
-    throw new Error("Not authenticated \u2014 run `vault auth login` first");
-  }
-  const response = await fetch(`${CONVEX_SITE_URL}/api/auth/convex/token`, {
-    method: "GET",
-    headers: {
-      cookie: sessionCookie
-    }
-  });
-  if (!response.ok) {
-    throw new Error(`Auth token exchange failed (${response.status}). Session may be expired \u2014 run \`vault auth login\` again.`);
-  }
-  const data = await response.json();
-  if (!data.token) {
-    throw new Error("No token returned from auth endpoint");
-  }
-  convex.setAuth(data.token);
-  if (!keyRingRefreshed) {
-    keyRingRefreshed = true;
-    if (isVaultUnlocked()) {
-      try {
-        await refreshKeyRing(convex, getVaultKeys());
-      } catch {
-      }
-    }
-  }
-  return convex;
-}
-function decryptBlobPayload(blob, keyRing) {
-  const docKey = keyRing.unwrapDocKey({
-    vaultId: blob.vaultId,
-    keyVersion: blob.keyVersion,
-    encryptedDocKey: new Uint8Array(blob.encryptedDocKey)
-  });
-  try {
-    return decryptPayloadWithDocKey(blob.encryptedBlob, docKey);
-  } finally {
-    docKey.fill(0);
-  }
-}
-function decryptPayloadWithDocKey(encryptedBlob, docKey) {
-  const bytes = encryptedBlob instanceof Uint8Array ? encryptedBlob : new Uint8Array(encryptedBlob);
-  return JSON.parse(new TextDecoder().decode(decrypt(bytes, docKey)));
-}
-function captureRegistry(blob, metadata) {
-  if (blob.blobId !== PEOPLE_REGISTRY_BLOB_ID) return;
-  if (!metadata || !Array.isArray(metadata.people)) return;
-  try {
-    setLocalMeta("people_registry", { people: metadata.people });
-  } catch {
-  }
-}
-function payloadToDocument(blob, metadata) {
-  const encryptedDocKey = new Uint8Array(blob.encryptedDocKey ?? new ArrayBuffer(0));
-  return {
-    id: blob.blobId,
-    title: metadata.title ?? "Untitled",
-    rawText: metadata.rawText,
-    markdownContent: metadata.markdownContent,
-    type: metadata.type ?? "generic",
-    tags: metadata.tags ?? [],
-    fields: metadata.fields ?? {},
-    organizations: metadata.organizations,
-    mentions: metadata.mentions,
-    overview: metadata.overview,
-    embedding: metadata.embedding,
-    encryptedDocKey,
-    mimeType: metadata.mimeType,
-    storageId: metadata.storageId,
-    encryptedStorageId: metadata.encryptedStorageId,
-    fileEncrypted: metadata.encryptedStorageId ? 1 : 0,
-    // R2 asset refs come from top-level blob columns (not encrypted payload)
-    fileAssetProvider: blob.fileAssetProvider,
-    fileAssetKey: blob.fileAssetKey,
-    fileAssetMimeType: blob.fileAssetMimeType,
-    fileAssetSize: blob.fileAssetSize,
-    fileAssetVersion: blob.fileAssetVersion,
-    fileAssetStatus: blob.fileAssetStatus,
-    previewAssetProvider: blob.previewAssetProvider,
-    previewAssetKey: blob.previewAssetKey,
-    previewAssetMimeType: blob.previewAssetMimeType,
-    previewAssetSize: blob.previewAssetSize,
-    previewAssetVersion: blob.previewAssetVersion,
-    previewAssetStatus: blob.previewAssetStatus,
-    owner: metadata.owner,
-    originalOwner: metadata.originalOwner,
-    addedBy: blob.addedBy,
-    imageUrl: metadata.imageUrl,
-    dateAdded: metadata.dateAdded,
-    status: "ready",
-    // The blob column, not the encrypted payload: a document that has been
-    // moved between spaces carries the old id inside its own ciphertext.
-    vaultId: blob.vaultId ?? metadata.vaultId,
-    keyVersion: blob.keyVersion,
-    savedBy: metadata.savedBy && typeof metadata.savedBy === "object" ? metadata.savedBy : void 0,
-    createdAt: metadata.createdAt ?? blob.updatedAt,
-    updatedAt: blob.updatedAt,
-    syncStatus: "synced"
-  };
-}
-async function upsertEncryptedBlob(convex, args) {
-  const keys = getVaultKeys();
-  const wrapped = keys.keyRing.wrapDocKey(args.docKey, args.spaceId);
-  const blobBuffer = new ArrayBuffer(args.encryptedBlob.byteLength);
-  new Uint8Array(blobBuffer).set(args.encryptedBlob);
-  const keyBuffer = new ArrayBuffer(wrapped.encryptedDocKey.byteLength);
-  new Uint8Array(keyBuffer).set(wrapped.encryptedDocKey);
-  const common = {
-    blobId: args.blobId,
-    encryptedBlob: blobBuffer,
-    encryptedDocKey: keyBuffer,
-    blobSize: args.encryptedBlob.length,
-    keyVersion: wrapped.keyVersion,
-    ...args.addedBy ? { addedBy: args.addedBy } : {}
-  };
-  if (!wrapped.spaceId && keys.mode === "connection") {
-    throw new Error("No space to write to \u2014 this connection has no write access");
-  }
-  const result = wrapped.spaceId ? await convex.mutation(api.encryptedSync.upsertBlobByVault, {
-    vaultId: wrapped.spaceId,
-    ...common
-  }) : await convex.mutation(api.encryptedSync.upsertBlob, common);
-  return { ...wrapped, updatedAt: result?.updatedAt };
-}
-async function refreshKeyRing(convex, keys) {
-  if (keys.mode === "connection") return refreshConnectionRing(convex, keys);
-  const meta = await convex.query(api.vaultMeta.getIdentity, {});
-  if (!meta?.wrappedPrivateKey || !meta.publicKey) return false;
-  let identity;
-  try {
-    identity = {
-      privateKey: decrypt(new Uint8Array(meta.wrappedPrivateKey), keys.muk),
-      publicKey: new Uint8Array(meta.publicKey)
-    };
-  } catch {
-    return false;
-  }
-  keys.identity = identity;
-  const rows = await convex.query(api.vaults.getMyMemberships, {});
-  const ring = KeyRing.fromMemberships(rows, identity);
-  if (ring.spaces.size === 0) return false;
-  applyKeyRing(keys, ring, identity);
-  if (ring.primaryStorageId) updateConfig({ vaultId: ring.primaryStorageId });
-  saveSpaceDirectory(ring.list().map((e) => ({ spaceId: e.spaceId, kind: e.kind, name: e.name })));
-  return true;
-}
-async function refreshConnectionRing(convex, keys) {
-  const keyPair = keys.connectionKeyPair;
-  if (!keyPair) return false;
-  const res = await convex.query(api.agentConnections.getMyEnvelopes, {});
-  let manifest = null;
-  if (res.sealedManifest) {
-    try {
-      manifest = openSealedJson(res.sealedManifest, keyPair);
-    } catch {
-      manifest = null;
-    }
-  }
-  let context2 = null;
-  if (res.sealedContext) {
-    try {
-      context2 = openSealedJson(res.sealedContext, keyPair);
-    } catch {
-      context2 = null;
-    }
-  }
-  setConnectionState({
-    connectionId: res.connectionId,
-    preset: res.preset ?? ((res.grants ?? []).length > 0 ? "full" : context2 ? "standard" : "private"),
-    manifest,
-    context: context2,
-    grants: res.grants ?? []
-  });
-  if (res.intendedClient !== void 0) adoptIntendedClient(res.intendedClient);
-  const ring = KeyRing.fromMemberships(res.rows ?? [], keyPair);
-  applyConnectionRing(keys, ring);
-  const directory = /* @__PURE__ */ new Map();
-  for (const space of manifest?.spaces ?? []) {
-    directory.set(space.spaceId, { spaceId: space.spaceId, kind: space.kind, name: space.name });
-  }
-  for (const entry of ring.list()) {
-    directory.set(entry.spaceId, { spaceId: entry.spaceId, kind: entry.kind, name: entry.name });
-  }
-  saveSpaceDirectory([...directory.values()]);
-  try {
-    deleteDocumentsOutsideSpaces(ring.list().map((e) => e.spaceId));
-  } catch {
-  }
-  return true;
-}
-function saveSpaceDirectory(spaces) {
-  try {
-    setLocalMeta("spaces", spaces);
-  } catch {
-  }
-}
-function invalidateKeyRing() {
-  keyRingRefreshed = false;
-}
-function spaceTargets(keys) {
-  const keyRing = keys.keyRing;
-  if (keys.mode === "connection") return keyRing.list().map((entry) => entry.spaceId);
-  if (keyRing.isLegacy) return [keyRing.primaryStorageId ?? void 0];
-  const ids = keyRing.list().map((entry) => entry.spaceId);
-  return ids.length > 0 ? ids : [void 0];
-}
-var SYNC_PAGE_SIZE = 20;
-async function fetchBlobs(convex, spaceId, since, onPage) {
-  const blobs = [];
-  let cursor = null;
-  for (; ; ) {
-    const paginationOpts = { numItems: SYNC_PAGE_SIZE, cursor };
-    const result = spaceId ? since === null ? await convex.query(api.encryptedSync.getBlobPageByVault, {
-      vaultId: spaceId,
-      paginationOpts
-    }) : await convex.query(api.encryptedSync.getUpdatedSincePageByVault, {
-      vaultId: spaceId,
-      since,
-      paginationOpts
-    }) : since === null ? await convex.query(api.encryptedSync.getBlobPage, { paginationOpts }) : await convex.query(api.encryptedSync.getUpdatedSincePage, {
-      since,
-      paginationOpts
-    });
-    blobs.push(...result.page);
-    onPage?.(blobs.length);
-    if (result.isDone) break;
-    cursor = result.continueCursor;
-  }
-  return blobs;
-}
-async function syncFull(keys, onProgress) {
-  const convex = await authenticateConvexClient();
-  onProgress?.({ total: 0, current: 0, phase: "downloading" });
-  const blobs = [];
-  for (const spaceId of spaceTargets(keys)) {
-    blobs.push(
-      ...await fetchBlobs(
-        convex,
-        spaceId,
-        null,
-        (soFar) => onProgress?.({ total: soFar, current: soFar, phase: "downloading" })
-      )
-    );
-  }
-  const total = blobs.length;
-  let count = 0;
-  const failures = [];
-  const database = getDatabase();
-  const transaction = database.transaction(() => {
-    for (const blob of blobs) {
-      try {
-        onProgress?.({ total, current: count, phase: "decrypting" });
-        const metadata = decryptBlobPayload(blob, keys.keyRing);
-        captureRegistry(blob, metadata);
-        upsertDocument(payloadToDocument(blob, metadata));
-        count++;
-        onProgress?.({ total, current: count, phase: "saving" });
-      } catch (err) {
-        failures.push({ blobId: blob.blobId, error: err.message });
-      }
-    }
-  });
-  transaction();
-  if (failures.length > 0) {
-    const jsonFails = failures.filter((f) => f.error.includes("not valid JSON"));
-    const missing = failures.filter((f) => f.error.startsWith("No key held"));
-    const authFails = failures.filter((f) => f.error.includes("authenticate data") || f.error.includes("Unsupported state"));
-    const otherFails = failures.length - jsonFails.length - missing.length - authFails.length;
-    process.stderr.write(`[sync] Skipped ${failures.length} blobs: ${jsonFails.length} non-JSON (avatars), ${missing.length} no key held, ${authFails.length} auth failures, ${otherFails} other
-`);
-  }
-  const latestTimestamp = blobs.reduce((max, b) => Math.max(max, b.updatedAt), 0);
-  if (latestTimestamp > 0) {
-    updateConfig({ lastSyncTimestamp: latestTimestamp });
-  }
-  if (keys.mode === "connection") markSpacesSynced(spaceTargets(keys));
-  return count;
-}
-function getLocalMetaSafe(key) {
-  try {
-    return getLocalMeta(key);
-  } catch {
-    return null;
-  }
-}
-function markSpacesSynced(spaceIds) {
-  try {
-    setLocalMeta("synced_spaces", spaceIds.filter((id) => !!id));
-  } catch {
-  }
-}
-async function syncIncremental(keys, onProgress) {
-  const convex = await authenticateConvexClient();
-  const config = loadConfig();
-  const since = config.lastSyncTimestamp ?? 0;
-  onProgress?.({ total: 0, current: 0, phase: "downloading" });
-  const syncedSpaces = new Set(keys.mode === "connection" ? getLocalMetaSafe("synced_spaces") ?? [] : []);
-  const blobs = [];
-  const targets = spaceTargets(keys);
-  for (const spaceId of targets) {
-    const spaceSince = keys.mode === "connection" && spaceId && !syncedSpaces.has(spaceId) ? null : since;
-    blobs.push(
-      ...await fetchBlobs(
-        convex,
-        spaceId,
-        spaceSince,
-        (soFar) => onProgress?.({ total: soFar, current: soFar, phase: "downloading" })
-      )
-    );
-  }
-  if (keys.mode === "connection") markSpacesSynced(targets);
-  if (blobs.length === 0) {
-    return { count: 0, deleted: 0 };
-  }
-  const total = blobs.length;
-  let count = 0;
-  let deleted = 0;
-  const database = getDatabase();
-  const transaction = database.transaction(() => {
-    for (const blob of blobs) {
-      if (blob.deleted) {
-        deleteDocument(blob.blobId);
-        deleted++;
-        continue;
-      }
-      try {
-        onProgress?.({ total, current: count, phase: "decrypting" });
-        const metadata = decryptBlobPayload(blob, keys.keyRing);
-        captureRegistry(blob, metadata);
-        upsertDocument(payloadToDocument(blob, metadata));
-        count++;
-        onProgress?.({ total, current: count, phase: "saving" });
-      } catch {
-      }
-    }
-  });
-  transaction();
-  const latestTimestamp = blobs.reduce((max, b) => Math.max(max, b.updatedAt), 0);
-  if (latestTimestamp > 0) {
-    updateConfig({ lastSyncTimestamp: latestTimestamp });
-  }
-  return { count, deleted };
-}
-async function fetchAndStoreVaultMeta(vaultId) {
-  if (await isConnectionMode()) return;
-  const convex = await authenticateConvexClient();
-  const keychain = getKeychain();
-  let meta;
-  if (vaultId) {
-    meta = await convex.query(api.vaultMeta.getForVault, { vaultId });
-  } else {
-    meta = await convex.query(api.vaultMeta.get, {});
-  }
-  if (!meta) {
-    throw new Error("Vault metadata not found on server");
-  }
-  const { bytesToBase64: bytesToBase644 } = await Promise.resolve().then(() => (init_crypto(), crypto_exports));
-  await keychain.set("salt", bytesToBase644(new Uint8Array(meta.salt)));
-  await keychain.set("wrapped_vault_key", bytesToBase644(new Uint8Array(meta.wrappedVaultKey)));
-  if (meta.vaultId) {
-    updateConfig({ vaultId: meta.vaultId });
-  }
-}
-
 // src/cli/commands/auth.ts
+init_keyExchange();
+init_connection();
+init_vault();
+init_sync();
+init_client();
 async function storeLoginCredentials(payload) {
   const keychain = getKeychain();
   if (!payload.sessionCookie || !payload.secretKey || !payload.salt || !payload.wrappedVaultKey) {
@@ -4289,6 +4818,8 @@ function registerAuthCommands(program2) {
 }
 
 // src/cli/commands/unlock.ts
+init_vault();
+init_sync();
 init_database();
 init_config();
 import { createInterface } from "readline";
@@ -4413,6 +4944,8 @@ function registerUnlockCommands(program2) {
 }
 
 // src/cli/commands/sync.ts
+init_sync();
+init_vault();
 init_config();
 init_database();
 function registerSyncCommands(program2) {
@@ -4488,6 +5021,10 @@ function registerSyncCommands(program2) {
 }
 
 // src/cli/commands/spaces.ts
+init_vault();
+init_sync();
+init_convexApi();
+init_connection();
 function registerSpacesCommand(program2) {
   program2.command("spaces").description("List the spaces this machine holds keys for").action(async () => {
     const isJson = shouldOutputJson(program2.opts());
@@ -4593,11 +5130,13 @@ function registerSpacesCommand(program2) {
 
 // src/cli/commands/doc.ts
 init_database();
+init_vault();
+init_sync();
+init_crypto();
 import fs5 from "fs";
 import path5 from "path";
 import os5 from "os";
-import crypto6 from "crypto";
-init_crypto();
+import crypto8 from "crypto";
 
 // src/core/thumbnail.ts
 import { spawn } from "child_process";
@@ -4704,6 +5243,7 @@ function runCommand(cmd, args) {
 // src/core/preview.ts
 init_crypto();
 init_database();
+init_convexApi();
 async function attachPreview(convex, args) {
   const { docId, vaultId, docKey, localDoc, filePath, mimeType } = args;
   if (!canHaveThumbnail(mimeType)) return "none";
@@ -4739,7 +5279,7 @@ async function attachPreview(convex, args) {
     localDoc.previewAssetSize = encryptedThumbBytes.length;
     localDoc.previewAssetVersion = 1;
     localDoc.previewAssetStatus = "ready";
-    upsertDocument(localDoc);
+    upsertDocument2(localDoc);
     return "ready";
   } catch (err) {
     return `skipped: ${err.message}`;
@@ -4748,12 +5288,22 @@ async function attachPreview(convex, args) {
 
 // src/cli/commands/doc.ts
 init_database();
+init_secretSeal();
+init_secrets();
 init_config();
+init_convexApi();
+init_vault();
 
 // src/core/writes.ts
 init_crypto();
-import os4 from "os";
+init_vault();
+init_sync();
+init_convexApi();
+init_connection();
 init_config();
+init_secretSeal();
+init_database();
+import os4 from "os";
 function buildDocPayload(doc, extras = {}) {
   return {
     title: doc.title,
@@ -4793,6 +5343,14 @@ function spaceForNewDoc() {
 }
 async function commitDocWrite(w) {
   const keys = getVaultKeys();
+  if (!w.isNew) {
+    let row = null;
+    try {
+      row = getDocumentById(w.blobId);
+    } catch {
+    }
+    w = { ...w, payload: await restoreForWrite({ convex: w.convex, blobId: w.blobId, vaultId: w.spaceId, docKey: w.docKey, payload: w.payload, row }) };
+  }
   const encryptedBlob = encrypt(new TextEncoder().encode(JSON.stringify(w.payload)), w.docKey);
   if (keys.mode !== "connection") {
     const wrapped = await upsertEncryptedBlob(w.convex, {
@@ -4864,6 +5422,7 @@ async function commitDelete(args) {
 var PENDING_APPROVAL_MESSAGE = "Proposed on the user's phone. Nothing is saved until they approve it \u2014 check with vault_request_status.";
 
 // src/cli/commands/doc.ts
+init_client();
 function requireUnlocked(isJson) {
   if (!isVaultUnlocked()) {
     const msg = "Vault is locked \u2014 run `vault unlock` first";
@@ -5004,6 +5563,7 @@ function registerDocCommands(program2) {
     try {
       const dbField = field === "content" ? "markdownContent" : field;
       updateDocumentField(id, dbField, dbField === "tags" ? value.split(",").map((t) => t.trim()) : value);
+      const editedSecret = isSecretField(dbField, value) ? { field: dbField, value } : null;
       const updatedDoc = getDocumentById(id);
       const { vaultKey } = getVaultKeys();
       let docKey;
@@ -5013,23 +5573,32 @@ function registerDocCommands(program2) {
         docKey = generateDocumentKey();
       }
       const config = loadConfig();
-      const docContent = JSON.stringify({
-        title: updatedDoc.title,
-        rawText: updatedDoc.rawText,
-        markdownContent: updatedDoc.markdownContent,
-        type: updatedDoc.type,
-        tags: updatedDoc.tags,
-        fields: updatedDoc.fields,
-        organizations: updatedDoc.organizations,
-        mentions: updatedDoc.mentions,
-        owner: updatedDoc.owner,
-        embedding: updatedDoc.embedding ? Array.from(updatedDoc.embedding) : null,
-        mimeType: updatedDoc.mimeType,
-        encryptedStorageId: updatedDoc.encryptedStorageId,
-        storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
-        dateAdded: updatedDoc.dateAdded,
-        savedBy: updatedDoc.savedBy
+      const restoredPayload = await restoreForWrite({
+        convex: await authenticateConvexClient(),
+        blobId: id,
+        vaultId: updatedDoc.vaultId,
+        docKey,
+        row: updatedDoc,
+        payload: {
+          title: updatedDoc.title,
+          rawText: updatedDoc.rawText,
+          markdownContent: updatedDoc.markdownContent,
+          type: updatedDoc.type,
+          tags: updatedDoc.tags,
+          fields: updatedDoc.fields,
+          organizations: updatedDoc.organizations,
+          mentions: updatedDoc.mentions,
+          owner: updatedDoc.owner,
+          embedding: updatedDoc.embedding ? Array.from(updatedDoc.embedding) : null,
+          mimeType: updatedDoc.mimeType,
+          encryptedStorageId: updatedDoc.encryptedStorageId,
+          storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
+          dateAdded: updatedDoc.dateAdded,
+          savedBy: updatedDoc.savedBy
+        }
       });
+      if (editedSecret) restoredPayload.fields = { ...restoredPayload.fields, [editedSecret.field]: editedSecret.value };
+      const docContent = JSON.stringify(restoredPayload);
       const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
       const wrapped = wrapDocumentKey(docKey, updatedDoc.vaultId);
       const wrappedDocKey = wrapped.encryptedDocKey;
@@ -5057,7 +5626,7 @@ function registerDocCommands(program2) {
           keyVersion: wrapped.keyVersion
         });
       }
-      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, keyVersion: wrapped.keyVersion, syncStatus: "synced" });
+      upsertDocument2({ ...updatedDoc, encryptedDocKey: wrappedDocKey, keyVersion: wrapped.keyVersion, syncStatus: "synced" });
       docKey.fill(0);
       if (isJson) {
         output({ status: "updated", id, field, value });
@@ -5337,7 +5906,7 @@ function registerDocCommands(program2) {
         }
         process.exit(1);
       }
-      const hash = crypto6.createHash("sha256").update(contentBytes).digest("hex");
+      const hash = crypto8.createHash("sha256").update(contentBytes).digest("hex");
       const docId = hash;
       const existingDoc = getDocumentById(docId);
       if (existingDoc) {
@@ -5428,7 +5997,7 @@ function registerDocCommands(program2) {
           keyVersion: wrapped.keyVersion
         });
       }
-      upsertDocument(localDoc);
+      upsertDocument2(localDoc);
       docKey.fill(0);
       const result = {
         status: "created",
@@ -5530,23 +6099,33 @@ function registerDocCommands(program2) {
       } else {
         docKey = generateDocumentKey();
       }
-      const docContent = JSON.stringify({
-        title: updatedDoc.title,
-        rawText: updatedDoc.rawText,
-        markdownContent: content,
-        type: updatedDoc.type,
-        tags: updatedDoc.tags,
-        fields: updatedDoc.fields,
-        organizations: updatedDoc.organizations,
-        mentions: updatedDoc.mentions,
-        owner: updatedDoc.owner,
-        embedding: updatedDoc.embedding ? Array.from(updatedDoc.embedding) : null,
-        mimeType: updatedDoc.mimeType,
-        encryptedStorageId: updatedDoc.encryptedStorageId,
-        storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
-        dateAdded: updatedDoc.dateAdded,
-        savedBy: updatedDoc.savedBy
+      const editedSecret = null;
+      const restoredPayload = await restoreForWrite({
+        convex: await authenticateConvexClient(),
+        blobId: id,
+        vaultId: updatedDoc.vaultId,
+        docKey,
+        row: updatedDoc,
+        payload: {
+          title: updatedDoc.title,
+          rawText: updatedDoc.rawText,
+          markdownContent: content,
+          type: updatedDoc.type,
+          tags: updatedDoc.tags,
+          fields: updatedDoc.fields,
+          organizations: updatedDoc.organizations,
+          mentions: updatedDoc.mentions,
+          owner: updatedDoc.owner,
+          embedding: updatedDoc.embedding ? Array.from(updatedDoc.embedding) : null,
+          mimeType: updatedDoc.mimeType,
+          encryptedStorageId: updatedDoc.encryptedStorageId,
+          storageId: updatedDoc.encryptedStorageId ? void 0 : updatedDoc.storageId,
+          dateAdded: updatedDoc.dateAdded,
+          savedBy: updatedDoc.savedBy
+        }
       });
+      if (editedSecret) restoredPayload.fields = { ...restoredPayload.fields, [editedSecret.field]: editedSecret.value };
+      const docContent = JSON.stringify(restoredPayload);
       const encryptedBlob = encrypt(new TextEncoder().encode(docContent), docKey);
       const wrapped = wrapDocumentKey(docKey, updatedDoc.vaultId);
       const wrappedDocKey = wrapped.encryptedDocKey;
@@ -5574,7 +6153,7 @@ function registerDocCommands(program2) {
           keyVersion: wrapped.keyVersion
         });
       }
-      upsertDocument({ ...updatedDoc, encryptedDocKey: wrappedDocKey, keyVersion: wrapped.keyVersion });
+      upsertDocument2({ ...updatedDoc, encryptedDocKey: wrappedDocKey, keyVersion: wrapped.keyVersion });
       docKey.fill(0);
       if (isJson) {
         output({ status: "updated", id, title: localDoc.title });
@@ -5627,7 +6206,7 @@ function registerDocCommands(program2) {
           const content = fileBuffer.toString("utf-8");
           const contentEncoded = new TextEncoder().encode(content);
           if (contentEncoded.byteLength > 200 * 1024) throw new Error("Content exceeds 200KB limit");
-          const hash2 = crypto6.createHash("sha256").update(contentEncoded).digest("hex");
+          const hash2 = crypto8.createHash("sha256").update(contentEncoded).digest("hex");
           const docId2 = hash2;
           const existingDoc = getDocumentById(docId2);
           if (existingDoc) {
@@ -5704,7 +6283,7 @@ function registerDocCommands(program2) {
           } else {
             await convex2.mutation(api.encryptedSync.upsertBlob, { blobId: docId2, encryptedBlob: blobBuffer2, encryptedDocKey: keyBuffer2, blobSize: encryptedBlob2.length, keyVersion: wrapped2.keyVersion });
           }
-          upsertDocument(localDoc2);
+          upsertDocument2(localDoc2);
           docKey2.fill(0);
           const textResult = { status: "created", id: docId2, title: localDoc2.title, type: localDoc2.type, tags: localDoc2.tags, owner: localDoc2.owner };
           if (isJson) {
@@ -5720,7 +6299,7 @@ function registerDocCommands(program2) {
           }
           continue;
         }
-        const hash = crypto6.createHash("sha256").update(fileBytes).digest("hex");
+        const hash = crypto8.createHash("sha256").update(fileBytes).digest("hex");
         const docId = hash;
         if (!isJson) process.stderr.write("Uploading to server...\n");
         const convex = await authenticateConvexClient();
@@ -5858,7 +6437,7 @@ function registerDocCommands(program2) {
         localDoc.fileAssetSize = encryptedFileBytes.length;
         localDoc.fileAssetVersion = 1;
         localDoc.fileAssetStatus = "ready";
-        upsertDocument(localDoc);
+        upsertDocument2(localDoc);
         if (!isJson && canHaveThumbnail(mimeType)) process.stderr.write("Generating preview thumbnail...\n");
         const preview = await attachPreview(convex, {
           docId,
@@ -5917,14 +6496,14 @@ init_database();
 
 // src/shared/vectorSearch.ts
 var DIMS = 3072;
-var index = null;
+var index2 = null;
 function buildVectorIndex(docs) {
   const docsWithEmbeddings = docs.filter(
     (d) => d.embedding && d.embedding.length === DIMS
   );
   const count = docsWithEmbeddings.length;
   if (count === 0) {
-    index = null;
+    index2 = null;
     return;
   }
   const ids = [];
@@ -5942,10 +6521,10 @@ function buildVectorIndex(docs) {
     }
     norms[i] = Math.sqrt(normSq);
   }
-  index = { ids, vectors, norms, count };
+  index2 = { ids, vectors, norms, count };
 }
 function searchVectors(queryEmbedding, topK = 10) {
-  if (!index || queryEmbedding.length !== DIMS) return [];
+  if (!index2 || queryEmbedding.length !== DIMS) return [];
   let queryNormSq = 0;
   for (let j = 0; j < DIMS; j++) {
     queryNormSq += queryEmbedding[j] * queryEmbedding[j];
@@ -5953,16 +6532,16 @@ function searchVectors(queryEmbedding, topK = 10) {
   const queryNorm = Math.sqrt(queryNormSq);
   if (queryNorm === 0) return [];
   const scores = [];
-  for (let i = 0; i < index.count; i++) {
-    const docNorm = index.norms[i];
+  for (let i = 0; i < index2.count; i++) {
+    const docNorm = index2.norms[i];
     if (docNorm === 0) continue;
     let dot = 0;
     const offset = i * DIMS;
     for (let j = 0; j < DIMS; j++) {
-      dot += queryEmbedding[j] * index.vectors[offset + j];
+      dot += queryEmbedding[j] * index2.vectors[offset + j];
     }
     const score = dot / (queryNorm * docNorm);
-    scores.push({ id: index.ids[i], score });
+    scores.push({ id: index2.ids[i], score });
   }
   scores.sort((a, b) => b.score - a.score);
   return scores.slice(0, topK);
@@ -6019,6 +6598,9 @@ function searchChunkVectors(queryEmbedding, topK = 20) {
 }
 
 // src/cli/commands/search.ts
+init_vault();
+init_sync();
+init_convexApi();
 var vectorIndexBuilt = false;
 function registerSearchCommands(program2) {
   program2.command("search").description("Search documents (hybrid FTS + vector)").argument("<query>", "Search query (use quotes for multi-word)").option("--mode <mode>", "Search mode: fts, vector, hybrid", "hybrid").option("--type <type>", "Filter by document type").option("--tags <tags>", "Filter by tags (comma-separated)").option("--limit <n>", "Max results", "10").option("--threshold <score>", "Min similarity score for vector results", "0.3").action(async (query, opts) => {
@@ -6128,6 +6710,7 @@ function registerSearchCommands(program2) {
 
 // src/cli/commands/stats.ts
 init_database();
+init_vault();
 init_config();
 function registerStatsCommand(program2) {
   program2.command("stats").description("Show vault statistics").action(() => {
@@ -6168,7 +6751,10 @@ function registerStatsCommand(program2) {
 }
 
 // src/cli/commands/usage.ts
+init_vault();
+init_sync();
 init_database();
+init_convexApi();
 function registerUsageCommand(program2) {
   program2.command("usage").description("Show API usage, plan details, and vault statistics").action(async () => {
     const isJson = shouldOutputJson(program2.opts());
@@ -6226,41 +6812,44 @@ function registerUsageCommand(program2) {
 
 // src/cli/commands/people.ts
 init_database();
+init_vault();
+init_sync();
 init_crypto();
 init_config();
+init_convexApi();
 init_constants();
-import crypto7 from "crypto";
+import crypto9 from "crypto";
 var REGISTRY_BLOB_ID = "__people_registry__";
 async function fetchRegistry() {
   const convex = await authenticateConvexClient();
   const config = loadConfig();
+  const spaces = [getVaultKeys().keyRing.primaryId, config.vaultId].filter((id, i, all) => !!id && all.indexOf(id) === i);
   let blob;
-  try {
-    if (config.vaultId) {
-      blob = await convex.query(api.encryptedSync.getBlobById, { blobId: REGISTRY_BLOB_ID, vaultId: config.vaultId });
+  for (const vaultId of spaces) {
+    try {
+      blob = await convex.query(api.encryptedSync.getBlobById, { blobId: REGISTRY_BLOB_ID, vaultId });
+    } catch {
     }
-  } catch {
+    if (blob) break;
   }
-  if (!blob) {
+  if (!blob && getVaultKeys().mode !== "connection") {
     try {
       blob = await convex.query(api.encryptedSync.getBlobById, { blobId: REGISTRY_BLOB_ID });
     } catch {
     }
   }
   if (!blob) return { people: [] };
+  const docKey = unwrapDocumentKey(new Uint8Array(blob.encryptedDocKey), blob);
   try {
-    const encDocKey = new Uint8Array(blob.encryptedDocKey);
-    const docKey = unwrapDocumentKey(encDocKey, blob);
-    const decrypted = decryptString(new Uint8Array(blob.encryptedBlob), docKey);
+    const registry = JSON.parse(decryptString(new Uint8Array(blob.encryptedBlob), docKey));
+    return { ...registry, people: Array.isArray(registry.people) ? registry.people : [] };
+  } finally {
     docKey.fill(0);
-    return JSON.parse(decrypted);
-  } catch {
-    return { people: [] };
   }
 }
 async function syncRegistry(registry) {
   const convex = await authenticateConvexClient();
-  const docKey = new Uint8Array(crypto7.randomBytes(DOCUMENT_KEY_BYTES));
+  const docKey = new Uint8Array(crypto9.randomBytes(DOCUMENT_KEY_BYTES));
   const encryptedBlob = encryptString(JSON.stringify(registry), docKey);
   await upsertEncryptedBlob(convex, {
     blobId: REGISTRY_BLOB_ID,
@@ -6420,6 +7009,8 @@ function registerPeopleCommands(program2) {
 
 // src/cli/commands/chunk.ts
 init_database();
+init_vault();
+init_sync();
 
 // src/shared/chunking.ts
 var CHUNK_SIZE = 2e3;
@@ -6498,6 +7089,7 @@ function chunkDocument(docId, title, type, fields, rawText) {
 }
 
 // src/cli/commands/chunk.ts
+init_convexApi();
 function registerChunkCommands(program2) {
   const chunk = program2.command("chunk").description("Manage chunk index for RAG context retrieval");
   chunk.command("status").description("Show chunk index status").action(() => {
@@ -6614,6 +7206,9 @@ function registerChunkCommands(program2) {
 
 // src/cli/commands/context.ts
 init_database();
+init_vault();
+init_sync();
+init_convexApi();
 init_database();
 function registerContextCommand(program2) {
   program2.command("context").description("Retrieve relevant document context for a query (for agent RAG)").argument("<query>", "Natural language query").option("--limit <n>", "Max documents to return", "5").option("--chunks <n>", "Max chunks per document", "4").option("--include-fields", "Include structured fields in output").option("--type <type>", "Filter by document type").option("--max-tokens <n>", "Approximate token budget (chars/4)").action(async (query, opts) => {
@@ -6759,6 +7354,7 @@ function registerContextCommand(program2) {
 
 // src/cli/commands/lifestyle.ts
 init_database();
+init_vault();
 function requireUnlocked2(isJson) {
   if (!isVaultUnlocked()) {
     const msg = "Vault is locked \u2014 run `moivault unlock` first";
@@ -7156,8 +7752,12 @@ function registerLifestyleCommands(program2) {
   });
 }
 
+// src/cli/commands/ls.ts
+init_vault();
+
 // src/core/docPaths.ts
 init_database();
+init_docPath();
 function loadAliasMap() {
   return buildAliasMap(getLocalMeta("people_registry"));
 }
@@ -7174,11 +7774,12 @@ function buildPathIndex() {
   for (const [id, p] of byId) byPath.set(p, id);
   return { byId, byPath, rows };
 }
-function resolvePath(index2, path12) {
-  return index2.byPath.get(normalizePathQuery(path12)) ?? null;
+function resolvePath(index3, path12) {
+  return index3.byPath.get(normalizePathQuery(path12)) ?? null;
 }
 
 // src/cli/commands/ls.ts
+init_docPath();
 function registerLsCommand(program2) {
   program2.command("ls").description("List the vault as folders: vault/<space>/<person>/<file>").argument("[path]", "Folder or file, e.g. vault/family/priya", "vault/").action((pathArg) => {
     const isJson = shouldOutputJson(program2.opts());
@@ -7191,11 +7792,11 @@ function registerLsCommand(program2) {
       }
       process.exit(1);
     }
-    const index2 = buildPathIndex();
+    const index3 = buildPathIndex();
     const query = normalizePathQuery(pathArg);
-    const fileId = index2.byPath.get(query);
+    const fileId = index3.byPath.get(query);
     if (fileId) {
-      const row = index2.rows.find((r) => r.id === fileId);
+      const row = index3.rows.find((r) => r.id === fileId);
       if (isJson) output({ kind: "file", path: displayPath(query), id: fileId, title: row.title, type: row.type });
       else console.log(`${displayPath(query)}  ${row.title ?? ""}  [${fileId}]`);
       return;
@@ -7203,11 +7804,11 @@ function registerLsCommand(program2) {
     const prefix = query ? `${query}/` : "";
     const dirs = /* @__PURE__ */ new Map();
     const files = [];
-    for (const [id, p] of index2.byId) {
+    for (const [id, p] of index3.byId) {
       if (!p.startsWith(prefix)) continue;
       const rest = p.slice(prefix.length);
       const slash = rest.indexOf("/");
-      if (slash === -1) files.push({ name: rest, id, title: index2.rows.find((r) => r.id === id)?.title ?? null });
+      if (slash === -1) files.push({ name: rest, id, title: index3.rows.find((r) => r.id === id)?.title ?? null });
       else dirs.set(rest.slice(0, slash), (dirs.get(rest.slice(0, slash)) ?? 0) + 1);
     }
     if (dirs.size === 0 && files.length === 0 && query) {
@@ -7240,6 +7841,24 @@ init_site();
 import fs9 from "fs";
 import path8 from "path";
 import { spawn as spawn3 } from "child_process";
+async function confirmOnTerminal(prompt, expected) {
+  let fd;
+  try {
+    fd = fs9.openSync("/dev/tty", "r+");
+  } catch {
+    return false;
+  }
+  try {
+    fs9.writeSync(fd, prompt);
+    const buf = Buffer.alloc(256);
+    const n = fs9.readSync(fd, buf, 0, 256, null);
+    return buf.subarray(0, n).toString("utf-8").trim().toLowerCase() === expected.toLowerCase();
+  } catch {
+    return false;
+  } finally {
+    fs9.closeSync(fd);
+  }
+}
 function openInBrowser(url) {
   const cmd = process.platform === "darwin" ? "open" : "xdg-open";
   spawn3(cmd, [url], { stdio: "ignore", detached: true }).unref();
@@ -7308,6 +7927,12 @@ function registerBrowserCommands(program2) {
       process.exitCode = 1;
       return;
     }
+    if (!await confirmOnTerminal(`  Agents on this machine will be able to fill your vault secrets into ${site}.
+  Type the site name to confirm: `, site)) {
+      console.error("  Not confirmed. Nothing changed.");
+      process.exitCode = 1;
+      return;
+    }
     const file = path8.join(browserDir(), "allowed-sites.json");
     let sites = [];
     try {
@@ -7348,6 +7973,10 @@ function learnSecrets(docs) {
 
 // src/cli/reveal.ts
 init_database();
+init_connection();
+init_sync();
+init_convexApi();
+init_client();
 var installed = false;
 function maskStdout() {
   if (installed) return;
@@ -7373,13 +8002,14 @@ async function approveReveal(command, docIds) {
   if (!connectionModeKnown()) return true;
   try {
     const convex = await authenticateConvexClient();
+    const client2 = detectClientFromEnv().key;
     const sealedReason = sealJsonToUser({
       reason: `Show secret values (ID, account, card numbers) unmasked in the terminal: moivault ${command}${docIds.length ? ` ${docIds[0]}` : ""}`,
-      client: "terminal",
-      tool: `cli:${command} --reveal`,
+      client: client2,
+      tool: `moivault ${command} --reveal`,
       ...docIds.length ? { blobIds: docIds } : {}
     });
-    const { requestId } = await convex.mutation(api.agentRequests.create, { kind: "read", client: "terminal", sealedReason });
+    const { requestId } = await convex.mutation(api.agentRequests.create, { kind: "read", client: client2, sealedReason });
     process.stderr.write("  Asked your phone to allow --reveal\u2026\n");
     const deadline = Date.now() + 9e4;
     while (Date.now() < deadline) {
@@ -7395,17 +8025,58 @@ async function approveReveal(command, docIds) {
   process.stderr.write("  Not approved; secret values stay masked.\n");
   return false;
 }
+async function revealDocument(id, command) {
+  const { getDocumentById: getDocumentById3 } = await Promise.resolve().then(() => (init_database(), database_exports));
+  const { unwrapDocumentKey: unwrapDocumentKey2 } = await Promise.resolve().then(() => (init_vault(), vault_exports));
+  const { decryptPayloadWithDocKey: decryptPayloadWithDocKey2 } = await Promise.resolve().then(() => (init_sync(), sync_exports));
+  const row = getDocumentById3(id);
+  if (!row?.encryptedDocKey) {
+    process.stderr.write("  Not a document this machine can open.\n");
+    process.exitCode = 1;
+    return;
+  }
+  const convex = await authenticateConvexClient();
+  const blob = await convex.query(api.encryptedSync.getBlobById, { blobId: id, ...row.vaultId ? { vaultId: row.vaultId } : {} });
+  if (!blob?.encryptedBlob) {
+    process.stderr.write("  The server has no copy of this document.\n");
+    process.exitCode = 1;
+    return;
+  }
+  const docKey = unwrapDocumentKey2(row.encryptedDocKey, row);
+  try {
+    const p = decryptPayloadWithDocKey2(blob.encryptedBlob, docKey);
+    const out = command === "doc text" ? { id, title: p.title, rawText: p.rawText ?? "" } : command === "doc fields" ? { id, title: p.title, type: p.type, fields: p.fields } : { id, ...p, embedding: void 0 };
+    process.stdout.write(JSON.stringify(out, null, 2) + "\n");
+  } finally {
+    docKey.fill(0);
+  }
+}
+
+// src/cli/index.ts
+init_secretSeal();
 
 // src/mcp/server.ts
+init_vault();
+init_database();
+init_config();
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z as z2 } from "zod";
 init_database();
-init_config();
-init_database();
+init_sync();
 init_crypto();
+init_convexApi();
+init_client();
+init_connection();
+
+// src/core/activity.ts
+init_connection();
+init_sync();
+init_convexApi();
+init_client();
 
 // src/core/auditDetail.ts
+init_connection();
 import path9 from "path";
 var SAFE_STRING_ARGS = /* @__PURE__ */ new Set([
   "query",
@@ -7551,6 +8222,9 @@ function interceptCommandFailure() {
 }
 
 // src/core/browse.ts
+init_connection();
+init_vault();
+init_docPath();
 function usesContextCard() {
   return isConnectionSession() && getPreset() !== "full" && getContextCard() !== null;
 }
@@ -7582,10 +8256,10 @@ function getBrowseIndex() {
   return { byId, byPath, rows, rowById: new Map(rows.map((r) => [r.id, r])), fromContext: !!card };
 }
 function searchContextCard(query, limit) {
-  const index2 = getBrowseIndex();
+  const index3 = getBrowseIndex();
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (terms.length === 0) return [];
-  return index2.rows.filter((r) => r.source === "context").map((r) => {
+  return index3.rows.filter((r) => r.source === "context").map((r) => {
     const hay = `${r.title ?? ""} ${(r.type ?? "").replace(/_/g, " ")} ${r.owner ?? ""}`.toLowerCase();
     return { r, hits: terms.filter((t) => hay.includes(t)).length };
   }).filter((x) => x.hits > 0).sort((a, b) => b.hits - a.hits).slice(0, limit).map((x) => x.r);
@@ -7594,86 +8268,9 @@ function askFor(blobId) {
   return `Listed on the context card only. Ask for the full document with vault_request({ reason, blobIds: ["${blobId}"] }).`;
 }
 
-// src/core/granted.ts
-var GRANTED_TTL_MS = 60 * 60 * 1e3;
-var cache = /* @__PURE__ */ new Map();
-function clientCache(client2) {
-  let c = cache.get(client2);
-  if (!c) {
-    c = /* @__PURE__ */ new Map();
-    cache.set(client2, c);
-  }
-  return c;
-}
-function connectionKeyPair() {
-  const kp = getVaultKeys().connectionKeyPair;
-  if (!kp) throw new Error("Granted documents need a paired machine \u2014 run `moivault auth pair <code>`");
-  return kp;
-}
-async function fetchGrantedDocs(convex, client2, blobIds, requestId) {
-  if (blobIds.length === 0) return [];
-  const kp = connectionKeyPair();
-  const out = [];
-  for (let i = 0; i < blobIds.length; i += 50) {
-    const rows = await convex.mutation(api.agentRequests.fetchGranted, {
-      blobIds: blobIds.slice(i, i + 50),
-      client: client2,
-      ...requestId ? { requestId } : {}
-    });
-    for (const row of rows) {
-      const sealedDocKey = new Uint8Array(row.sealedDocKey);
-      const docKey = openSealed(sealedDocKey, kp.privateKey, kp.publicKey);
-      let metadata;
-      try {
-        metadata = decryptPayloadWithDocKey(row.encryptedBlob, docKey);
-      } finally {
-        docKey.fill(0);
-      }
-      const doc = payloadToDocument(
-        {
-          _id: row.blobId,
-          blobId: row.blobId,
-          vaultId: row.vaultId,
-          keyVersion: row.keyVersion ?? void 0,
-          encryptedBlob: row.encryptedBlob,
-          encryptedDocKey: new ArrayBuffer(0),
-          updatedAt: Date.now(),
-          fileAssetProvider: row.fileRef ? "r2" : void 0,
-          fileAssetMimeType: row.fileRef?.mimeType ?? void 0,
-          fileAssetSize: row.fileRef?.size ?? void 0,
-          fileAssetStatus: row.fileRef?.status ?? void 0
-        },
-        metadata
-      );
-      clientCache(client2).set(row.blobId, { doc, sealedDocKey, fetchedAt: Date.now() });
-      out.push(doc);
-    }
-  }
-  return out;
-}
-function getGrantedDoc(client2, blobId) {
-  const entry = cache.get(client2)?.get(blobId);
-  if (!entry) return null;
-  if (Date.now() - entry.fetchedAt > GRANTED_TTL_MS) {
-    cache.get(client2).delete(blobId);
-    return null;
-  }
-  return entry.doc;
-}
-function openGrantedDocKey(client2, blobId) {
-  const entry = cache.get(client2)?.get(blobId);
-  if (!entry) return null;
-  const kp = connectionKeyPair();
-  return openSealed(entry.sealedDocKey, kp.privateKey, kp.publicKey);
-}
-function listGrantedDocs(client2) {
-  const c = cache.get(client2);
-  if (!c) return [];
-  const now = Date.now();
-  return [...c.values()].filter((e) => now - e.fetchedAt <= GRANTED_TTL_MS).map((e) => e.doc);
-}
-
 // src/mcp/server.ts
+init_docPath();
+init_granted();
 init_secrets();
 
 // src/browser/tools.ts
@@ -7681,39 +8278,37 @@ import fs10 from "fs";
 import path10 from "path";
 import { z } from "zod";
 init_ipc();
+init_connection();
+init_sync();
+init_convexApi();
+init_database();
+init_vault();
 var text = (t) => ({ content: [{ type: "text", text: scrubber2.scrub(t) }] });
 var fail = (t, code) => ({ content: [{ type: "text", text: JSON.stringify({ error: scrubber2.scrub(t), ...code ? { code } : {} }) }] });
 var TASK_IDLE_MS = 30 * 60 * 1e3;
 var tasks = /* @__PURE__ */ new Map();
 var pending = /* @__PURE__ */ new Map();
-function currentTask(client2, create = true) {
+function newTask(goal) {
+  return { id: `task_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, goal, grants: /* @__PURE__ */ new Set(), lastActive: Date.now() };
+}
+async function endTask(client2) {
+  const t = tasks.get(client2);
+  tasks.delete(client2);
+  if (t) await sendToDaemon("forgetTask", { taskId: t.id }).catch(() => {
+  });
+}
+function currentTask(client2) {
   const t = tasks.get(client2);
   if (t && Date.now() - t.lastActive <= TASK_IDLE_MS) {
     t.lastActive = Date.now();
     return t;
   }
-  if (t) tasks.delete(client2);
-  if (!create) return null;
-  const fresh = { id: `task_${Date.now().toString(36)}`, goal: "(the agent did not say)", grants: /* @__PURE__ */ new Set(), lastActive: Date.now() };
+  if (t) void endTask(client2);
+  const fresh = newTask("(the agent did not say)");
   tasks.set(client2, fresh);
   return fresh;
 }
 var grantKey = (client2, rec, site) => `${client2}|${rec.docId}|${rec.field}|${site}`;
-function persistedGrantsFile() {
-  return path10.join(browserDir(), "grants.json");
-}
-function loadPersistedGrants() {
-  try {
-    return new Set(JSON.parse(fs10.readFileSync(persistedGrantsFile(), "utf-8")));
-  } catch {
-    return /* @__PURE__ */ new Set();
-  }
-}
-function persistGrant(key) {
-  const all = loadPersistedGrants();
-  all.add(key);
-  fs10.writeFileSync(persistedGrantsFile(), JSON.stringify([...all]), { mode: 384 });
-}
 function locallyAllowed(site) {
   try {
     const sites = JSON.parse(fs10.readFileSync(path10.join(browserDir(), "allowed-sites.json"), "utf-8"));
@@ -7723,19 +8318,41 @@ function locallyAllowed(site) {
   }
 }
 var humanField = (field) => field.replace(/\.\d+/g, "").split(".").pop().replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+async function decryptLocally(rec) {
+  const row = getDocumentById(rec.docId);
+  if (!row?.encryptedDocKey) throw new Error("This document can't be opened on this machine.");
+  const convex = await authenticateConvexClient();
+  const blob = await convex.query(api.encryptedSync.getBlobById, { blobId: rec.docId, ...row.vaultId ? { vaultId: row.vaultId } : {} });
+  if (!blob?.encryptedBlob) throw new Error("The server has no copy of this document.");
+  const docKey = unwrapDocumentKey(row.encryptedDocKey, row);
+  try {
+    const payload = decryptPayloadWithDocKey(blob.encryptedBlob, docKey);
+    const value = rec.field.split(".").reduce((o, k) => o == null ? void 0 : o[k], payload.fields);
+    if (typeof value !== "string" && typeof value !== "number") throw new Error(`${rec.field} is empty on "${rec.docTitle}".`);
+    return String(value).trim();
+  } finally {
+    docKey.fill(0);
+  }
+}
 async function approveFill(client2, task, rec, target, waitMs) {
   const key = grantKey(client2.key, rec, target.site);
-  if (task.grants.has(key) || loadPersistedGrants().has(key)) return { status: "granted" };
+  const spec = { docId: rec.docId, field: rec.field, mask: rec.mask, sites: [target.site], taskId: task.id };
+  if (task.grants.has(key)) {
+    const { has } = await daemon("hasValue", { taskId: task.id, docId: rec.docId, field: rec.field });
+    if (has) return { status: "granted", spec };
+    task.grants.delete(key);
+  }
   if (!connectionModeKnown()) {
-    if (locallyAllowed(target.site)) {
-      task.grants.add(key);
-      return { status: "granted" };
+    if (!locallyAllowed(target.site)) {
+      return { status: "denied", message: `This machine is not paired with a phone, so nobody can approve filling ${rec.mask} into ${target.site}. Pair it (moivault auth pair), or the person can run, at the keyboard: moivault browser allow ${target.site}` };
     }
-    return { status: "denied", message: `This machine is not paired with a phone, so nobody can approve filling ${rec.mask} into ${target.site}. Pair it (moivault auth pair), or the person can run: moivault browser allow ${target.site}` };
+    task.grants.add(key);
+    return { status: "granted", spec: { ...spec, value: await decryptLocally(rec) } };
   }
   const convex = await authenticateConvexClient();
-  let requestId = pending.get(key);
-  if (!requestId) {
+  let open = pending.get(key);
+  if (!open) {
+    const { keyId, publicKey } = await daemon("fillKey");
     const reason = `Fill your ${humanField(rec.field)} (${rec.mask}) from "${rec.docTitle}" into ${target.site}, field "${target.name || "unnamed"}". Task: ${task.goal}`;
     const sealedReason = sealJsonToUser({
       reason,
@@ -7745,23 +8362,31 @@ async function approveFill(client2, task, rec, target, waitMs) {
       blobIds: [rec.docId],
       fill: { site: target.site, origin: target.origin, field: rec.field, fieldName: target.name, mask: rec.mask, goal: task.goal, docTitle: rec.docTitle }
     });
-    ({ requestId } = await convex.mutation(api.agentRequests.create, { kind: "read", client: client2.key, sealedReason }));
-    pending.set(key, requestId);
+    const pub = Buffer.from(publicKey, "base64");
+    const { requestId } = await convex.mutation(api.agentRequests.create, {
+      kind: "fill",
+      client: client2.key,
+      sealedReason,
+      blobId: rec.docId,
+      fillKey: pub.buffer.slice(pub.byteOffset, pub.byteOffset + pub.byteLength)
+    });
+    open = { requestId, keyId };
+    pending.set(key, open);
   }
   const deadline = Date.now() + waitMs;
   for (; ; ) {
-    const s = await convex.query(api.agentRequests.status, { requestId });
+    const s = await convex.query(api.agentRequests.status, { requestId: open.requestId });
     if (s.status === "approved") {
       pending.delete(key);
+      const { sealedFill } = await convex.mutation(api.agentRequests.collectFill, { requestId: open.requestId });
       task.grants.add(key);
-      if (s.scope === "always") persistGrant(key);
-      return { status: "granted" };
+      return { status: "granted", spec: { ...spec, sealed: { keyId: open.keyId, data: Buffer.from(sealedFill).toString("base64") } } };
     }
     if (s.status === "denied" || s.status === "expired") {
       pending.delete(key);
       return { status: "denied", message: s.status === "denied" ? `The person declined filling ${rec.mask} into ${target.site}.` : `Nobody answered in time; the request to fill ${rec.mask} into ${target.site} expired.` };
     }
-    if (Date.now() >= deadline) return { status: "pending", requestId };
+    if (Date.now() >= deadline) return { status: "pending", requestId: open.requestId };
     await new Promise((r) => setTimeout(r, Math.min(2e3, Math.max(0, deadline - Date.now()))));
   }
 }
@@ -7796,7 +8421,8 @@ function registerBrowserTools(server2, clientOf) {
     { goal: z.string().min(3).describe("What you're doing, in the person's terms, e.g. 'Apply for the UK visitor visa'") },
     async ({ goal }) => {
       const client2 = clientOf().key;
-      tasks.set(client2, { id: `task_${Date.now().toString(36)}`, goal, grants: /* @__PURE__ */ new Set(), lastActive: Date.now() });
+      await endTask(client2);
+      tasks.set(client2, newTask(goal));
       return text(`Task started: ${goal}`);
     }
   );
@@ -7805,8 +8431,8 @@ function registerBrowserTools(server2, clientOf) {
     "End the current browser task. Site approvals given for it lapse.",
     {},
     async () => {
-      tasks.delete(clientOf().key);
-      return text("Task ended; its approvals are gone.");
+      await endTask(clientOf().key);
+      return text("Task ended; its approvals are gone, and the browser forgot the values it was given.");
     }
   );
   tool(
@@ -7876,7 +8502,7 @@ function registerBrowserTools(server2, clientOf) {
         const e = err;
         return fail(e.message, e.code);
       }
-      const grants = /* @__PURE__ */ new Map();
+      const specs = /* @__PURE__ */ new Map();
       for (const f of secretFields) {
         const rec = records.get(f.ref);
         const t = targets[f.ref];
@@ -7887,13 +8513,12 @@ function registerBrowserTools(server2, clientOf) {
         if (approval.status === "pending") {
           return { content: [{ type: "text", text: JSON.stringify({ status: "pending_approval", requestId: approval.requestId, message: `Waiting for the person to approve ${rec.mask} for ${t.site} on their phone. Call browser_fill again with the same arguments once they have; nothing was filled yet.` }) }] };
         }
-        grants.set(f.ref, [t.site]);
+        specs.set(f.ref, approval.spec);
       }
       return run("fill", {
         fields: fields.map((f) => {
           if (!f.secret) return { ref: f.ref, text: f.text };
-          const rec = records.get(f.ref);
-          return { ref: f.ref, secret: { value: rec.value, mask: rec.mask, sites: grants.get(f.ref) } };
+          return { ref: f.ref, secret: specs.get(f.ref) };
         }),
         submit
       });
@@ -7920,14 +8545,60 @@ function registerBrowserTools(server2, clientOf) {
   tool("browser_back", "Go back one page.", {}, async () => run("back"));
   tool(
     "browser_handoff",
-    "Hand the browser to the person for something only they should do: log in, solve a CAPTCHA, enter a 2FA code, pay. The Vault Browser window comes to the front; this waits until they press Done (or waitSeconds pass) and returns the page. Tell them in chat what you need.",
+    "Hand the browser to the person for something only they should do: log in, solve a CAPTCHA, enter a 2FA code, pay. The Vault Browser window comes to the front and their phone gets a notice; this waits until they press Done (on the phone, in the live view, or `moivault browser done`) or waitSeconds pass, and returns the page. Tell them in chat what you need.",
     { reason: z.string().min(3).describe("Shown to the person, e.g. 'Log in to your airline account'"), waitSeconds: z.number().min(0).max(300).default(120) },
-    async (a) => run("handoff", a)
+    async ({ reason, waitSeconds }) => {
+      const client2 = clientOf();
+      try {
+        await daemon("handoffStart", { reason });
+      } catch (err) {
+        const e = err;
+        return fail(e.message, e.code);
+      }
+      let requestId = null;
+      let convex = null;
+      if (connectionModeKnown()) {
+        try {
+          convex = await authenticateConvexClient();
+          ({ requestId } = await convex.mutation(api.agentRequests.create, {
+            kind: "handoff",
+            client: client2.key,
+            sealedReason: sealJsonToUser({ reason, client: client2.key, tool: "browser_handoff", handoff: { reason, goal: tasks.get(client2.key)?.goal ?? null } })
+          }));
+        } catch {
+        }
+      }
+      const deadline = Date.now() + waitSeconds * 1e3;
+      let done = false;
+      while (!done && Date.now() < deadline) {
+        const st = await sendToDaemon("handoffState").catch(() => ({ waiting: false }));
+        if (!st.waiting) done = true;
+        else if (requestId && convex) {
+          const r = await convex.query(api.agentRequests.status, { requestId }).catch(() => null);
+          if (r?.status === "approved") {
+            await sendToDaemon("done").catch(() => {
+            });
+            done = true;
+          } else if (r?.status === "denied") {
+            await sendToDaemon("done").catch(() => {
+            });
+            return fail("The person said they won't do this now. Ask them in chat how to continue.", "DECLINED");
+          }
+        }
+        if (!done) await new Promise((r) => setTimeout(r, 1500));
+      }
+      if (!done) return text("Still waiting for the person to finish in the Vault Browser window. Call browser_handoff again to keep waiting, or ask them in chat.");
+      if (requestId && convex) await convex.mutation(api.agentRequests.withdraw, { requestId }).catch(() => {
+      });
+      const snap = await run("snapshot");
+      return { content: [{ type: "text", text: "The person finished and handed control back." }, ...snap.content] };
+    }
   );
 }
 
 // src/mcp/server.ts
-var MCP_SERVER_VERSION = "0.3.3";
+init_secretSeal();
+var MCP_SERVER_VERSION = "0.3.4";
 var stagedDropFiles = /* @__PURE__ */ new Map();
 var hasSyncedThisSession = false;
 function errorMessage(error) {
@@ -7954,6 +8625,8 @@ async function ensureUnlocked() {
     );
   }
   openDatabase();
+  await prepareSecretIndex();
+  await sealExistingDatabase();
 }
 async function ensureSynced() {
   await ensureUnlocked();
@@ -7974,11 +8647,11 @@ function json(value) {
 }
 function notFound(ref) {
   if (usesContextCard()) {
-    const index2 = getBrowseIndex();
-    const id = ref.id ?? (ref.path ? index2.byPath.get(normalizePathQuery(ref.path)) : void 0);
-    const row = id ? index2.rowById.get(id) : void 0;
+    const index3 = getBrowseIndex();
+    const id = ref.id ?? (ref.path ? index3.byPath.get(normalizePathQuery(ref.path)) : void 0);
+    const row = id ? index3.rowById.get(id) : void 0;
     if (row && row.source === "context") {
-      return json({ status: "not_shared", id: row.id, path: displayPath(index2.byId.get(row.id)), title: row.title, type: row.type, owner: row.owner, message: askFor(row.id) });
+      return json({ status: "not_shared", id: row.id, path: displayPath(index3.byId.get(row.id)), title: row.title, type: row.type, owner: row.owner, message: askFor(row.id) });
     }
   }
   if (getPreset() === "private") return json({ error: "Document not found", ...ref, hint: PRIVATE_HINT });
@@ -8094,14 +8767,14 @@ var docRefShape = {
   id: z2.string().optional().describe("Document ID"),
   path: z2.string().optional().describe("Document path, e.g. vault/family/priya/passport.pdf (from vault_ls / search results)")
 };
-function resolveDocRef(ref, index2) {
+function resolveDocRef(ref, index3) {
   if (ref.id) return ref.id;
-  if (ref.path) return resolvePath(index2 ?? buildPathIndex(), ref.path);
+  if (ref.path) return resolvePath(index3 ?? buildPathIndex(), ref.path);
   return null;
 }
-function withPath(rows, index2) {
+function withPath(rows, index3) {
   return rows.map((r) => {
-    const p = index2.byId.get(r.id);
+    const p = index3.byId.get(r.id);
     return { ...r, path: p ? displayPath(p) : null };
   });
 }
@@ -8246,11 +8919,11 @@ function createMcpServer(options = {}) {
       results.sort((a, b) => b.score - a.score);
       const top = withPath(results.slice(0, limit), buildPathIndex());
       if (usesContextCard() && top.length < limit) {
-        const index2 = getBrowseIndex();
+        const index3 = getBrowseIndex();
         const seen = new Set(top.map((r) => r.id));
         for (const row of searchContextCard(query, limit)) {
           if (seen.has(row.id) || type && row.type !== type) continue;
-          top.push({ id: row.id, title: row.title, type: row.type, owner: row.owner, path: displayPath(index2.byId.get(row.id)), source: "context", ...row.expiresAt ? { expiresAt: row.expiresAt } : {}, next: askFor(row.id) });
+          top.push({ id: row.id, title: row.title, type: row.type, owner: row.owner, path: displayPath(index3.byId.get(row.id)), source: "context", ...row.expiresAt ? { expiresAt: row.expiresAt } : {}, next: askFor(row.id) });
           if (top.length >= limit) break;
         }
       }
@@ -8310,9 +8983,9 @@ function createMcpServer(options = {}) {
         if (contextDocs.length >= limit) break;
       }
       contextDocs.sort((a, b) => b.score - a.score);
-      const index2 = buildPathIndex();
+      const index3 = buildPathIndex();
       for (const d of contextDocs) {
-        const p = index2.byId.get(d.docId);
+        const p = index3.byId.get(d.docId);
         d.path = p ? displayPath(p) : null;
       }
       const people = [...new Set(contextDocs.map((d) => d.owner).filter(Boolean))];
@@ -8416,8 +9089,9 @@ function createMcpServer(options = {}) {
           convex,
           blobId: id,
           docKey,
-          payload: buildDocPayload(updatedDoc),
           spaceId: updatedDoc.vaultId,
+          // A new value for a secret field is a placeholder in the local row; the write carries the value.
+          payload: isSecretField(field, value) ? { ...buildDocPayload(updatedDoc), fields: { ...updatedDoc.fields, [field]: value } } : buildDocPayload(updatedDoc),
           isNew: false,
           client: clientOf(),
           tool: "vault_doc_edit",
@@ -8425,7 +9099,7 @@ function createMcpServer(options = {}) {
           reason
         });
         if (outcome.status === "pending_approval") return pendingResult(outcome, { id, field, value });
-        upsertDocument({ ...updatedDoc, encryptedDocKey: outcome.encryptedDocKey, keyVersion: outcome.keyVersion, syncStatus: "synced" });
+        upsertDocument2({ ...updatedDoc, encryptedDocKey: outcome.encryptedDocKey, keyVersion: outcome.keyVersion, syncStatus: "synced" });
         return json({ status: "updated", id, field, value });
       } finally {
         docKey.fill(0);
@@ -8554,7 +9228,7 @@ function createMcpServer(options = {}) {
       await ensureConnectionState();
       const { default: fs12 } = await import("fs");
       const { default: path12 } = await import("path");
-      const crypto14 = await import("crypto");
+      const crypto15 = await import("crypto");
       if (!fs12.existsSync(filePath)) return json({ error: "File not found" });
       const direct = writeGoesDirect(void 0, true);
       const fileBuffer = fs12.readFileSync(filePath);
@@ -8562,7 +9236,7 @@ function createMcpServer(options = {}) {
       const fileName = path12.basename(filePath);
       const ext = path12.extname(filePath).toLowerCase().slice(1);
       const mimeType = { pdf: "application/pdf", jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", heic: "image/heic" }[ext] ?? "application/octet-stream";
-      const hash = crypto14.createHash("sha256").update(fileBytes).digest("hex");
+      const hash = crypto15.createHash("sha256").update(fileBytes).digest("hex");
       const docId = hash;
       const convex = await authenticateConvexClient();
       const uploadUrl = await convex.mutation(api.storage.generateUploadUrl, {});
@@ -8654,7 +9328,7 @@ function createMcpServer(options = {}) {
       localDoc.fileAssetSize = encFileBytes.length;
       localDoc.fileAssetVersion = 1;
       localDoc.fileAssetStatus = "ready";
-      upsertDocument(localDoc);
+      upsertDocument2(localDoc);
       const preview = await attachPreview(convex, { docId, vaultId, docKey, localDoc, filePath, mimeType });
       docKey.fill(0);
       return json({ status: "uploaded", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags, preview });
@@ -8662,10 +9336,10 @@ function createMcpServer(options = {}) {
   );
   async function createTextDoc(args) {
     await ensureConnectionState();
-    const crypto14 = await import("crypto");
+    const crypto15 = await import("crypto");
     const contentBytes = new TextEncoder().encode(args.content);
     if (contentBytes.byteLength > 200 * 1024) return json({ error: "Content exceeds 200KB limit" });
-    const docId = crypto14.createHash("sha256").update(contentBytes).digest("hex");
+    const docId = crypto15.createHash("sha256").update(contentBytes).digest("hex");
     const existingDoc = getDocumentById(docId);
     if (existingDoc) return json({ status: "duplicate", id: docId, title: existingDoc.title });
     const convex = await authenticateConvexClient();
@@ -8724,7 +9398,7 @@ ${args.content}` });
         reason: args.reason
       });
       if (outcome.status === "pending_approval") return pendingResult(outcome, { title: localDoc.title, type: localDoc.type });
-      upsertDocument({ ...localDoc, encryptedDocKey: outcome.encryptedDocKey, keyVersion: outcome.keyVersion, vaultId: outcome.spaceId ?? void 0 });
+      upsertDocument2({ ...localDoc, encryptedDocKey: outcome.encryptedDocKey, keyVersion: outcome.keyVersion, vaultId: outcome.spaceId ?? void 0 });
       return json({ status: "created", id: docId, title: localDoc.title, type: localDoc.type, tags: localDoc.tags, owner: localDoc.owner });
     } finally {
       docKey.fill(0);
@@ -8804,7 +9478,7 @@ ${args.content}` });
           reason
         });
         if (outcome.status === "pending_approval") return pendingResult(outcome, { id: docId, title: localDoc.title });
-        upsertDocument({ ...updatedDoc, encryptedDocKey: outcome.encryptedDocKey, keyVersion: outcome.keyVersion });
+        upsertDocument2({ ...updatedDoc, encryptedDocKey: outcome.encryptedDocKey, keyVersion: outcome.keyVersion });
         return json({ status: "updated", id: docId, title: localDoc.title });
       } finally {
         docKey.fill(0);
@@ -8850,11 +9524,11 @@ ${args.content}` });
     { path: z2.string().default("vault/").describe("Folder or file path, e.g. vault/ or vault/family/priya") },
     async ({ path: path12 }) => {
       await ensureSynced();
-      const index2 = getBrowseIndex();
+      const index3 = getBrowseIndex();
       const query = normalizePathQuery(path12);
-      const fileId = index2.byPath.get(query);
+      const fileId = index3.byPath.get(query);
       if (fileId) {
-        const row = index2.rowById.get(fileId);
+        const row = index3.rowById.get(fileId);
         return json({
           kind: "file",
           path: displayPath(query),
@@ -8870,12 +9544,12 @@ ${args.content}` });
       const prefix = query ? `${query}/` : "";
       const dirs = /* @__PURE__ */ new Map();
       const files = [];
-      for (const [id, p] of index2.byId) {
+      for (const [id, p] of index3.byId) {
         if (!p.startsWith(prefix)) continue;
         const rest = p.slice(prefix.length);
         const slash = rest.indexOf("/");
         if (slash === -1) {
-          const row = index2.rowById.get(id);
+          const row = index3.rowById.get(id);
           files.push({ name: rest, id, title: row?.title ?? null, type: row?.type ?? null, ...row?.source === "context" ? { readable: false } : {} });
         } else {
           const dir = rest.slice(0, slash);
@@ -8893,7 +9567,7 @@ ${args.content}` });
       return json({
         path: displayPath(query ? `${query}/` : ""),
         entries,
-        ...index2.fromContext ? { note: "Entries marked readable: false are listed on the context card only \u2014 ask for them with vault_request({ reason, blobIds })." } : {}
+        ...index3.fromContext ? { note: "Entries marked readable: false are listed on the context card only \u2014 ask for them with vault_request({ reason, blobIds })." } : {}
       });
     }
   );
@@ -8906,11 +9580,11 @@ ${args.content}` });
     },
     async ({ depth, path: path12 }) => {
       await ensureSynced();
-      const index2 = getBrowseIndex();
+      const index3 = getBrowseIndex();
       const root = normalizePathQuery(path12);
       const prefix = root ? `${root}/` : "";
       const tree = { children: /* @__PURE__ */ new Map(), count: 0 };
-      for (const [id, p] of index2.byId) {
+      for (const [id, p] of index3.byId) {
         if (!p.startsWith(prefix)) continue;
         const parts = p.slice(prefix.length).split("/");
         let node = tree;
@@ -8936,7 +9610,7 @@ ${args.content}` });
             lines.push(`${indent}${key} (${child.count})`);
             walk(child, level + 1, `${indent}  `);
           } else {
-            const listedOnly = index2.rowById.get(child.id)?.source === "context";
+            const listedOnly = index3.rowById.get(child.id)?.source === "context";
             lines.push(`${indent}${key}  [${child.id}]${listedOnly ? " (ask)" : ""}`);
           }
         }
@@ -8946,7 +9620,7 @@ ${args.content}` });
       return json({
         totalDocs: tree.count,
         tree: lines.join("\n"),
-        ...index2.fromContext ? { note: "(ask) = listed on the context card only; request it with vault_request({ reason, blobIds })." } : {},
+        ...index3.fromContext ? { note: "(ask) = listed on the context card only; request it with vault_request({ reason, blobIds })." } : {},
         ...tree.count === 0 && isConnectionSession() ? { hint: emptyHint() } : {}
       });
     }
@@ -9273,7 +9947,7 @@ import { spawn as spawn4 } from "child_process";
 import fs11 from "fs";
 import os6 from "os";
 import path11 from "path";
-import crypto12 from "crypto";
+import crypto13 from "crypto";
 var DEFAULT_PORT2 = 8797;
 var DEFAULT_PUBLIC_URL = "https://moivaultmcp.wiloop.io";
 var DEFAULT_DOWNLOAD_TTL_SECONDS = 15 * 60;
@@ -9484,7 +10158,7 @@ async function downloadDocument(id) {
   };
 }
 function issueDownloadToken(file, ttlSeconds) {
-  const token = crypto12.randomBytes(32).toString("base64url");
+  const token = crypto13.randomBytes(32).toString("base64url");
   const ttl = Math.max(60, Math.min(ttlSeconds || DEFAULT_DOWNLOAD_TTL_SECONDS, 3600));
   downloadTokens.set(token, { ...file, expiresAt: Date.now() + ttl * 1e3 });
   return token;
@@ -9973,17 +10647,20 @@ async function startRestServer() {
 
 // src/mcp/serve.ts
 import http4 from "http";
-import crypto13 from "crypto";
+import crypto14 from "crypto";
 import { spawn as spawn5, spawnSync as spawnSync2 } from "child_process";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+init_keychain();
+init_connection();
+init_client();
 var DEFAULT_SERVE_PORT = 8798;
 var MAX_BODY_BYTES2 = 4 * 1024 * 1024;
 async function getServeSecret(rotate = false) {
   const kc = getKeychain();
   let secret = rotate ? null : await kc.get("serve_secret");
   if (!secret) {
-    secret = crypto13.randomBytes(24).toString("base64url");
+    secret = crypto14.randomBytes(24).toString("base64url");
     await kc.set("serve_secret", secret);
   }
   return secret;
@@ -9991,7 +10668,7 @@ async function getServeSecret(rotate = false) {
 function safeEqual(a, b) {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
-  return ab.length === bb.length && crypto13.timingSafeEqual(ab, bb);
+  return ab.length === bb.length && crypto14.timingSafeEqual(ab, bb);
 }
 function readBody2(req) {
   return new Promise((resolve, reject) => {
@@ -10051,7 +10728,7 @@ async function startServe(opts = {}) {
         if (!sessionId && isInitializeRequest(body)) {
           const mcp2 = createMcpServer({ remote: true });
           const transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => crypto13.randomUUID(),
+            sessionIdGenerator: () => crypto14.randomUUID(),
             onsessioninitialized: (id) => {
               transports.set(id, transport);
             }
@@ -10152,7 +10829,9 @@ function printInstructions(args) {
 }
 
 // src/cli/index.ts
+init_vault();
 init_database();
+init_connection();
 var REPORTED_READS = {
   "doc get": "id",
   "doc text": "id",
@@ -10189,7 +10868,7 @@ function commandArgs(key, actionCommand) {
 }
 var reporting = null;
 var program = new Command();
-program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.3").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").option("--reveal", "Show secret values (ID, account, card numbers) unmasked \u2014 asks your phone first on a paired machine").hook("preAction", async (thisCommand, actionCommand) => {
+program.name("moivault").description("CLI for Vault \u2014 encrypted document management for agents and humans").version("0.3.4").option("--json", "Force JSON output").option("--pretty", "Force human-readable output").option("--db <path>", "Custom SQLite database path").option("--vault-id <id>", "Target specific vault").option("--verbose", "Enable debug logging").option("--reveal", "Show secret values (ID, account, card numbers) unmasked \u2014 asks your phone first on a paired machine").hook("preAction", async (thisCommand, actionCommand) => {
   const commandName = actionCommand.name();
   const parentName = actionCommand.parent?.name();
   const skipAutoUnlock = parentName === "auth" || commandName === "unlock" || commandName === "lock";
@@ -10210,11 +10889,25 @@ program.name("moivault").description("CLI for Vault \u2014 encrypted document ma
     } catch {
     }
   }
+  if (isVaultUnlocked()) {
+    try {
+      await prepareSecretIndex();
+      await sealExistingDatabase();
+    } catch {
+    }
+  }
   const key = commandKey(actionCommand);
   const mode = REPORTED_READS[key];
   if (mode) {
     const docIds = mode === "id" && typeof actionCommand.args[0] === "string" ? [actionCommand.args[0]] : [];
-    if (!(thisCommand.opts().reveal && await approveReveal(key, docIds))) maskStdout();
+    if (thisCommand.opts().reveal && await approveReveal(key, docIds)) {
+      if (docIds.length && ["doc get", "doc fields", "doc text"].includes(key)) {
+        await revealDocument(docIds[0], key);
+        await recordCliActivity(`cli:${key}`, docIds, { args: commandArgs(key, actionCommand) });
+        process.exit(0);
+      }
+    }
+    maskStdout();
   }
   if (mode) {
     const docIds = mode === "id" && typeof actionCommand.args[0] === "string" ? [actionCommand.args[0]] : [];
